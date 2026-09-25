@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-menu",
+  "description": "托盘菜单窗口权限：菜单项点完 / Esc / 光标离开时自收起（hide），事件用 core:default 里的 listen",
+  "windows": ["tray-menu"],
+  "permissions": ["core:default", "core:window:allow-hide"]
+}

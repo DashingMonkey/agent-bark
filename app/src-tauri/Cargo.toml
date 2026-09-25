@@ -1,0 +1,40 @@
+[package]
+name = "agent-bark-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# 安装后的 exe 名（Tauri 2 的 productName 只改安装器名，不改 exe 名）
+default-run = "AgentBark"
+
+# 显式重命名 bin → 产物 AgentBark.exe；lib 名不变（main.rs 引用 agent_bark_app::run）
+[[bin]]
+name = "AgentBark"
+path = "src/main.rs"
+
+[lib]
+name = "agent_bark_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+bark-core = { workspace = true }
+bark-cli = { workspace = true }
+bark-server = { workspace = true }
+bark-adapters = { workspace = true }
+bark-channels = { workspace = true }
+tauri = { workspace = true }
+tauri-plugin-autostart = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+# 「关于」页检查更新用（阻塞客户端，与 bark-channels 的 webhook 同一套）
+reqwest = { workspace = true }
+# 最小订阅者：仅 fmt + std（不启用 ansi/env-filter，避免额外依赖）。
+# 没有订阅者时 tracing::warn! 是空操作，用户看不到任何告警。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

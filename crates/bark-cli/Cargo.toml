@@ -1,0 +1,15 @@
+[package]
+name = "bark-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bark-core = { workspace = true }
+bark-adapters = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+sysinfo = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }

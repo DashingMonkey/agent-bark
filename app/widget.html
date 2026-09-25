@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>agent-bark 悬浮窗</title>
+    <script>
+      /* 首帧定色：与 index.html / menu.html 内联脚本、src/theme.ts 同一套规则（改键名三处一起改） */
+      (function () {
+        try {
+          var p = localStorage.getItem("agent-bark.theme");
+          var t = p === "dark" || p === "light" ? p : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      /*
+        桌面悬浮窗（当前活动会话小卡片）。
+
+        窗口是透明、无边框、置顶、不可聚焦的；页面只渲染一张圆角卡片，
+        内容恒为固定宽（--card-w），窗口尺寸由 widget.ts 按内容高度跟随
+        （行数变化时 setSize）。卡片不许有任何**画到圆角之外**的装饰
+        （外阴影、外发光都不行）：窗口恰好是卡片大小，圆角外的像素会被
+        窗口的矩形边界硬裁切，在桌面上留下一圈带直边的色块。
+
+        颜色四态与主应用 --state-* / glow.rs 同一套（思考/警告/完成/终止）。
+      */
+      :root {
+        /* 具体值由 <head> 里的内联脚本与 src/theme.ts 写到 data-theme 上 */
+        color-scheme: dark;
+        /* 首帧兜底宽度，widget.ts 会用注入参数覆盖 */
+        --card-w: 240px;
+      }
+      :root[data-theme="light"] { color-scheme: light; }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* 窗口透明：任何不透明背景都会在桌面上留一块色板 */
+        background: transparent;
+      }
+      body {
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        user-select: none;
+        cursor: default;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: flex-start;
+        /* 自动隐藏的淡入 / 淡出（时长与 widget.ts 的 FADE_MS 一致，改一处一起改）：
+           .fade = 透明，摘掉类即淡入；淡出完成后 widget.ts 才 win.hide() */
+        transition: opacity 160ms ease;
+      }
+      #app.fade { opacity: 0; }
+
+      .card {
+        flex-shrink: 0;
+        width: var(--card-w);
+        padding: 5px 10px;
+        border-radius: 10px;
+        background: rgba(29, 29, 32, 0.92);
+        border: 1px solid rgba(51, 51, 56, 0.95);
+      }
+      :root[data-theme="light"] .card {
+        background: rgba(255, 255, 255, 0.94);
+        border-color: rgba(213, 213, 220, 0.95);
+      }
+
+      .row-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 26px;
+        padding: 0 2px;
+      }
+      .agent-icon { display: inline-flex; flex-shrink: 0; }
+      .agent-icon svg { width: 15px; height: 15px; display: block; }
+      .name {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        font-weight: 600;
+        color: #e8e8ea;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .state {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .state .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      /* 四态配色：与主应用 --state-* / glow.rs GlowState::color 同源（Primer） */
+      .state.thinking { color: #4493f8; } .state.thinking .dot { background: #4493f8; }
+      .state.warning { color: #f0883e; } .state.warning .dot { background: #f0883e; }
+      .state.completed { color: #3fb950; } .state.completed .dot { background: #3fb950; }
+      .state.terminated { color: #f85149; } .state.terminated .dot { background: #f85149; }
+      :root[data-theme="light"] .name { color: #232327; }
+      :root[data-theme="light"] .state.thinking { color: #0969da; }
+      :root[data-theme="light"] .state.thinking .dot { background: #0969da; }
+      :root[data-theme="light"] .state.warning { color: #bc4c00; }
+      :root[data-theme="light"] .state.warning .dot { background: #bc4c00; }
+      :root[data-theme="light"] .state.completed { color: #1a7f37; }
+      :root[data-theme="light"] .state.completed .dot { background: #1a7f37; }
+      :root[data-theme="light"] .state.terminated { color: #cf222e; }
+      :root[data-theme="light"] .state.terminated .dot { background: #cf222e; }
+
+      .idle {
+        color: #9a9aa2;
+        font-size: 12px;
+      }
+      .idle img {
+        width: 16px;
+        height: 16px;
+        border-radius: 4px;
+        opacity: 0.85;
+      }
+
+      /*
+        右键菜单（固定位置 / 关闭悬浮窗）：与卡片同一套面板样式。
+        窗口比菜单小（卡片只有 38px 高），widget.ts 会在打开时把窗口
+        临时撑到能容纳菜单、关闭时还原——菜单本体只管定位与展示。
+      */
+      #ctx-menu {
+        position: fixed;
+        z-index: 10;
+        display: none;
+        min-width: 132px;
+        padding: 4px;
+        border-radius: 8px;
+        background: rgba(29, 29, 32, 0.97);
+        border: 1px solid rgba(51, 51, 56, 0.95);
+      }
+      .ctx-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #e8e8ea;
+        font-family: inherit;
+        font-size: 12px;
+        text-align: left;
+        cursor: default;
+      }
+      .ctx-item:hover { background: rgba(255, 255, 255, 0.08); }
+      /* 勾选列：两行菜单的对齐垫片，「固定位置」激活时显示 ✓ */
+      .ctx-check { width: 13px; flex-shrink: 0; text-align: center; color: #4493f8; }
+      .ctx-item.checked .ctx-check::before { content: "✓"; }
+      :root[data-theme="light"] #ctx-menu {
+        background: rgba(255, 255, 255, 0.97);
+        border-color: rgba(213, 213, 220, 0.95);
+      }
+      :root[data-theme="light"] .ctx-item { color: #232327; }
+      :root[data-theme="light"] .ctx-item:hover { background: rgba(0, 0, 0, 0.06); }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="ctx-menu">
+      <button type="button" class="ctx-item" id="ctx-pin"><span class="ctx-check"></span>固定位置</button>
+      <button type="button" class="ctx-item" id="ctx-exit"><span class="ctx-check"></span>关闭悬浮窗</button>
+    </div>
+    <script type="module" src="/src/widget.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bark-core",
+    "crates/bark-cli",
+    "crates/bark-server",
+    "crates/bark-adapters",
+    "crates/bark-channels",
+    "app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+bark-core = { path = "crates/bark-core" }
+bark-cli = { path = "crates/bark-cli" }
+bark-server = { path = "crates/bark-server" }
+bark-adapters = { path = "crates/bark-adapters" }
+bark-channels = { path = "crates/bark-channels" }
+
+serde = { version = "1", features = ["derive"] }
+# preserve_order：serde_json 的 Map 保持插入序（IndexMap）而非字母序，
+# 写回用户的 agent 配置文件（settings.json 等）时不再把整份文件按键名重排
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+toml = "1"
+dirs = "7"
+rusqlite = { version = "0.40", features = ["bundled"] }
+# TraeWork 会话库 SQLCipher 4 页面级解密（crates/bark-adapters/src/traework_db.rs）
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sysinfo = "0.39"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+
+[profile.release]
+lto = true
+strip = true

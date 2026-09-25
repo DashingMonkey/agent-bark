@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>agent-bark 屏幕光效</title>
+    <style>
+      /*
+        屏幕光效覆盖层。两层内容：
+
+        1) 边缘光效（常驻）——由 --effect 选表现，--edge 控显隐：
+           · breathing  呼吸：无细线，单层辉光坡（外缘最实、向内渐隐）明暗
+                        呼吸；终止态例外：换成心跳双脉冲（见「状态节奏差异」段）
+           · comet      流光：整圈细线常亮打底（宽度随屏高缩放），一道高光沿线
+                        流动（首尾相连）；非运行态整线加亮并按状态呼吸。
+                         拖尾渐变 smoothstep 12 段细描 + 噪点抖动（.grain），
+                         根治细线上的色彩断层（见 .spin 注释）；光带内缘再贴一根 1px
+                         深色发丝描边（.inner-edge，最低档），浅底读形靠它
+           两种灯效的颜色层下面都垫一层**静态暗晕**（.b-halo / .shadow：黑
+           inset 阶梯，不参与任何动画）：浅色桌面上锚定呼吸最暗相位与 45% 整
+           线的可见度（白亮头也靠它衬托），深色桌面上黑上叠黑不可感知——背景
+           无关，无需检测桌面明暗。参数经 doc/glow-edge-compare.html 浅色桌面
+           肉眼校过。
+        2) 全屏特效（一次性）——每次颜色亮起时补放一次全屏特效（类型标记在
+           #burst 的 data-effect 上：fog=雾散（光雾从中心洇开）、
+           scan=HUD 扫描（水平亮线从顶扫到底））；
+           颜色走独立通道 --burst-rgb（多会话并行时边缘与全屏可以不同色）。
+
+        ## 配色与术语
+        颜色**不在本文件定义**：`--c` / `--rgb` 由 glow.ts 从 Rust 侧 payload 写入，
+        唯一来源是 `src-tauri/src/glow.rs` 的 `GlowState::color`。下面的值只是首帧
+        兜底（payload 到达前的那几毫秒），**必须与 GlowState::color 同步改**。
+        状态一律用角色名（思考 / 警告 / 完成 / 终止），不写色系名——配色换过一版
+        （黄 → 蓝），写色系名的注释全是漏改的。
+
+        ## 性能取舍
+        覆盖层是常驻全屏的，所以**常驻**的部分只允许动 opacity / transform：
+        这两个属性在合成器上做，不会触发整屏重绘。呼吸的辉光坡和流光的整线/
+        高光都是「静态的 box-shadow 阶梯（或纯色环带）+ 只动 opacity」——早先
+        版本直接动画 box-shadow 的模糊/扩散半径（每帧重绘整屏），观感发糊发卡，
+        已退役。
+        全屏雾散更进一步：两层都是**静态渐变整体缩放**，只动 transform / opacity，
+        连旧版「扫屏」方案的大半径模糊滤镜（每帧全屏重绘）都省掉了——虽然它也是
+        偶发的一次性动画，能不重绘就不重绘。
+      */
+      :root {
+        --c: #4493f8; /* 兜底：思考色，见文件头「配色与术语」 */
+        /*
+          主色的分量，**逗号分隔**：样式里一律写成 rgba(var(--rgb), .5)。
+          别改成空格分隔——`rgba(255 204 0, .5)` 是非法语法（空格写法必须配 `/`
+          分隔 alpha），整条声明会被丢掉，特效会静默消失。
+        */
+        --rgb: 68, 147, 248;
+        /*
+          全屏特效的独立颜色通道：多会话并行时边缘保持思考色呼吸，
+          全屏按事件角色（完成 / 终止）补放，互不覆盖。由 glow.ts 下发。
+        */
+        --burst-rgb: 68, 147, 248;
+        /*
+          流光细线宽度（首帧兜底，1080p 屏高基准）：与 glow.rs 的 GLOW_WIDTH 同步改；
+          payload 到达后由 glow.ts 的 applyWidth 按本屏高度等比缩放覆盖
+          （呼吸坡是纯渐变，不用线宽）。
+          初版 4px 用户实测「看不清」，且渐变色带在细线上最扎眼——线宽按比例
+          放大一档到 6px（×1.5），一个数的事，嫌粗嫌细改这里 + GLOW_WIDTH。
+        */
+        --w: 6px;
+        --r: 14px;
+        --op: 0.9;
+        /* 灯效速度倍率：1 = 参考稿的原始节奏（由 Rust 侧下发，观感已写死） */
+        --speed: 1;
+        /* 辉光强度倍率：控制内辉光「往里渗」的范围（由 Rust 侧下发，观感已写死） */
+        --glow: 1;
+        --burst: 3000ms;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* 窗口本身是透明的，任何一处不透明背景都会在屏幕上留下一块色块 */
+        background: transparent;
+      }
+
+      body {
+        user-select: none;
+        cursor: default;
+      }
+
+      /*
+        底边留 1px 不画：窗口本身比显示器**多** 1 物理像素（见 glow.rs 的 rect_of），多出来
+        的那 1px 落在屏幕外，为的是让窗口矩形不等于显示器矩形——矩形完全重合会被 GeForce
+        Experience / 游戏模式这类软件按「无边框全屏应用」匹配误判。
+
+        绘制层（本元素及其全部子层、含全屏雾散）在这里同步内缩 1px，于是那一行里什么都
+        没有：紧挨着的下屏不会被画上任何像素；而本屏四边的光带都恰好从屏幕边缘起算，与
+        「窗口和屏幕等大」时完全一致（不缩的话，被推到屏外的那一侧光带会薄 1px）。
+        两个数值必须与 glow.rs 的 rect_of 同步改。
+      */
+      #glow {
+        position: fixed;
+        inset: 0 0 1px 0;
+        opacity: 0;
+        transition: opacity 0.45s ease;
+        pointer-events: none;
+      }
+
+      #glow.on {
+        opacity: var(--op);
+      }
+
+      /* ---------- 灯效层：同一时刻只有一层在跑 ---------- */
+      .breathe,
+      .comet {
+        position: absolute;
+        inset: 0;
+        display: none;
+      }
+
+      #glow[data-effect="breathing"] .breathe {
+        display: block;
+      }
+
+      #glow[data-effect="comet"] .comet {
+        display: block;
+      }
+
+      /*
+        边缘灯带显隐是独立开关（设置页「边缘光效」）：按 data-edge 只收起灯带层。
+        不能用不加 .on 的方式实现——#burst 在 #glow 里，整层压暗会把全屏雾散
+        一起压掉。与上面两条规则同特异性，靠书写顺序取胜。
+      */
+      #glow[data-edge="off"] .breathe,
+      #glow[data-edge="off"] .comet {
+        display: none;
+      }
+
+      /* ==================== 呼吸（v3：无细线，单层辉光坡） ==================== */
+
+      /*
+        两层：静态暗晕 .b-halo（下）+ 呼吸的颜色坡 .b-glow（上）。
+        v2 的细边条（常驻描边 + 黑垫晕）已删，粗辉光条改为纯递减坡——四段
+        inset box-shadow 阶梯拼出「外缘最实、往内越来越透明」，没有硬边台阶。
+        丝滑三要点不变：只动 opacity（零重绘）；正弦近似缓动
+        cubic-bezier(0.37, 0, 0.63, 1) + alternate 让明暗两端速度为零（转身无顿挫）；
+        半程 2.4s / 全程 4.8s ≈ 平静呼吸，再快就像警示灯。
+
+        暗相位下限 0.55 是可见度的关键：细线时代的「常驻存在感」由它接棒——
+        低于这个值的时段余光基本感知不到灯还亮着（v2 实测结论），且颜色坡
+        没有边条兜底，整圈必须全程可见；浅色桌面上这个下限不够用，由底下
+        静态的 .b-halo 锚定（见它自己的注释）。
+
+        坡宽 ×2（用户拍板）：四段阶梯 6/16/30/50px → 12/32/60/100px，
+        暗晕同步 ×2（比例失衡会让最暗相位的锚定变弱）。inset 阴影无方向
+        偏移，四边等宽等透明度。代价是往里渗 100px，贴边内容被压对比的
+        范围翻倍（半透明渐变，不挡操作）。
+      */
+      .breathe {
+        position: absolute;
+        inset: 0;
+        border-radius: var(--r);
+      }
+
+      .breathe i {
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        display: block;
+      }
+
+      /*
+        静态暗晕：颜色坡底下的黑晕垫层（半径对齐颜色坡的 12/32/60px 阶梯，
+        坡宽 ×2 后同步翻倍）。关键是它**不进 opacity 动画**——呼吸最暗的
+        相位正是它该发力的时候，跟着一起淡就只出了一半力。浅色桌面：最暗
+        相位边缘仍有暗边锚定「灯还亮着」，暗底还衬得色光更饱和；深色桌面：
+        黑上叠黑不可感知，等于零副作用。v2 细边条的黑垫晕承担过同一职责，
+        v3 去细线时一并删掉了，这层是它的接棒——但不再依附细线，也不随
+        呼吸起伏。纯静态层，零重绘。
+      */
+      .b-halo {
+        box-shadow:
+          inset 0 0 calc(12px * var(--glow)) 0 rgba(0, 0, 0, 0.45),
+          inset 0 0 calc(32px * var(--glow)) 8px rgba(0, 0, 0, 0.28),
+          inset 0 0 calc(60px * var(--glow)) 20px rgba(0, 0, 0, 0.14);
+      }
+
+      .b-glow {
+        opacity: 0.55;
+        box-shadow:
+          inset 0 0 calc(12px * var(--glow)) 0 rgba(var(--rgb), 0.92),
+          inset 0 0 calc(32px * var(--glow)) 6px rgba(var(--rgb), 0.62),
+          inset 0 0 calc(60px * var(--glow)) 16px rgba(var(--rgb), 0.38),
+          inset 0 0 calc(100px * var(--glow)) 32px rgba(var(--rgb), 0.16);
+        animation: pl-glow calc(2400ms / var(--speed)) cubic-bezier(0.37, 0, 0.63, 1) infinite alternate;
+      }
+
+      @keyframes pl-glow {
+        from {
+          opacity: 0.55;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+
+      /*
+        ==================== 状态节奏差异 ====================
+
+        终止色（红）呼吸的暗相位会「洗」向警告色（橙）——两者色相只差约 22°，
+        都是低饱和暗色，单靠颜色在半亮相位分不开（用户实测）。解法是分节奏：
+        终止 = 心跳双脉冲（咚 12% - 咚 38% - 停 60%~），暗相位垫高到 0.5
+        让终止色全程不洗白；警告（橙）保持上面的慢呼吸不动。节奏差异连色弱
+        用户都能区分——灵动岛 / 路由器指示灯的标准做法。
+
+        data-state 由 glow.ts 从 Rust 侧下发；只在 failed 时覆盖动画。
+      */
+      #glow[data-effect="breathing"][data-state="failed"] .b-glow {
+        animation: pl-glow-failed calc(1600ms / var(--speed)) cubic-bezier(0.37, 0, 0.63, 1) infinite;
+      }
+
+      @keyframes pl-glow-failed {
+        0% {
+          opacity: 0.5;
+        }
+        12% {
+          opacity: 1;
+        }
+        26% {
+          opacity: 0.55;
+        }
+        38% {
+          opacity: 1;
+        }
+        60%,
+        100% {
+          opacity: 0.5;
+        }
+      }
+
+      /* ==================== 流光（整线 + 流动高光） ==================== */
+
+      .ring {
+        position: absolute;
+        inset: 0;
+        border-radius: var(--r);
+        padding: var(--w);
+        /* 只保留 padding 那一条：content-box 与整块做 exclude，即「整块挖掉内容区」 */
+        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+        mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        mask-composite: exclude;
+      }
+
+      /*
+        静态暗晕：整线与高光底下的黑晕垫层（与 .b-halo 同一职责，流光版）。
+        不用 mask 环带而用整块 inset box-shadow——软边自然（硬边环带在浅色上
+        会读成一条黑杠）。白亮头（#fff）在浅色壁纸上原本隐形，靠这圈暗底
+        衬托回来；深色桌面黑上叠黑不可感知。不参与任何状态动画，纯静态零重绘。
+
+        参数教训（实测两轮得出）：inset 阴影的模糊高斯跨在阴影边界两侧，**名义
+        alpha 在最边缘只兑现约一半**——首版 8px/0.3 与二版 5px/0.5 的边缘压暗
+        几乎没差（亮度 159 → 160，等于白改）。要真的压暗边缘，得用 spread 把
+        实心核推进到边线底下：第一段 1px spread 让 0.65 的名义值在色线
+        中心兑现 ~0.45，1080p 基准下整线外缘 ~142 亮度（背景 238；比呼吸最暗
+        相位的 156 略深——流光的白头要靠更深的底才跳得出来）；第二段负责
+        4~14px 的羽化过渡。
+        线宽 4→6px 后这两段按 ×1.5 同比放大（6px/2px、21px/6px），压暗比例
+        与线宽的相对关系不变。
+      */
+      .shadow {
+        position: absolute;
+        inset: 0;
+        border-radius: var(--r);
+        box-shadow:
+          inset 0 0 6px 2px rgba(0, 0, 0, 0.65),
+          inset 0 0 21px 6px rgba(0, 0, 0, 0.25);
+      }
+
+      /*
+        整线打底：首尾相连的常亮细线（宽度 = --w，Rust 侧按 1080p 基准下发、
+        glow.ts 按本屏高度等比缩放）。
+        running 态半亮（0.45），高光沿线流动时始终看得出线；非运行态加亮到
+        0.55 并按状态呼吸（见下方状态规则）。浅色桌面上 45% 细线的对比度由
+        底下静态的 .shadow 撑——拉高透明度反而会吃掉高光与整线的对比度。
+      */
+      .base {
+        background: var(--c);
+        opacity: 0.45;
+        transition: opacity 0.3s ease, background-color 0.3s ease;
+      }
+
+      .core {
+        overflow: hidden;
+        transition: background-color 0.3s ease;
+      }
+
+      /*
+        高光本体。145vmax ≈ 视口对角线（≤ √2·vmax ≈ 1.414vmax），
+        保证旋转到任意角度都能铺满整个视口，四角不会漏。
+
+        尾根 180deg = 尾迹 180° ≈ 周长的一半；尾部峰值用 0.55 半透明主色
+        而不是不透明——高光是「叠加」在整线上的，流动全程底下都看得出线，
+        亮头是唯一的纯白。
+
+        ## 拖尾渐变必须是 smoothstep 多段细描（色彩断层的根治）
+        早先两站直达（transparent → 0.55 主色）写法的插值本身是线性的，但
+        绘制落回 8bit 时，长缓坡被量化成一条条等亮度弧带——细线上看得清
+        楚楚的「色彩断层」（用户实测）。解法两层：
+        1) 12 段 smoothstep 采样：台阶宽度打散成两头窄、中间宽的非均匀
+           分布，视觉上连成一条丝滑的坡；
+        2) .grain 噪点抖动层（见下）：把残余的 1~2 LSB 量化差打散成看
+           不见的颗粒。两者合起来才是「丝滑渐变」，少任何一层都还能看出条纹。
+      */
+      .spin {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 145vmax;
+        height: 145vmax;
+        margin: -72.5vmax 0 0 -72.5vmax;
+        /* 亮头在 360°（= 0°）处，尾巴朝逆时针方向拖出半圈 */
+        background: conic-gradient(
+          from 0deg,
+          transparent 0deg,
+          transparent 180deg,
+          rgba(var(--rgb), 0.011) 193.7deg,
+          rgba(var(--rgb), 0.043) 207.3deg,
+          rgba(var(--rgb), 0.086) 221deg,
+          rgba(var(--rgb), 0.143) 234.7deg,
+          rgba(var(--rgb), 0.208) 248.3deg,
+          rgba(var(--rgb), 0.275) 262deg,
+          rgba(var(--rgb), 0.342) 275.7deg,
+          rgba(var(--rgb), 0.407) 289.3deg,
+          rgba(var(--rgb), 0.464) 303deg,
+          rgba(var(--rgb), 0.509) 316.7deg,
+          rgba(var(--rgb), 0.538) 330.3deg,
+          rgba(var(--rgb), 0.55) 344deg,
+          color-mix(in srgb, rgb(var(--rgb)) 45%, #fff) 351.5deg,
+          #fff 359.5deg,
+          transparent 360deg
+        );
+        opacity: 0;
+        transition: opacity 0.3s ease;
+        animation: glow-spin calc(3200ms / var(--speed)) linear infinite;
+        will-change: transform;
+      }
+
+      @keyframes glow-spin {
+        from {
+          transform: rotate(0deg);
+        }
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* 流光：只有「运行中」才转；其余状态整圈常亮（转到别处才亮等于没亮） */      #glow[data-effect="comet"][data-state="running"] .spin {
+        opacity: 1;
+      }
+
+      #glow[data-effect="comet"][data-state="waiting"] .core,
+      #glow[data-effect="comet"][data-state="completed"] .core,
+      #glow[data-effect="comet"][data-state="failed"] .core {
+        background: var(--c);
+      }
+
+      /*
+        非运行态：高光停转隐藏（.spin 的通用规则在下面），整线加亮并按状态
+        呼吸。底线的 base-breathe 与高光层的 glow-breathe 同周期同相位，叠出
+        的整圈明暗与呼吸的节奏一致。
+      */
+      #glow[data-effect="comet"][data-state="waiting"] .base,
+      #glow[data-effect="comet"][data-state="completed"] .base,
+      #glow[data-effect="comet"][data-state="failed"] .base {
+        opacity: 0.55;
+      }
+
+      @keyframes base-breathe {
+        0%,
+        100% {
+          opacity: 0.55;
+        }
+        50% {
+          opacity: 0.22;
+        }
+      }
+
+      #glow[data-effect="comet"][data-state="waiting"] .base {
+        animation: base-breathe 1.2s ease-in-out infinite;
+      }
+
+      #glow[data-effect="comet"][data-state="failed"] .base {
+        animation: base-breathe 1.5s ease-in-out infinite;
+      }
+
+      #glow[data-effect="comet"][data-state="waiting"] .core {
+        animation: glow-breathe 1.2s ease-in-out infinite;
+      }
+
+      #glow[data-effect="comet"][data-state="failed"] .core {
+        animation: glow-breathe 1.5s ease-in-out infinite;
+      }
+
+      @keyframes glow-breathe {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.4;
+        }
+      }
+
+      /* 非「运行中」状态暂停旋转：省掉无谓的 GPU 合成 */
+      #glow[data-effect="comet"]:not([data-state="running"]) .spin {
+        animation-play-state: paused;
+      }
+
+      /*
+        噪点抖动层（.grain）：丝滑渐变的第二只手。
+        smoothstep 多段细描把台阶打散之后，仍会残留 1~2 LSB 的量化条纹——
+        人眼对这种规则条纹极敏感。这层静态噪点（feTurbulence 生成、baseFrequency
+        拉高到 0.9 使颗粒接近像素级）以约 4% 不透明度叠在色带之上，把规则的
+        量化差打散成随机颗粒，条纹就再也连不成线了。这是显示管线 dither 的
+        网页版标准做法。
+
+        性能：纯静态背景纹理，不参与任何动画、不触发重绘——和 .b-halo /
+        .shadow 一样是「贴上去就不管」的层。噪声 SVG 内联 data-URI，零请求。
+      */
+      .grain {
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.045'/%3E%3C/svg%3E");
+        background-size: 120px 120px;
+        background-repeat: repeat;
+      }
+
+      /*
+        内侧深色细边框（.inner-edge，最低档 1px）：贴在光带内缘的一根深色发丝线，
+        紧挨 6px 色线的内侧往里 1px。作用与 .shadow 同哲学——浅色桌面：给光带
+        内侧一条「暗缝」，把色线和内容隔开，读形靠它；深色桌面：黑上叠黑
+        不可感知，零副作用。背景无关，无需检测桌面明暗。
+
+        用 border 而不是 box-shadow：要的就是一根锐利的线，不带羽化。
+        纯静态层零重绘；宽度取 1px（最低档）——再粗就会读成第二条线，
+        压过色带本身。实机位置 = 光带宽（--w）处向内 1px。
+      */
+      .inner-edge {
+        position: absolute;
+        inset: var(--w);
+        border: 1px solid rgba(0, 0, 0, 0.6);
+        border-radius: max(0px, calc(var(--r) - var(--w)));
+        pointer-events: none;
+      }
+
+      /* ==================== 全屏特效（雾散） ==================== */
+
+      /*
+        一次触发放一遍，跑完停在 opacity:0（both 保留末帧），不留残影也不占常驻开销。
+        颜色取 --burst-rgb（事件角色色），与边缘光带的 --rgb（边缘状态色）是两个通道：
+        多会话并行时可以「边缘思考色呼吸 + 完成色雾散」同时进行。
+
+        形态：光像一团雾气从屏幕中心洇开——亮核 + 偏心漂移的薄雾两层长尾渐变
+        叠加，全程无清晰边界；雾漫到边缘后边缘内辉光才点亮，随后整屏一起淡出。
+
+        不用时 visibility: hidden：两层 150/220vmax 的圆很大（1080p 下各约
+        2900/4200 见方），不藏起来的话即使 opacity 为 0 也可能一直占着大纹理。
+      */
+      .burst {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        opacity: 0;
+        visibility: hidden;
+      }
+
+      .burst.on {
+        visibility: visible;
+      }
+
+      /*
+        类型分派：data-effect 选表现，同一时刻只渲染一组子层。用 display:none
+        而不是压 opacity——雾散那两张 150/220vmax 的大渐变不生成盒子才真正离场
+        （不占合成纹理），选雾散时扫描层同理。
+      */
+      #burst[data-effect="scan"] .burst-pulse,
+      #burst[data-effect="scan"] .burst-haze,
+      #burst[data-effect="scan"] .burst-wash {
+        display: none;
+      }
+
+      #burst:not([data-effect="scan"]) .scan {
+        display: none;
+      }
+
+      /*
+        容器包络（整体渐显渐隐）只属于雾散。扫描线一入场就该可见、出场由自己
+        的关键帧管，再叠一层包络会把亮线压到 30% 处才看得见。
+      */
+      #burst[data-effect="fog"].on {
+        animation: burst-env var(--burst) ease-in-out both;
+      }
+
+      /* 扫描没有容器包络：容器直接全亮（基础态 opacity:0 是给雾散用的） */
+      #burst[data-effect="scan"].on {
+        opacity: 1;
+      }
+
+      /*
+        渐显渐隐：约 1/3 时间渐入，尾部渐出，中间不留硬边。
+
+        峰值定在 0.8：这层盖在用户真实桌面上，不能「整块铺满主色」致盲；但它是
+        一次性的短事件，压得太低（初版 0.7 × 扫带 alpha 0.5 ≈ 有效峰值 0.35）
+        余光扫不出来（用户实测「不够明显」）。配合亮核中心 alpha 0.5，中心有效
+        峰值约 0.4、越往边缘越淡——一眼看得到，仍不挡内容。
+      */
+      @keyframes burst-env {
+        0% {
+          opacity: 0;
+        }
+        30% {
+          opacity: 0.8;
+        }
+        62% {
+          opacity: 0.7;
+        }
+        100% {
+          opacity: 0;
+        }
+      }
+
+      /*
+        雾散两层：亮核 + 漂移薄雾。都只动 transform / opacity（静态渐变整体缩放，
+        零重绘、零模糊滤镜）。边界感主要来自陡峭的 alpha 起伏和环形波前，
+        这里渐变全部走长尾平滑衰减、不设任何环带。
+
+        · 亮核 .burst-pulse：150vmax 的圆（半径 75vmax > 16:9 半对角 ≈57.4vmax），
+          满幅时四角仍落在渐变 ~77% 半径处，保有 ~0.1 的余光，边缘不被「切」出圆边。
+        · 薄雾 .burst-haze：220vmax、偏心 (42% 44%) 的更淡一团；偏心渐变 + 轻微
+          rotate = 亮斑绕着中心慢漂，两层叠加打破「完美圆」的对称边界感。
+      */
+      .burst-pulse {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 150vmax;
+        aspect-ratio: 1;
+        margin: -75vmax 0 0 -75vmax;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle closest-side,
+          rgba(var(--burst-rgb), 0.5) 0%,
+          rgba(var(--burst-rgb), 0.38) 25%,
+          rgba(var(--burst-rgb), 0.26) 50%,
+          rgba(var(--burst-rgb), 0.15) 72%,
+          rgba(var(--burst-rgb), 0.06) 90%,
+          rgba(var(--burst-rgb), 0) 100%
+        );
+        transform: scale(0.05);
+      }
+
+      .burst-haze {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 220vmax;
+        aspect-ratio: 1;
+        margin: -110vmax 0 0 -110vmax;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle closest-side at 42% 44%,
+          rgba(var(--burst-rgb), 0.26) 0%,
+          rgba(var(--burst-rgb), 0.2) 30%,
+          rgba(var(--burst-rgb), 0.13) 55%,
+          rgba(var(--burst-rgb), 0.07) 78%,
+          rgba(var(--burst-rgb), 0.02) 94%,
+          rgba(var(--burst-rgb), 0) 100%
+        );
+        transform: rotate(0deg) scale(0.06);
+      }
+
+      /* 尾段 opacity 微降 = 雾摊开后慢慢变薄消散；transform 跨 60% 帧直接插值 */
+      @keyframes burst-pulse {
+        from {
+          transform: scale(0.05);
+          opacity: 1;
+        }
+        60% {
+          opacity: 1;
+        }
+        to {
+          transform: scale(1);
+          opacity: 0.88;
+        }
+      }
+
+      @keyframes burst-haze {
+        from {
+          transform: rotate(0deg) scale(0.06);
+          opacity: 0.9;
+        }
+        60% {
+          opacity: 0.9;
+        }
+        to {
+          transform: rotate(26deg) scale(1);
+          opacity: 0.72;
+        }
+      }
+
+      /*
+        子动画必须挂在 .on 下：playBurst 靠「摘 class + 强制回流 + 重挂」重启动画，
+        挂在元素本身的话只在页面加载后跑一次并停在末帧，之后每次触发的全屏特效
+        都只剩 .burst 包络在明暗呼吸（扩散位移消失，实测「第二次起只有呼吸」）。
+      */
+      .burst.on .burst-pulse {
+        animation: burst-pulse var(--burst) cubic-bezier(0.3, 0.05, 0.35, 1) both;
+        will-change: transform, opacity;
+      }
+
+      .burst.on .burst-haze {
+        animation: burst-haze var(--burst) cubic-bezier(0.3, 0.1, 0.45, 1) both;
+        will-change: transform, opacity;
+      }
+
+      /* 四边向内的同色内辉光：雾漫到边缘才点亮（约 45% 时长前隐身，72% 时升满），
+         让整屏和边缘光带咬合成一个整体；雾体本身会把光送到边缘，alpha 比旧版略降 */
+      .burst-wash {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        box-shadow: inset 0 0 220px 40px rgba(var(--burst-rgb), 0.35);
+      }
+
+      .burst.on .burst-wash {
+        animation: burst-wash-in var(--burst) ease-in-out both;
+      }
+
+      @keyframes burst-wash-in {
+        0%,
+        45% {
+          opacity: 0;
+        }
+        72% {
+          opacity: 1;
+        }
+        100% {
+          opacity: 1;
+        }
+      }
+
+      /*
+        噪点抖动层（复用 .grain 的平铺噪声）：全屏铺满、盖在雾体三层最上面，
+        雾散「色彩断层」的根治层。
+
+        断层从哪来：亮核/薄雾是 alpha 0.5 → 0 的长尾坡，1080p 下摊在 ~1440px
+        半径上，0.5 的 alpha 只有约 128 级可分辨台阶——每 ~11px 才舍得换一级
+        灰阶，纯色壁纸上正好读成一圈圈同心「年轮」；.burst-wash 的 220px 大
+        模糊 inset 阴影是同款长坡。渐变色标写得再多也救不了：断层出在最终的
+        8-bit 量化（浏览器纹理 → 合成器 → DWM 上屏），不在插值。
+
+        治法与流光拖尾同一套（见 .grain 注释）：约 4% 不透明度的随机颗粒把
+        「整圈一起进位」打散成亚像素颗粒，扰动约 ±3~8 LSB，是 1 LSB 断层对比
+        的好几倍，几个像素外就被眼睛积分成连续坡。雾散这层用得比流光更省心：
+        两团雾本身偏心 + 反向旋转，环带互相错位连不成规整弧线，颗粒只需负责
+        残余的 1 LSB 条纹——所以不必再像 .spin 那样把衰减曲线重采样成 S 形
+        （那是改雾形，观感已定，不能动）。
+
+        不需要自己的动画：整层是 .burst 的子层，雾散包络（渐显渐隐）到哪它到
+        哪——雾多亮噪点就多重，一起淡出，全程零重绘零滤镜；不用时随 .burst 的
+        visibility: hidden 一起离场。黑白/彩色颗粒各半带来的轻微均匀灰幕峰值约
+        2%，只在特效那几秒里存在。
+
+        扫描（scan）不需要它：尾迹坡够陡（~1.7px 一级台阶），量化细到看不见，
+        颗粒只会脏了 HUD 亮线；扫描又没有包络（容器恒亮），留着会变成一块
+        不散的灰幕。显隐规则跟自己的层放一起，不再去分派清单里排一行。
+      */
+      .burst-grain {
+        position: absolute;
+        inset: 0;
+      }
+
+      #burst[data-effect="scan"] .burst-grain {
+        display: none;
+      }
+
+      /* ==================== 全屏特效（HUD 扫描） ==================== */
+
+      /*
+        移植自 doc/glow-burst-cool-designs.html 的 09「HUD 扫描」：一条水平亮线
+        带渐弱尾迹从顶扫到底——「系统正在处理」的科技感。
+        线只有 3px 量级（渐变带底缘 96%~99% 那一截）、尾迹 alpha ≤0.22，扫过
+        内容是「掠过」不是「盖住」。
+
+        **只有线，没有四角括号**：原设计的四角 L 括号在整屏扫动之外又钉了四个
+        静止锚点，余光里那四条折线比扫线本身更抢眼，且与「从上到下扫」这一个
+        动作无关，已删（.bk 元素与 bk-on 关键帧一并移除）。
+
+        与雾散相反，这组**没有容器包络**（见上面分派段的说明）：入场/出场全部
+        由扫描线自己的关键帧（both 填充）管理，动画外恒为 opacity:0，不留残影、
+        不占常驻开销。
+
+        时长沿用全屏特效统一的 --burst（Rust 侧下发）：关键帧全按百分比写，
+        时长变了只是节奏等比伸缩。
+      */
+
+      /* 扫描线：26% 屏高的渐变带，亮线在带子底缘；子元素静止时藏在 -105% 屏高外 */
+      #burst[data-effect="scan"] .scan {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        height: 26%;
+        opacity: 0;
+        background: linear-gradient(
+          to bottom,
+          transparent 0%,
+          rgba(var(--burst-rgb), 0.05) 55%,
+          rgba(var(--burst-rgb), 0.22) 86%,
+          rgba(var(--burst-rgb), 0.65) 96%,
+          color-mix(in srgb, rgb(var(--burst-rgb)) 45%, white) 99%,
+          transparent 100%
+        );
+        transform: translateY(-105%);
+      }
+
+      #burst[data-effect="scan"].on .scan {
+        animation: scan-down var(--burst) cubic-bezier(0.55, 0.1, 0.5, 0.9) both;
+        will-change: transform, opacity;
+      }
+
+      /* 亮线在元素底缘：-105% → 460%（自身高 26% × 4.6 ≈ 120% 屏高）恰好出画 */
+      @keyframes scan-down {
+        0% {
+          transform: translateY(-105%);
+          opacity: 0;
+        }
+        8% {
+          opacity: 1;
+        }
+        88% {
+          opacity: 1;
+        }
+        100% {
+          transform: translateY(460%);
+          opacity: 0;
+        }
+      }
+
+    </style>
+  </head>
+  <body>
+    <div id="glow" data-state="idle" data-effect="breathing" data-edge="on">
+      <!-- 全屏特效：每次颜色亮起补放一次（类型标记在 data-effect：fog=雾散 / scan=HUD 扫描） -->
+      <div class="burst" id="burst" data-effect="fog">
+        <i class="burst-pulse"></i>
+        <i class="burst-haze"></i>
+        <i class="burst-wash"></i>
+        <!-- 噪点抖动层：盖在雾体三层最上面，打散 8-bit 量化的同心环断层（见 .burst-grain 注释） -->
+        <i class="burst-grain grain"></i>
+        <!-- HUD 扫描：只有一条从上到下的亮线（移植自 doc/glow-burst-cool-designs.html 的 09） -->
+        <i class="scan"></i>
+      </div>
+      <!-- 灯效一：呼吸（静态暗晕垫底，颜色坡整层呼吸，只动 opacity） -->
+      <div class="breathe">
+        <i class="b-halo"></i>
+        <i class="b-glow"></i>
+      </div>
+      <!-- 灯效二：流光（静态暗晕垫底，整线打底、高光层在上、噪点抖动收尾、内侧深色细边框，首尾相连） -->
+      <div class="comet">
+        <div class="shadow"></div>
+        <div class="ring base"></div>
+        <div class="ring core"><i class="spin"></i></div>
+        <div class="ring grain"></div>
+        <i class="inner-edge"></i>
+      </div>
+    </div>
+    <script type="module" src="/src/glow.ts"></script>
+  </body>
+</html>

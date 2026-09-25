@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>agent-bark 托盘菜单</title>
+    <script>
+      /* 首帧定色：与 index.html / widget.html 内联脚本、src/theme.ts 同一套规则（改键名三处一起改） */
+      (function () {
+        try {
+          var p = localStorage.getItem("agent-bark.theme");
+          var t = p === "dark" || p === "light" ? p : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      /*
+        托盘菜单（点击托盘图标弹出）。窗口是透明、无边框、置顶、可聚焦的，
+        页面只渲染一个圆角面板，铺满窗口——窗口尺寸在 tray_menu.rs 定死
+        （MENU_W × MENU_H），这里的几何常量改了必须同步改 Rust 侧。
+
+        面板与菜单项样式与悬浮窗右键菜单（widget.html #ctx-menu）同一套：
+        同样的圆角 / 描边 / 半透明底 / 勾选列，深浅主题跟随系统。
+      */
+      :root {
+        /* 具体值由 <head> 里的内联脚本与 src/theme.ts 写到 data-theme 上 */
+        color-scheme: dark;
+      }
+      :root[data-theme="light"] { color-scheme: light; }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* 窗口透明：任何不透明背景都会在桌面上留一块色板 */
+        background: transparent;
+      }
+      body {
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        user-select: none;
+        cursor: default;
+      }
+      #menu {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        padding: 4px;
+        border-radius: 8px;
+        background: rgba(29, 29, 32, 0.97);
+        border: 1px solid rgba(51, 51, 56, 0.95);
+      }
+      .ctx-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        height: 28px;
+        flex-shrink: 0;
+        width: 100%;
+        padding: 0 8px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #e8e8ea;
+        font-family: inherit;
+        font-size: 12px;
+        text-align: left;
+        cursor: default;
+      }
+      /* body.no-hover：菜单常驻隐藏复用，重新弹出时 Chromium 不重算 ：hover，
+         上次点过的项会顶着悬停态出现——menu.ts 的 guardStaleHover 挂/摘（src/hover.ts） */
+      body:not(.no-hover) .ctx-item:hover { background: rgba(255, 255, 255, 0.08); }
+      /* 勾选列：四行菜单的对齐垫片，「静音」激活时显示 ✓ */
+      .ctx-check { width: 13px; flex-shrink: 0; text-align: center; color: #4493f8; }
+      .ctx-item.checked .ctx-check::before { content: "✓"; }
+      :root[data-theme="light"] #menu {
+        background: rgba(255, 255, 255, 0.97);
+        border-color: rgba(213, 213, 220, 0.95);
+      }
+      :root[data-theme="light"] .ctx-item { color: #232327; }
+      :root[data-theme="light"] body:not(.no-hover) .ctx-item:hover { background: rgba(0, 0, 0, 0.06); }
+    </style>
+  </head>
+  <body>
+    <div id="menu">
+      <button type="button" class="ctx-item" id="menu-show"><span class="ctx-check"></span>显示主窗口</button>
+      <button type="button" class="ctx-item" id="menu-glow"><span class="ctx-check"></span>重置流光</button>
+      <button type="button" class="ctx-item" id="menu-mute"><span class="ctx-check"></span>静音（暂停通知）</button>
+      <button type="button" class="ctx-item" id="menu-quit"><span class="ctx-check"></span>退出</button>
+    </div>
+    <script type="module" src="/src/menu.ts"></script>
+  </body>
+</html>

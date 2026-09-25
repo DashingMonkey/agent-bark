@@ -1,0 +1,38 @@
+# Rust
+target/
+**/target/
+
+# Node
+node_modules/
+**/node_modules/
+app/dist/
+dist/
+.pnpm-store/
+.vite/
+
+# Tauri
+app/src-tauri/gen/
+app/src-tauri/target/
+
+# 本地离线构建环境（本机 TLS 不通时用本地 registry 编译，见 .cargo-home/*.ps1）
+.cargo-home/
+
+# 沙箱/调试临时产物
+app/vite-sandbox-patch.mjs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local
+*.bak
+*.tmp
+# 本地快速打包脚本（个人用，不入库；发版用 build.bat）
+build-quick.bat
+.env
+.env.local
+
+# WorkBuddy 本地会话数据
+.workbuddy/

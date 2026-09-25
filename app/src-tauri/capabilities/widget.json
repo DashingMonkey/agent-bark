@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "widget",
+  "description": "悬浮窗权限：行数变化跟随尺寸（set-size）、拖动（start-dragging）、位置记忆读窗口几何（outer-position/scale-factor）、右键菜单撑高窗口（set-position/current-monitor）、自动隐藏收放窗口（hide/show），事件用 core:default 里的 listen",
+  "windows": ["widget"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-outer-position",
+    "core:window:allow-scale-factor",
+    "core:window:allow-current-monitor",
+    "core:window:allow-hide",
+    "core:window:allow-show"
+  ]
+}

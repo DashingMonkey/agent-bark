@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "glow-capability",
+  "description": "屏幕边缘流光覆盖窗口（label 形如 glow-0，运行时动态创建，故用通配）。权限最小化（§2.18）：glow.html/glow.ts 只用 @tauri-apps/api/event 的 listen（收 Rust 推来的 glow://state，卸载路径会调 unlisten），零 invoke、零窗口 API——故只给 core:event 的 listen/unlisten，不再给偏宽的 core:default（它连带 app/image/menu/path/resources/webview/window 全家桶）。构建/运行面若出现能力缺失（如后续 glow.ts 引入窗口 API），按实际用到的最小集补，不要回退成 core:default。",
+  "windows": ["glow-*"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

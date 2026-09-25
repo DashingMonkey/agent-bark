@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 让原生滚动条 / select 下拉等跟随系统主题（与 style.css 的 :root color-scheme 一致） -->
+    <meta name="color-scheme" content="dark light" />
+    <title>Agent Bark</title>
+    <script>
+      /*
+        首帧定色：主题偏好存在 localStorage（见 src/theme.ts），这里同步读一次并写到
+        <html> 上，避免「系统浅色 + 用户选深色」时先闪一下浅色。
+        必须在样式与模块之前内联执行，所以逻辑与 theme.ts 的 resolvedTheme 重复了一份
+        （改键名要三处一起改：index.html / widget.html / menu.html）。
+      */
+      (function () {
+        try {
+          var p = localStorage.getItem("agent-bark.theme");
+          var t = p === "dark" || p === "light" ? p : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {
+          /* 隐私模式等取不到 localStorage：按深色兜底，theme.ts 会再纠正一次 */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

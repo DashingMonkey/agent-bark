@@ -1,0 +1,708 @@
+:root {
+  /* 原生滚动条 / select 下拉 / 表单控件跟随主题。具体值由 theme.ts 按
+     「用户偏好 + 系统主题」解析后写在 <html> 上（首帧由 html 里的内联脚本先定），
+     这里只给不带 data-theme 时的兜底 */
+  color-scheme: dark;
+  --bg: #141416;
+  --panel: #1d1d20;
+  --panel-2: #252528;
+  --border: #333338;
+  --text: #e8e8ea;
+  --muted: #9a9aa2;
+  --brand: #6f6fff;
+  --brand-2: #4b3fe3;
+  --ok: #1dc981;
+  --warn: #efaa17;
+  --err: #e8463a;
+  /* 自绘标题栏：高度与按钮宽度对齐 Windows 11 原生标题栏比例 */
+  --titlebar-h: 34px;
+  --titlebar-btn-w: 46px;
+  --hover-bg: rgba(255, 255, 255, .08);
+  --hover-bg-strong: rgba(255, 255, 255, .14);
+  --close-hover: #e81123;
+  --close-hover-active: #f1707a;
+  /* 细滚动条（对齐 VS Code：半透明滑块，轨道透明） */
+  --scrollbar-thumb: rgba(121, 121, 121, .4);
+  --scrollbar-thumb-hover: rgba(121, 121, 121, .55);
+  --tooltip-shadow: 0 4px 14px rgba(0, 0, 0, .4);
+  /* 四态色板（思考/警告/完成/终止）：与屏幕光效同一套语义色。
+     深色取 GitHub Primer 深色语义色（= glow.rs GlowState::color），
+     浅色取对应浅色语义色（徽标文字在浅底上需要更深才够对比） */
+  --state-thinking: #4493f8;
+  --state-warning: #f0883e;
+  --state-completed: #3fb950;
+  --state-terminated: #f85149;
+  /* 表单控件规格：高度 / 圆角 / 底色 / 描边抽成一套变量，输入框、下拉框、时间框、
+     数字框共用一套几何，避免「每个控件各撑一个高度」。深色下用比卡片略亮的
+     面板底色（VS Code 的做法：控件是浮起来的），浅色下换成白底描边（见下方媒体查询）。 */
+  --control-h: 30px;
+  --control-radius: 7px;
+  --field-bg: #252528;
+  --field-border: #3d3d44;
+  --field-border-hover: #55555f;
+  /* 焦点态：描边换成品牌色 + 1px 内描边环（Radix Themes 的 ring-inset 做法）。
+     环贴在内侧，和边框合成一条干净的 2px 线——不外溢、不发光，
+     在卡片上不会糊出一圈淡紫的晕 */
+  --focus-ring: inset 0 0 0 1px var(--brand);
+  --menu-shadow: 0 10px 28px rgba(0, 0, 0, .45);
+  /* 下拉箭头自绘（原生箭头带一圈方形按钮区，两种主题下都发灰）。
+     data URI 里用不了 currentColor，只能深/浅主题各写一份色值 */
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.25 6.5 8 10.25 11.75 6.5' fill='none' stroke='%23a8a8b0' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* 亮色主题：由 theme.ts 在 <html> 上打 data-theme="light"（偏好为「跟随系统」时
+   由它按 matchMedia 解析）。这里只覆写颜色变量，媒体查询不再参与配色——
+   否则「系统浅色 + 用户显式选深色」会被媒体查询里的浅色变量盖掉 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f3f6;
+  --panel: #ffffff;
+  --panel-2: #e9e9ee;
+  --border: #d5d5dc;
+  --text: #232327;
+  --muted: #666670;
+  --brand: #4b3fe3;
+  --brand-2: #5748e8;
+  /* 亮色下加深 --ok / --warn：12px 文本需 ≥4.5:1（WCAG AA）。
+     对白底：#0a7345 ≈ 5.9:1，#855600 ≈ 6.3:1；
+     对 .ok-box / .warn-box 的 10% 混色底仍分别为 ≈5.1:1 / ≈5.0:1。 */
+  --ok: #0a7345;
+  --warn: #855600;
+  --err: #cf3428;
+  --hover-bg: rgba(0, 0, 0, .055);
+  --hover-bg-strong: rgba(0, 0, 0, .1);
+  --scrollbar-thumb: rgba(100, 100, 100, .35);
+  --scrollbar-thumb-hover: rgba(100, 100, 100, .5);
+  --tooltip-shadow: 0 4px 14px rgba(0, 0, 0, .16);
+  --state-thinking: #0969da;
+  --state-warning: #bc4c00;
+  --state-completed: #1a7f37;
+  --state-terminated: #cf222e;
+  /* 浅色下控件用白底 + 描边（macOS / Codex 设置页的做法）：
+     卡片本身就是白的，再给灰底会显得控件是「不可用」的 */
+  --field-bg: #ffffff;
+  --field-border: #cfcfd8;
+  --field-border-hover: #ababb6;
+  --menu-shadow: 0 10px 28px rgba(0, 0, 0, .16);
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.25 6.5 8 10.25 11.75 6.5' fill='none' stroke='%235c5c66' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--text);
+  user-select: none;
+}
+
+#app { height: 100vh; display: flex; flex-direction: column; }
+
+.layout { flex: 1; display: flex; min-height: 0; }
+
+/* ---- 自绘标题栏（取代 Windows 原生标题栏，样式参考 VS Code）---- */
+/* 整条都是拖拽区（data-tauri-drag-region="deep" 会向下穿透）；
+   按钮是 clickable 元素，drag.js 会自动把它们排除在拖拽之外 */
+.titlebar {
+  flex: 0 0 auto;
+  height: var(--titlebar-h);
+  display: flex;
+  align-items: center;
+  padding-left: 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.titlebar-brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+.titlebar-logo {
+  display: block;
+  width: 18px;
+  height: 18px;
+  /* 图标 PNG 自带透明圆角（半径 56/256），这里按同比例裁切，避免二次圆角啃掉图标边缘 */
+  border-radius: 4px;
+  -webkit-user-drag: none;
+}
+
+.titlebar-name {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.titlebar-controls { margin-left: auto; display: flex; height: 100%; }
+
+/* 覆盖全局 button 样式（品牌底色 / 圆角 / 内边距），做成原生标题栏按钮：
+   46×34 的整块热区，最小化/最大化悬停变浅，关闭悬停变红 */
+.titlebar-btn {
+  width: var(--titlebar-btn-w);
+  height: 100%;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  cursor: default;
+  transition: background .12s, color .12s;
+}
+/* 选择器带 .titlebar-controls 提权：否则会被全局 button:hover:not(:disabled) 盖过。
+   悬停/按下态统一挂 body:not(.no-hover) 门控：窗口隐藏再显示后 Chromium 不重算
+   ：hover，刚打开会顶着上次的悬停样式（比如关闭按钮红着）——门控见 src/hover.ts */
+body:not(.no-hover) .titlebar-controls .titlebar-btn:hover { background: var(--hover-bg); color: var(--text); opacity: 1; }
+body:not(.no-hover) .titlebar-controls .titlebar-btn:active { background: var(--hover-bg-strong); }
+.titlebar-btn:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+body:not(.no-hover) .titlebar-btn.close:hover { background: var(--close-hover); color: #fff; }
+body:not(.no-hover) .titlebar-btn.close:active { background: var(--close-hover-active); }
+
+/* 图标用 1px 描边画（对齐像素网格，DPR=1 下不糊） */
+.titlebar-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1; }
+
+/* 主题切换：codicon color-mode 是**填充型**图标（甚至靠 even-odd 抠出右半），
+   盖掉 .titlebar-icon 给描边图标准备的那套 fill:none + stroke */
+.titlebar-btn.theme-btn .titlebar-icon { fill: currentColor; stroke: none; }
+
+.sidebar {
+  width: 180px;
+  border-right: 1px solid var(--border);
+  padding: 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--panel);
+}
+
+/* 导航项使用 <button>，先重置按钮默认样式再套用原导航外观 */
+.nav-item {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: var(--muted);
+  transition: background .15s, color .15s;
+}
+/* 悬停/选中态同样提权，避免被全局 button:hover:not(:disabled) 盖过（门控见 .titlebar-btn 处注释） */
+body:not(.no-hover) .sidebar .nav-item:hover { background: var(--panel-2); color: var(--text); opacity: 1; }
+.sidebar .nav-item.active,
+body:not(.no-hover) .sidebar .nav-item.active:hover { background: var(--brand-2); color: #fff; }
+.nav-item:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+.content { flex: 1; overflow-y: auto; padding: 20px 24px; }
+
+.page-title { font-size: 17px; font-weight: 600; margin: 0 0 16px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.row { display: flex; align-items: center; gap: 10px; }
+.between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.col { display: flex; flex-direction: column; gap: 6px; }
+.grow { flex: 1; min-width: 0; }
+
+/* 徽标参考 GitHub labels：同色系半透明填充 + 彩色文字，不再描边 */
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  white-space: nowrap;
+}
+.badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.badge.on { color: var(--brand); background: color-mix(in srgb, var(--brand) 16%, transparent); }
+.badge.err { color: var(--err); background: color-mix(in srgb, var(--err) 14%, transparent); }
+.badge.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+/* 四态徽标（思考/警告/完成/终止）：配色与屏幕光效同一套 --state-*，
+   事件流与悬浮窗共用这套类（类名由 api.ts 的 eventBadgeClass / phaseBadgeClass 产出） */
+.badge.thinking { color: var(--state-thinking); background: color-mix(in srgb, var(--state-thinking) 15%, transparent); }
+.badge.warning { color: var(--state-warning); background: color-mix(in srgb, var(--state-warning) 15%, transparent); }
+.badge.completed { color: var(--state-completed); background: color-mix(in srgb, var(--state-completed) 15%, transparent); }
+.badge.terminated { color: var(--state-terminated); background: color-mix(in srgb, var(--state-terminated) 15%, transparent); }
+
+/* 按钮参考 VS Code：悬停/按压用明确的底色变化（不靠 opacity 糊一层），
+   键盘 Tab 有品牌色焦点环 */
+button {
+  background: var(--brand-2);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+/* 悬停/按下也挂 no-hover 门控（见 .titlebar-btn 处注释）：否则门控期间标题栏等
+   覆盖规则失效后会回落到这里，把按钮染成品牌色 */
+body:not(.no-hover) button:hover:not(:disabled) { background: var(--brand); }
+body:not(.no-hover) button:active:not(:disabled) { background: color-mix(in srgb, var(--brand-2) 80%, #000); }
+button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+body:not(.no-hover) button.ghost:hover:not(:disabled) { background: var(--hover-bg); }
+body:not(.no-hover) button.ghost:active:not(:disabled) { background: var(--hover-bg-strong); }
+button.danger { background: transparent; border: 1px solid color-mix(in srgb, var(--err) 50%, transparent); color: var(--err); }
+body:not(.no-hover) button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 10%, transparent); }
+/* 「屏幕光效」预览按钮：边缘（描边）直接用对应状态色（--state-* 与光效同一套语义色） */
+button.ghost.state-thinking { border-color: var(--state-thinking); }
+button.ghost.state-warning { border-color: var(--state-warning); }
+button.ghost.state-completed { border-color: var(--state-completed); }
+button.ghost.state-terminated { border-color: var(--state-terminated); }
+
+/* ---- 表单控件 ----
+   几何一律走 --control-h / --control-radius：定高、定圆角、指定内边距。
+   旧版没写死高度，输入框靠内容撑、时间框干脆没进这套选择器，一行里能排出三种高度。
+   交互三态：悬停提亮描边；聚焦 = 品牌色描边 + 1px 内描边环（见 --focus-ring）。
+
+   选择器一律套 :where()（特异性归零）：否则 `input:not([type=checkbox]):not([range]):focus`
+   这类写法会攒到 (0,3,1)，把 .input-group / .quiet-item 这些「组件内覆盖」压在下面——
+   表现就是组内输入框自己又画一圈焦点环，圆角容器里套个直角框，非常难看。 */
+:where(input[type="text"], input[type="number"], input[type="time"], input[type="search"], select, textarea) {
+  height: var(--control-h);
+  padding: 0 10px;
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
+  border-radius: var(--control-radius);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  min-width: 0;
+  /* 只过渡交互态真正用到的两个属性。**别把 background 放进来**：
+     底色只随主题变，跟着过渡会让输入框比周围卡片慢半拍地渐变过去，
+     主题切换的瞬时感全毁（悬停/聚焦本来也不改底色） */
+  transition: border-color .12s, box-shadow .12s;
+}
+textarea { height: auto; padding: 7px 10px; line-height: 1.5; }
+/* 数值类控件用等宽数字：改值时字宽不跳，多行数字也对得齐 */
+:where(input[type="number"], input[type="time"]) { font-variant-numeric: tabular-nums; }
+
+/* 悬停只提亮描边，不动底色（动底色会和「选中/禁用」的语义混起来） */
+:where(input[type="text"], input[type="number"], input[type="time"], input[type="search"], select, textarea):hover {
+  border-color: var(--field-border-hover);
+}
+:where(input[type="text"], input[type="number"], input[type="time"], input[type="search"], select, textarea):focus {
+  border-color: var(--brand);
+  box-shadow: var(--focus-ring);
+}
+:where(input[type="text"], input[type="number"], input[type="time"], input[type="search"], select, textarea):disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+::placeholder { color: color-mix(in srgb, var(--muted) 85%, transparent); }
+
+/* 下拉框：抹掉原生外观，箭头改用底色上方自绘的 chevron（深浅主题各一份），
+   右侧留出箭头位；展开的原生弹层在 Windows 上按 color-scheme 着色，这里补齐
+   option 的底色，避免深色主题下弹出一块白 */
+select {
+  appearance: none;
+  padding-right: 28px;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 13px 13px;
+  /* 选中项超长就地省略，不折行（个别 WebView2 版本的选中内容会折出第二行撑破
+     定高控件）；弹层 ::picker 在 top layer，不受这里的 overflow 影响 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+select option { background: var(--panel); color: var(--text); }
+
+/* 作者按钮在非 base-select 引擎里不参与渲染（原生闭合态只认 option），
+   但保险起见显式隐藏；base-select 引擎的接管样式在下面的 @supports 里 */
+select > button { display: none; }
+
+/* 下拉弹层自绘（Chrome 135+ / WebView2 135+）：
+   appearance: base-select 把原生弹层从「系统绘制」换成「页面内元素」，
+   只有这样才谈得上给弹层和选项做圆角 / 悬停高亮 / 品牌色选中态。
+   不支持的版本不认识这个关键字，会继续走上一条 select 规则（原生弹层），
+   样式退化但不会坏——所以这里用 @supports 包住，不做降级 hack */
+@supports (appearance: base-select) {
+  select,
+  select::picker(select) { appearance: base-select; }
+  /* 箭头继续用上面自绘的 chevron：两套外观（新老 WebView2）保持一致 */
+  select::picker-icon { display: none; }
+
+  /* base-select 的「已选中内容」由内部按钮渲染：按钮被拉伸到控件内容盒（28px），
+     行盒却贴在它顶部——实测文字比同排输入框高 5.4px（输入框墨迹中心 +1.3px，
+     下拉框 -4.1px，肉眼就是「内容偏上」）。把行高设成控件高度即可把行盒压回中线
+     （行盒比内容盒高 2px，溢出的 2px 不可见）；弹层里的选项必须还原行高，
+     否则每一项都会被撑到 30px */
+  select { line-height: var(--control-h); }
+  select option { line-height: normal; }
+
+  /* 作者按钮 + selectedcontent 接管闭合态的选中项渲染（官方推荐结构，见 MDN
+     Customizable select）。实测（WebView2 153 / Chrome 146）引擎把按钮按
+     display:contents 透传——不生成盒子，选中文字的布局与垂直居中都由 select
+     自身机制完成。这里显式声明 contents（压过上面的 display:none，也压过任何
+     版本 UA 样式表给按钮的盒模型，作者样式恒胜 UA），按钮在任何引擎版本下都
+     只是语义壳；selectedcontent 配单行省略号，作为超长选中项不折行的兜底 */
+  select > button {
+    display: contents;
+    /* display:contents 不挡继承：全局 button 规则（color:#fff）会漏进来，
+       浅色主题下选中文字变成白色不可见——显式归位到 select 的前景色 */
+    color: inherit;
+  }
+  select > button > selectedcontent {
+    display: block;
+    /* select 是 flex 容器且 align-items:normal（拉伸）：盒子被撑到内容盒高、
+       文字贴顶（实测偏上 5.25px）。收成内容高度交给交叉轴居中，文字随之居中 */
+    align-self: center;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: normal;
+  }
+
+  select::picker(select) {
+    margin-top: 4px;
+    padding: 4px;
+    background: var(--panel);
+    border: 1px solid var(--field-border);
+    border-radius: 10px;
+    box-shadow: var(--menu-shadow);
+  }
+  /* 选项：圆角高亮块（圆角比弹层小 4px，正好贴着弹层内边距），
+     悬停与键盘焦点同一套底色；选中项用品牌色淡底，不用原生那个丑勾 */
+  select option {
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+  }
+  select option:hover,
+  select option:focus { background: var(--hover-bg); }
+  select option:checked {
+    background: color-mix(in srgb, var(--brand) 20%, transparent);
+    color: var(--text);
+  }
+  select option::checkmark { display: none; }
+}
+
+/* 时间框的原生取色/取时图标：默认灰得很重，压暗一点、悬停与聚焦时提亮，
+   让它看起来是控件的一部分而不是贴上去的小方块 */
+input[type="time"]::-webkit-calendar-picker-indicator {
+  opacity: .5;
+  transition: opacity .12s;
+}
+input[type="time"]:hover::-webkit-calendar-picker-indicator,
+input[type="time"]:focus::-webkit-calendar-picker-indicator { opacity: .85; }
+
+textarea.code {
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+/* 数字 + 单位：单位收进控件内部右侧（ms / px），比在控件外面另起一个 span
+   更像一个整体；焦点环打在整组上，输入框自身去边框融进去 */
+.input-group {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-h);
+  padding-right: 10px;
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
+  border-radius: var(--control-radius);
+  transition: border-color .12s, box-shadow .12s;
+}
+.input-group:hover { border-color: var(--field-border-hover); }
+.input-group:focus-within { border-color: var(--brand); box-shadow: var(--focus-ring); }
+.input-group > input {
+  flex: 1;
+  height: 100%;
+  padding: 0 6px 0 10px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+}
+.input-group > input:hover,
+.input-group > input:focus { border: none; box-shadow: none; }
+/* 组内的数字框藏掉原生步进器：Chrome 那个带灰底的上下箭头只在悬停 / 聚焦时冒出，
+   又会紧贴着单位挤在一起（「3000 ⌃⌄ ms」）；改值仍可用键盘上下键 / 直接输入 */
+.input-group > input::-webkit-inner-spin-button,
+.input-group > input::-webkit-outer-spin-button { appearance: none; margin: 0; }
+.input-unit { font-size: 12px; color: var(--muted); user-select: none; }
+
+/* 勾选框跟随品牌色（原生 accent 是 Chrome 蓝，和界面的紫不是一套） */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
+
+/* 顶部对齐的行：左侧标签按右侧「首行控件」的中线对齐，
+   用于右侧是列表 / 多行内容的字段（如免打扰时段） */
+.row.top { align-items: flex-start; }
+.row.top > .field-label { padding-top: 6px; }
+
+/* 只读值的等宽芯片：服务信息里的地址 / token 这类「照抄用」的值 */
+.code-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  user-select: text;
+}
+
+/* 开关类设置行（设置页 / 悬浮窗页共用）：左标题 + 一行说明、右控件，
+   行间发丝线分隔（VS Code / Codex 设置页的排法）。
+   卡片内边距是 16px，行自身留白 10px；首末行各收掉，让卡片边缘与行距同一套节奏 */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+}
+.setting-row + .setting-row { border-top: 1px solid var(--border); }
+.setting-row:first-child { padding-top: 2px; }
+.setting-row:last-child { padding-bottom: 2px; }
+
+.setting-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setting-label { font-size: 13px; font-weight: 500; }
+
+.switch { position: relative; width: 38px; height: 21px; flex-shrink: 0; cursor: pointer; }
+/* 不用 display:none，保持键盘 Tab 与读屏可达；透明覆盖在轨道上方，点击行为不变 */
+.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.switch input:disabled { cursor: not-allowed; }
+.switch input:focus-visible + .track { outline: 2px solid var(--brand); outline-offset: 2px; }
+.switch .track {
+  position: absolute; inset: 0;
+  /* 关态用半透明的文字色（跟随深浅主题自动变浅/变深），
+     比原来的「面板底 + 描边」更轻，也不会和卡片糊成一块 */
+  background: color-mix(in srgb, var(--text) 20%, transparent);
+  border-radius: 999px;
+  transition: background .15s;
+}
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 3px; left: 3px;
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  /* 圆点两态都是白色：关态的灰轨道 / 开态的品牌色轨道上都够醒目 */
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .35);
+  transition: transform .15s, background .15s;
+}
+.switch input:checked + .track { background: var(--brand-2); }
+.switch input:checked + .track::after { transform: translateX(17px); }
+
+.hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+/* 提示框不再自带 margin-top，间距一律由 .mt-* 工具类显式给出 */
+.warn-box {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  color: var(--warn);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.ok-box {
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent);
+  color: var(--ok);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.agent-name { font-weight: 600; font-size: 14px; }
+.agent-path { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
+/* 多路径时每个子项独占一行；超长路径就地折行，不能横向撑破卡片 */
+.agent-path > span { display: block; overflow-wrap: anywhere; }
+
+/* 分组卡内的小节标题：比 .agent-name 低一级（如「生效显示器/灯效/外观与节奏/预览」） */
+.section-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+/* agent 品牌图标（内联 SVG，来源见 assets/agents/README.md）：
+   彩色图标自带品牌色，mono 图标走 currentColor 跟随文字色 */
+.agent-icon { display: inline-flex; flex-shrink: 0; }
+.agent-icon svg { width: 16px; height: 16px; display: block; }
+
+/* Agents 卡片右侧的「接入说明」图标（感叹号，描边 SVG）：
+   裸图标不套底圈，悬停提亮，光标保持默认箭头（VS Code info icon 的做法） */
+.help-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: var(--muted);
+  cursor: default;
+  transition: color .12s;
+}
+.help-mark:hover { color: var(--text); }
+.help-mark svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  stroke-linecap: round;
+}
+.help-mark svg .dot { fill: currentColor; stroke: none; }
+
+/* 标签 + 悬停提示图标一行（设置页 / 悬浮窗页共用）：图标紧跟标签（.row 的 10px 间距太开） */
+.label-line { display: inline-flex; align-items: center; gap: 3px; }
+/* 光学对齐：图标盒居中（与右侧控件同轴），中文字形墨迹中心比行盒中线低约 0.05em，
+   文字上移补齐（与 Bootstrap Icons 的 vertical-align: -.125em 同一招：经验值） */
+.label-line .label-text { transform: translateY(-0.05em); }
+
+/* 全局悬停提示（v-tooltip 指令挂的单例，见 tooltip.ts） */
+.tooltip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 340px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--tooltip-shadow);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .1s;
+}
+.tooltip.show { opacity: 1; }
+
+/* 右下角 toast（保存结果等操作反馈，单例容器见 toast.ts）：
+   面板底 + 语义色侧条 + 同色图标，文字保持 --text（错误文案要可读优先）。
+   容器 pointer-events:none、单条再打开：空档不会挡住底下页面的点击 */
+.toast-box {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 360px;
+  padding: 9px 14px 9px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: 8px;
+  box-shadow: var(--tooltip-shadow);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+  animation: toast-in .22s cubic-bezier(.2, .8, .3, 1);
+}
+
+.toast svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toast.success { border-left-color: var(--ok); }
+.toast.success svg { color: var(--ok); }
+.toast.error { border-left-color: var(--err); }
+.toast.error svg { color: var(--err); }
+
+/* 离场：淡出并滑回（transform 与入场动画同一套位移，走过渡不走动画） */
+.toast.out {
+  opacity: 0;
+  transform: translateX(16px);
+  transition: opacity .18s ease, transform .18s ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* 细滚动条：对齐 VS Code（半透明滑块、透明轨道、悬停提亮） */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); }
+
+/* 文本选区用品牌色（默认蓝在深色主题里太刺眼） */
+::selection { background: color-mix(in srgb, var(--brand) 40%, transparent); }
+
+.card.disabled { opacity: 0.45; }
+.card.disabled .switch { cursor: not-allowed; }
+
+/* Agents 页分组标题（已检测到 / 未检测到 / 暂不支持接入），用于把几类软件分开 */
+.group-title { font-size: 12px; color: var(--muted); margin: 6px 2px 8px; }
+
+.event-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
+.event-item:last-child { border-bottom: none; }
+.event-time { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
+.event-msg { font-size: 13px; margin-top: 3px; white-space: pre-wrap; word-break: break-all; user-select: text; }
+
+.empty { text-align: center; color: var(--muted); padding: 48px 0; }
+
+/* 纯信息文本允许选中复制（排障用），body 其余保持 user-select: none */
+.agent-path, .hint, .empty, .warn-box, .ok-box, .tooltip { user-select: text; }
+
+/* 间距与布局工具类 */
+.mt-8 { margin-top: 8px; }
+.mt-10 { margin-top: 10px; }
+.mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; }
+.mb-12 { margin-bottom: 12px; }
+.mb-14 { margin-bottom: 14px; }
+.w-full { width: 100%; }
+.flex-2 { flex: 2; }
+/* 表单行左侧固定宽度标签列：收窄到放下最长标签（6 个汉字 ≈ 72px）再留少量余量，
+   避免短标签（「灯效」「思考」等）与右侧控件之间空隙过大 */
+.field-label { width: 96px; }
+/* 窄数字输入（替代 inline style="width: 110px"） */
+.input-narrow { width: 110px; }
+/* 更窄：只放 1~10 这类一位两位数（如声音的播放次数），和 110px 档拉开差距 */
+.input-tiny { width: 72px; }
+/* 「生效显示器」下拉：不铺满整行，但要放得下「1.显示器1(1920*1080)（主显示器）」 */
+.select-wide { max-width: 340px; }
+/* 事件列表卡片需要更小的内边距（替代 inline style="padding: 4px 16px"） */
+.card-tight { padding: 4px 16px; }
