@@ -30,9 +30,9 @@
 | `run_failed` | 回合出错 | 是 |
 | `run_aborted` | **用户主动中止**（自己按的停止/中断） | 否（流光在没有别的会话在跑时直接收起，见 configuration.md 的状态推导表） |
 
-> **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮终止色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮终止色；真回合失败仍由回合结束信号 + 心跳判死兜底。
+> **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败仍由回合结束信号 + 心跳判死兜底。
 
-> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 是运行中被归档、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮终止色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮终止色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
+> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 是运行中被归档、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
 
 **各 agent 的「手动中止」信号现状**（2026-09 核对，详情见各节）：
 
@@ -85,7 +85,7 @@
 **坑**：`~/.claude/settings.json` 常被手工编辑，若文件不是合法 JSON，我们**拒绝写入**（不会把你的配置覆盖成空对象）。UI 会显示「配置损坏」并给出文件路径。
 
 **中止信号（2026-09 按官方文档补齐，⚠️ 本机未安装 Claude Code，未实测）**：官方 hooks 文档（code.claude.com/docs/en/hooks，33 事件）明确 **Stop 在用户中断（Esc）时不触发**——中断的回合收不到完成信号。归途有二：
-- `SessionEnd`（reason: clear / logout / prompt_input_exit / other）：会话级结束。中断回合后**退出会话**就靠它释放「运行中」条目（归一成 run_aborted，不通知不亮终止色）；正常回合 Stop 之后紧跟的 SessionEnd 落在 10s 终态回声宽限窗内被抑制，更晚退出会记一条「已中止」（会话确实结束了，语义成立）。
+- `SessionEnd`（reason: clear / logout / prompt_input_exit / other）：会话级结束。中断回合后**退出会话**就靠它释放「运行中」条目（归一成 run_aborted，不通知不亮失败色）；正常回合 Stop 之后紧跟的 SessionEnd 落在 10s 终态回声宽限窗内被抑制，更晚退出会记一条「已中止」（会话确实结束了，语义成立）。
 - **中断后不退出、也不再继续**的会话仍无信号，只能等 10 分钟判死（能力边界，非遗漏）。
 另：`StopFailure`（回合因 API 错误结束）是 Claude Code 唯一的回合真失败信号，较新版本才有；若老版本对未知事件键严格校验会丢整份 hooks——真遇到就关掉开关回退，事件流可观测。
 
@@ -105,7 +105,7 @@
 - TraeCode **没有失败事件**，所以收不到 `run_failed`；
 - **手动中止无信号**（官方文档 docs.trae.cn/ide_hook-configuration-reference，2026-09 核对）：官方事件表就 6 个，没有 SessionEnd、没有中断事件；中断的回合只能等继续对话（UserPromptSubmit 会刷新会话）或 10 分钟判死。这是官方事件表的能力边界，后续版本加了 SessionEnd 再补；
 - `PreToolUse` 是阻塞型 hook，我们的子命令恒为放行（exit 0、不输出 stdout），不影响工具执行；
-- 心跳（activity）是「思考中 / 执行工具」实时状态的来源，缺了它流光只会亮警告 / 完成 / 终止色，不会亮思考色。
+- 心跳（activity）是「思考中 / 执行工具」实时状态的来源，缺了它流光只会亮等待 / 完成 / 失败色，不会亮思考色。
 
 ---
 
@@ -130,7 +130,7 @@
 | id | `qoder` |
 | 配置文件 | **`~/.qoder/settings.json`（国际版，桌面应用 / IDE / CLI 三个入口共用）** · **`~/.qoder-cn/settings.json`（国内版 Qoder CN）** |
 | 安装标记 | `~/.qoder` 或 `~/.qoder-cn` 目录存在（装任一版本都能检测到） |
-| 注册事件 | `UserPromptSubmit`→activity、`PreToolUse`→activity、`Notification`→**见下（授权等待=警告色）**、`PostToolUseFailure`→tool_failed、`Stop`→run_completed、**`SessionEnd`→run_aborted（主动中断清场）** |
+| 注册事件 | `UserPromptSubmit`→activity、`PreToolUse`→activity、`Notification`→**见下（授权等待=等待色）**、`PostToolUseFailure`→tool_failed、`Stop`→run_completed、**`SessionEnd`→run_aborted（主动中断清场）** |
 | 需要你做 | 改完配置**要完全退出并重启对应应用**（三个入口都只在启动时加载 hooks） |
 
 > 国际版与国内版**合并成一条 adapter**（与 TraeCode 的「国际版 / 国内版」同样式）：存在哪个配置文件就写哪个，两个都在就都写——一般人不会同时装两个版本。原来的独立条目 `qoder-cn` 已下线，老配置里的开关会在加载时并到 `qoder` 上。
@@ -141,8 +141,8 @@
 
 - **国际版**：桌面应用 `Qoder v0.2.3`（`QODER_HOOK_SOURCE=cli`、hook 协议 `1.1.47`）与 IDE（`=ide`、`1.29.0`）**都从 `~/.qoder/settings.json` 读 hooks**；应用重写该文件时会**保留**我们写入的 `hooks` 键；
 - **国内版**：CN IDE **实测读 `~/.qoder-cn/settings.json`**（`QODER_HOOK_SOURCE=ide`、协议 `1.29.0`）。⚠️ 官方帮助文档（`help.aliyun.com/zh/lingma/hooks`）至今仍写 `~/.lingma/settings.json`，那是灵码时代「VS Code 插件线」的家——埋在那儿的探针**一次都没被调起**，CN 自带引擎（`resources/app/resources/bin/…/QoderCN.exe`）里也搜不到任何 `.lingma` 文件路径，只有 `.qoder-cn/shared_client`。**别照文档改回去**；
-- 「等你授权」两版一致：**`Notification` + `notification_type=permission_prompt`**（`message` 形如 `Tool Bash requires confirmation`）→ 归一到 `InputRequired` 后被 `normalize()` 升级为 `PermissionRequired` → 警告色「需要确认」；
-- 「主动中断」两版一致：正常回合是 `… Stop` + `SessionEnd`（相隔约 150ms），**用户主动中断的回合只有 `SessionEnd`、没有 `Stop`**。不注册 `SessionEnd` 的话，被中断的会话会永远留在「运行中」列表、流光一直停在思考色；它归一成 `run_aborted`（中止）——会话立即清出列表，流光在没有别的会话在跑时直接收起（不亮终止色也不亮完成色、不通知，那是你自己按的停止）。正常回合那条 `SessionEnd` 会被状态机的**终态回声**抑制（不重复处理、不压掉完成色）；
+- 「等你授权」两版一致：**`Notification` + `notification_type=permission_prompt`**（`message` 形如 `Tool Bash requires confirmation`）→ 归一到 `InputRequired` 后被 `normalize()` 升级为 `PermissionRequired` → 等待色「需要确认」；
+- 「主动中断」两版一致：正常回合是 `… Stop` + `SessionEnd`（相隔约 150ms），**用户主动中断的回合只有 `SessionEnd`、没有 `Stop`**。不注册 `SessionEnd` 的话，被中断的会话会永远留在「运行中」列表、流光一直停在思考色；它归一成 `run_aborted`（中止）——会话立即清出列表，流光在没有别的会话在跑时直接收起（不亮失败色也不亮完成色、不通知，那是你自己按的停止）。正常回合那条 `SessionEnd` 会被状态机的**终态回声**抑制（不重复处理、不压掉完成色）；
 - `Stop` 带 `last_assistant_message`（助手回复全文），已优先取作通知正文；桌面应用模式下 `cwd` 是它自己的会话目录（`…\Documents\Qoder\<日期>\<会话id>`），项目名推导会自动跳过会话 id / 日期这类目录段；
 - ⚠️ **国内版桌面应用启动时会整份重写 `~/.qoder-cn/settings.json`**（连 CN IDE 自己的插件键都一起冲掉），我们写的 hooks 会被清掉。UI 侧已把「配置开着但 hook 不在」显示成开关关闭，点一下即重新写入（见 §0 与排查清单）。
 
@@ -151,7 +151,7 @@
 | 入口 | 是否读对应配置 | 状态 |
 | --- | --- | --- |
 | Qoder 桌面应用（国际版）/ IDE / CLI | ✅ `~/.qoder/settings.json` | 探针实测通过 |
-| Qoder CN IDE | ✅ `~/.qoder-cn/settings.json` | **端到端验证通过**（2026-09-10：授权弹窗亮起警告色、主动中断立刻清场不卡在思考色） |
+| Qoder CN IDE | ✅ `~/.qoder-cn/settings.json` | **端到端验证通过**（2026-09-10：授权弹窗亮起等待色、主动中断立刻清场不卡在思考色） |
 | Qoder CN JetBrains 插件 | 同家目录、同引擎（`shared_client/bin/QoderCN.exe`） | 不适用（见下） |
 | Qoder CN CLI（独立发行版） | 官方 CLI 文档写的就是这份 | 待验证 |
 | Qoder CN VS Code 插件 | ✖ 不读——`tongyi-lingma 2.6.7` 引擎里没有任何 hook 事件代码 | 该产品线不支持 hooks |
@@ -213,9 +213,9 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 - **`matcher` 键整个省略**：文档说缺省/空串/`*` 都是「匹配全部」，但有严格解析器会把空串当非法、进而丢弃整份来源；
 - **`PermissionRequest` 是阻塞型，hook 可以返回 Allow/Deny**，而且**同事件 hook 串行执行、后写的决定覆盖先写的**（一个放行 hook 能悄悄盖掉别人写的 deny）。我们只通知：**永远不输出决定**（stdout 为空、退出 0），任何异常都 fail-closed 回 ZCode 自己的权限流程；条目 `timeoutMs` 也只给 5000（同类实现给这个事件配到 600000，是因为它真的要替用户做决定）。代价：授权提示会多等我们一下——daemon 在跑是毫秒级，daemon 未运行最坏约 2 秒（bark-cli 读 stdin 的 2s 超时）；
 - **只有 7 个事件**，没有 `Notification`、`SessionEnd`、子代理生命周期事件。**实测：手动终止（停止按钮 / Esc）一个 hook 都不发**——两种时机都验过：① 模型思考中中断，探针停在 `PostToolUse`；② **工具正在执行时中断**（让它跑 `sleep 180`，在 130 秒内中断），探针停在 `PreToolUse`。更细的一层：ZCode 内部其实**试图**调 `PostToolUseFailure`，但 1ms 内就把 hook 进程取消了（日志里是 `hook.run.failed`），所以我们什么都收不到；文档里的 `is_interrupt` 字段在当前版本的中断路径上从未出现。
-  **对策（非官方）**：daemon 会**每秒增量读一次 ZCode 的本地日志**（`~/.zcode/cli/log/zcode-<日期>.jsonl`），识别中断记录后合成一条 **`run_aborted`（中止）**——效果是**按停止后约 1 秒内**会话清出列表、流光在没有别的会话在跑时直接收起（不亮终止色、不亮完成色、不通知；与 Qoder 的 `SessionEnd`、DSH 的 `aborted` 统一到同一类）。判据见下文「中断信号」；应用升级改了日志格式时会自然退化回判死超时，不会误报。不想让它读日志，关掉 ZCode 接入开关即可（那时它完全不工作）。
+  **对策（非官方）**：daemon 会**每秒增量读一次 ZCode 的本地日志**（`~/.zcode/cli/log/zcode-<日期>.jsonl`），识别中断记录后合成一条 **`run_aborted`（中止）**——效果是**按停止后约 1 秒内**会话清出列表、流光在没有别的会话在跑时直接收起（不亮失败色、不亮完成色、不通知；与 Qoder 的 `SessionEnd`、DSH 的 `aborted` 统一到同一类）。判据见下文「中断信号」；应用升级改了日志格式时会自然退化回判死超时，不会误报。不想让它读日志，关掉 ZCode 接入开关即可（那时它完全不工作）。
   「等你输入」只覆盖走 `PreToolUse`/`PermissionRequest` 的提问（`AskUserQuestion`），计划模式批准（`ExitPlanMode`）按「需要确认」通知——这类交互本身**不能**由 hook 代替你回答；
-- **`PostToolUse` 注册为 `tool_finished`（工具收尾）**：它是**等待状态解除的唯一信号**——答完 `AskUserQuestion` / 批完权限后，agent 要先思考一段时间才可能调下一个工具，这期间没有 `PreToolUse`（下一次工具开始才有）、没有 `UserPromptSubmit`（新回合才有）。曾经以「进程开销翻倍」为由不注册它，实测代价算错了方向：每轮多 3 次起进程（毫秒级）几乎无感，而「答完问题后警告色卡几十秒、直到下一个工具才开始」是用户每天可见的（实测复现）。它当心跳处理：相位回落思考中、会话留在表里；不通知、不入历史、不响音效（与 `activity` 同口径的纯状态信号）。注意收尾时点=工具结束：被批准工具**执行期间**相位仍是等待中（那段时间本来就没有事件），收尾才解除；乱序晚到（Stop 之后才到）由状态机的回声防护抑制，不会复活刚结束的会话。
+- **`PostToolUse` 注册为 `tool_finished`（工具收尾）**：它是**等待状态解除的唯一信号**——答完 `AskUserQuestion` / 批完权限后，agent 要先思考一段时间才可能调下一个工具，这期间没有 `PreToolUse`（下一次工具开始才有）、没有 `UserPromptSubmit`（新回合才有）。曾经以「进程开销翻倍」为由不注册它，实测代价算错了方向：每轮多 3 次起进程（毫秒级）几乎无感，而「答完问题后等待色卡几十秒、直到下一个工具才开始」是用户每天可见的（实测复现）。它当心跳处理：相位回落思考中、会话留在表里；不通知、不入历史、不响音效（与 `activity` 同口径的纯状态信号）。注意收尾时点=工具结束：被批准工具**执行期间**相位仍是等待中（那段时间本来就没有事件），收尾才解除；乱序晚到（Stop 之后才到）由状态机的回声防护抑制，不会复活刚结束的会话。
 - **子代理不做识别**：实测载荷里没有 `agent_type`/`agent_id`/`is_subagent`（主会话与子代理都只有 `session_id`），所以 ZCode 的子代理事件**会照常通知**。通用的「`agent_type` 非空即判子代理」启发式对 ZCode 会误伤主会话，适配器里已显式覆盖：只认 `is_subagent`/`subagent` 显式布尔值与 `sess_subagent_*` 会话命名；
 - **别指望项目级 hooks**：写在 `<工作区>/.zcode/config.json` 或 `zcode.json` 里的 `hooks` 在现行版本被整体忽略（日志记 `config_project_hooks_ignored`），设置页也隐藏了工作区作用域入口；只有用户级这份生效；
 - **同一份文件里可能有别的工具的条目**（clawd / OpenViking / Hindsight 等都往这里合并 hook）。我们只在数组末尾追加**自己的独立组**、按条目摘除，既不并入也不重排别人的组；反过来，clawd 见到我们的 `PermissionRequest` 条目会拒绝注册它自己的阻塞 hook（它的自我保护，对我们无影响）；
@@ -281,7 +281,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 | --- | --- | --- | --- |
 | `agent/turn-stopping` | serial（无 `next()`） | `run_completed` | 会话日志里最后一条 `assistant/message` 的 text 块；取不到退「回合 N 结束」 |
 | `agent/status` running | emit | `activity` | 只发根会话，喂「运行中会话」与流光 |
-| `agent/status` running→idle | emit | 兜底终态 | 本回合没被 `turn-stopping` 报过才发；按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮终止色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底） |
+| `agent/status` running→idle | emit | 兜底终态 | 本回合没被 `turn-stopping` 报过才发；按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮失败色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底） |
 | `agent/error` | emit | `run_failed` | `payload.error`（DSH 声明为 `unknown`）：字符串直用、对象取 `message`、否则截断 JSON |
 | `approval/request` | waterfall | `permission_required` | `toolName：reason`；观察完必须 `next()` |
 | `user-questions/request` | waterfall | `input_required` | 首个问题的 `header：question`；同样必须 `next()` |
@@ -317,7 +317,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 - 非官方方案：**应用升级可能失效**（已在 2.137.1 实测校准状态机），UI 上标「监控型」；
 - 读库采用「先复制 db 与 `-wal` 到临时目录再打开」，避免与宿主写锁冲突；两次复制无法保证同一时点，极端情况下会读到撕裂快照（单轮失败可接受，下轮自愈）；
 - 监控型拿不到每回合的 `UserPromptSubmit`/`PreToolUse`，所以靠周期性心跳（activity）维持「运行中」——否则 daemon 侧 10 分钟无活动会把会话判死，流光永远不亮思考色。**「接入成功但流光不亮」多半就是心跳没发出去**。
-- 状态跃迁映射：`working/planning` → `pending` = 等输入（警告色）；→ `completed` = 完成（完成色）；→ `terminated`/`error` = 失败（终止色）；**运行中被 `archived` = `run_aborted`（中止：不亮终止色也不亮完成色，没有别的会话时收起光效）**。`terminated` 分不清「用户终止」还是「进程挂了」，保守按失败处理（终止色）——这是本仓唯一一处中止语义做不到精确的地方。
+- 状态跃迁映射：`working/planning` → `pending` = 等输入（等待色）；→ `completed` = 完成（完成色）；→ `terminated`/`error` = 失败（失败色）；**运行中被 `archived` = `run_aborted`（中止：不亮失败色也不亮完成色，没有别的会话时收起光效）**。`terminated` 分不清「用户终止」还是「进程挂了」，保守按失败处理（失败色）——这是本仓唯一一处中止语义做不到精确的地方。
 
 ---
 
@@ -345,7 +345,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 - **非官方机制，TraeWork 升级可能失效**（换密钥常量 / 改 schema）：可用性探针（HMAC 校验 + 解密 + 查询，重试 3 次）失败时 UI 给出具体原因；核对工具 `tools/traework-probe.mjs`（`verify` / `strings` / `decrypt` / `dump` / `sql` 子命令，`strings` 扫 `ai_agent.dll` 判断密钥常量是否变更，用法见文件头注释），以及本机冒烟测试 `cargo test -p bark-adapters --lib -- --ignored`；
 - **`-wal` 必须一起看**（2026-09-24 事故教训）：宿主是 SQLite WAL 模式，新提交先落 `database.db-wal`、checkpoint 后才进主库，实测 `-wal` 常驻 4-5MB（上千帧）——旧实现只解主库、轮询指纹也只看主库，导致 checkpoint 之前的新回合**全程不可见**（当天两次提问均无光效，事件一个都没发）。现在 `decrypt_db` 按 SQLite WAL 恢复语义把 `-wal` 帧叠回明文库（checksum 链 + 页级 HMAC + 只到最后提交帧，RESTART checkpoint 残留的陈旧尾帧被链式校验排除），轮询指纹同样盯住 `-wal`；
 - 每轮把整库读入内存再解密（75MB 级，AES-NI 下几十毫秒），结果写临时文件后 rusqlite 只读查询；
-- 与 WorkBuddy 同款「先快照再推断」：撕裂快照单轮失败可接受、下轮自愈（连续失败每 12 轮 warn 一次）；运行中回合的行从库里消失（会话被删）时主动发 `run_aborted` 闭环，不让 daemon 侧 10 分钟后僵死判死误亮终止色。
+- 与 WorkBuddy 同款「先快照再推断」：撕裂快照单轮失败可接受、下轮自愈（连续失败每 12 轮 warn 一次）；运行中回合的行从库里消失（会话被删）时主动发 `run_aborted` 闭环，不让 daemon 侧 10 分钟后僵死判死误亮失败色。
 
 **备选路线（未采用，供后续参考）**：TraeWork 个人版支持 **MCP**（设置里手动配置 stdio/HTTP server；或项目级 `.trae/mcp.json`，需在 设置 > MCP 打开「启用项目级 MCP」）与 **Skill**（`SKILL.md` 放 `%userprofile%/.trae-cn/skills/` 全局生效，或项目 `.trae/skills/`；规则可用全局规则或 `AGENTS.md`）。组合方式：做一个 notify 型 MCP 工具 + Skill/规则要求模型在关键节点调用。缺点：**模型可能忘调**（可靠性不如库轮询）、事件粒度糙、拿不到干净的中止信号。适合做补充（如回合内的细节信号），不适合做主路线。
 
@@ -393,11 +393,11 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 **回合结束后流光一直停在思考色、「运行中会话」列表里那条不消失**：说明这次回合结束的信号没被我们收到。已知情形：
 - Qoder / Qoder CN **用户主动中断**时只有 `SessionEnd`、没有 `Stop`（见 §4，已注册处理 → `run_aborted`）；
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
-- 其它 agent 若进程被直接杀掉，不会有任何终态事件——这种情况靠**心跳静止判死**兜底（流光转终止色、条目清出列表）。
+- 其它 agent 若进程被直接杀掉，不会有任何终态事件——这种情况靠**心跳静止判死**兜底（流光转失败色、条目清出列表）。
 - **判死时长**默认 10 分钟，由后台巡检每 30s 检查一次（不需要等下一条事件到来——早期版本只在有新事件时才算判死，所以会一直卡在思考色，已修）。想让中断后的反馈更快，用环境变量 `BARK_STALE_AFTER_MS`（毫秒，最小 5000）覆盖，例如 `BARK_STALE_AFTER_MS=60000` = 静默 1 分钟即判死；代价是**长时间跑单个工具**时可能被误判成「意外终止」。
 - **不想等**：托盘菜单 →「重置流光」立刻驱散当前颜色（下一次事件到来时按正常逻辑重新点亮），会话条目也会在下一次快照时消失。
 
-**手动中止后流光为什么不亮终止色也不亮完成色**：这是刻意的。用户主动中止归一成 `run_aborted`——不是失败（不亮终止色、不弹「任务失败」）也不是完成（不亮完成色、不谎报跑完）；没有别的会话在跑时**直接收起光效**，还有别的会话在跑就照常显示它们的状态。若你看到某个 agent 中止后仍亮完成 / 终止色，说明它的中止信号还没被归到这一类（见 §0 的说明与各 agent 的「注册事件」一行）。
+**手动中止后流光为什么不亮失败色也不亮完成色**：这是刻意的。用户主动中止归一成 `run_aborted`——不是失败（不亮失败色、不弹「任务失败」）也不是完成（不亮完成色、不谎报跑完）；没有别的会话在跑时**直接收起光效**，还有别的会话在跑就照常显示它们的状态。若你看到某个 agent 中止后仍亮完成 / 失败色，说明它的中止信号还没被归到这一类（见 §0 的说明与各 agent 的「注册事件」一行）。
 
 ---
 

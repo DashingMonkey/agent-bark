@@ -123,7 +123,7 @@ fn token_matches(configured: &str, presented: &str) -> bool {
 ///
 /// 为什么：服务端此前只把 `timestamp == 0` 换成 now、其余信任客户端。伪造/错算的
 /// **未来时间戳**（如插件把秒当毫秒 ×10⁶）会让 daemon 把全部活跃会话判死（误亮
-/// 终止色），而未来时间戳的会话反而永不判死（`saturating_sub` 恒 0）；过旧时间戳
+/// 失败色），而未来时间戳的会话反而永不判死（`saturating_sub` 恒 0）；过旧时间戳
 /// 绕过 stale 重放判定。夹取是服务端半边的防御（客户端半边另修），见报告 §1.7。
 fn normalize_timestamp(ts: i64, now: i64) -> i64 {
     if ts == 0 {

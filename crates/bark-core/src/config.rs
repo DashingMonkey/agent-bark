@@ -57,7 +57,7 @@ impl Default for StateSound {
 
 /// 通知设置。
 ///
-/// 桌面 Toast 与系统提示音已下线，只剩「状态音效」：思考 / 警告 / 完成 / 终止
+/// 桌面 Toast 与系统提示音已下线，只剩「状态音效」：思考 / 等待 / 完成 / 失败
 /// 四个状态各自可选一个常见音效，默认全部未选（= 完全静音）。
 /// `enabled` 是「声音」区标题右侧的总开关，关闭后所有状态都不响，
 /// 各状态自己的音效设置保留（重新打开即恢复）。
@@ -68,12 +68,12 @@ pub struct NotifyConfig {
     pub enabled: bool,
     /// 思考（新回合开始 / agent 干活中）
     pub thinking: StateSound,
-    /// 警告（等待确认 / 等待输入）
-    pub warning: StateSound,
+    /// 等待（等待确认 / 等待输入）
+    pub waiting: StateSound,
     /// 完成
     pub completed: StateSound,
-    /// 终止（失败 / 心跳判死）
-    pub terminated: StateSound,
+    /// 失败（任务失败 / 心跳判死）
+    pub failed: StateSound,
 }
 
 impl Default for NotifyConfig {
@@ -81,21 +81,21 @@ impl Default for NotifyConfig {
         Self {
             enabled: true,
             thinking: StateSound::default(),
-            warning: StateSound::default(),
+            waiting: StateSound::default(),
             completed: StateSound::default(),
-            terminated: StateSound::default(),
+            failed: StateSound::default(),
         }
     }
 }
 
 impl NotifyConfig {
-    /// 取某个状态（"thinking" / "warning" / "completed" / "terminated"）的音效设置
+    /// 取某个状态（"thinking" / "waiting" / "completed" / "failed"）的音效设置
     pub fn sound(&self, state: &str) -> Option<&StateSound> {
         match state {
             "thinking" => Some(&self.thinking),
-            "warning" => Some(&self.warning),
+            "waiting" => Some(&self.waiting),
             "completed" => Some(&self.completed),
-            "terminated" => Some(&self.terminated),
+            "failed" => Some(&self.failed),
             _ => None,
         }
     }
@@ -243,27 +243,27 @@ pub enum MonitorTarget {
 #[serde(default)]
 pub struct StateEffects {
     pub thinking: String,
-    pub warning: String,
+    pub waiting: String,
     pub completed: String,
-    pub terminated: String,
+    pub failed: String,
 }
 
 impl StateEffects {
-    /// 按状态语义名取值（"thinking" / "warning" / "completed" / "terminated"，未知按 thinking）
+    /// 按状态语义名取值（"thinking" / "waiting" / "completed" / "failed"，未知按 thinking）
     pub fn get(&self, state: &str) -> &str {
         match state {
-            "warning" => &self.warning,
+            "waiting" => &self.waiting,
             "completed" => &self.completed,
-            "terminated" => &self.terminated,
+            "failed" => &self.failed,
             _ => &self.thinking,
         }
     }
 
     pub fn set(&mut self, state: &str, value: String) {
         match state {
-            "warning" => self.warning = value,
+            "waiting" => self.waiting = value,
             "completed" => self.completed = value,
-            "terminated" => self.terminated = value,
+            "failed" => self.failed = value,
             _ => self.thinking = value,
         }
     }
@@ -272,7 +272,7 @@ impl StateEffects {
 /// 屏幕光效配置。
 ///
 /// 运行时在屏幕最外圈覆盖一层透明、点击穿透的窗口，用颜色表达 agent 的实时状态
-/// （思考色=运行中、警告色=等你确认、完成色=完成、终止色=意外终止）；打开 `fullscreen` 后，
+/// （思考色=运行中、等待色=等你确认、完成色=完成、失败色=意外终止）；打开 `fullscreen` 后，
 /// 每次颜色亮起还会在整块屏幕上补一次全屏特效（「雾散」/「HUD 扫描」；
 /// 全屏色可能与边缘色不同，见 glow.rs）。
 ///
@@ -437,9 +437,9 @@ fn normalize_state_effects(
     };
     StateEffects {
         thinking: one(&e.thinking),
-        warning: one(&e.warning),
+        waiting: one(&e.waiting),
         completed: one(&e.completed),
-        terminated: one(&e.terminated),
+        failed: one(&e.failed),
     }
 }
 
@@ -872,7 +872,7 @@ system = false
         let cfg: BarkConfig =
             serde_json::from_str(r#"{"glow":{"effect":"comet","fullscreen_effect":"scan"}}"#).unwrap();
         let g = cfg.glow.sanitize();
-        for s in ["thinking", "warning", "completed", "terminated"] {
+        for s in ["thinking", "waiting", "completed", "failed"] {
             assert_eq!(g.edge_effects.get(s), "comet", "{s} 按旧全局迁移");
             assert_eq!(g.burst_effects.get(s), "scan", "{s} 按旧全局迁移");
         }
@@ -888,36 +888,36 @@ system = false
         let cfg: BarkConfig = serde_json::from_str(
             r#"{"glow":{
                 "effect":"comet",
-                "edge_effects":{"thinking":"none","warning":"breathing","completed":"","terminated":"rainbow"},
+                "edge_effects":{"thinking":"none","waiting":"breathing","completed":"","failed":"rainbow"},
                 "fullscreen_effect":"scan",
-                "burst_effects":{"thinking":"none","warning":"","completed":"fog","terminated":"rain"}
+                "burst_effects":{"thinking":"none","waiting":"","completed":"fog","failed":"rain"}
             }}"#,
         )
         .unwrap();
         let g = cfg.glow.sanitize();
         assert_eq!(g.edge_effects.get("thinking"), "none", "「无」是合法值，必须保留");
-        assert_eq!(g.edge_effects.get("warning"), "breathing");
+        assert_eq!(g.edge_effects.get("waiting"), "breathing");
         assert_eq!(g.edge_effects.get("completed"), "comet", "空 = 未设置 → 跟随旧全局");
-        assert_eq!(g.edge_effects.get("terminated"), "comet", "未知 id → 跟随旧全局");
+        assert_eq!(g.edge_effects.get("failed"), "comet", "未知 id → 跟随旧全局");
         assert_eq!(g.burst_effects.get("thinking"), "none");
-        assert_eq!(g.burst_effects.get("warning"), "scan");
+        assert_eq!(g.burst_effects.get("waiting"), "scan");
         assert_eq!(g.burst_effects.get("completed"), "fog");
-        assert_eq!(g.burst_effects.get("terminated"), "scan");
+        assert_eq!(g.burst_effects.get("failed"), "scan");
     }
 
     #[test]
     fn glow_effect_accessors_map_states_and_none() {
         let g = GlowConfig {
-            edge_effects: StateEffects { thinking: "none".into(), warning: "comet".into(), ..Default::default() },
-            burst_effects: StateEffects { completed: "none".into(), terminated: "scan".into(), ..Default::default() },
+            edge_effects: StateEffects { thinking: "none".into(), waiting: "comet".into(), ..Default::default() },
+            burst_effects: StateEffects { completed: "none".into(), failed: "scan".into(), ..Default::default() },
             ..Default::default()
         }
         .sanitize();
         assert!(g.edge_effect_for("thinking").is_none(), "「无」= 不亮边缘");
-        assert_eq!(g.edge_effect_for("warning"), Some(GlowEffect::Comet));
+        assert_eq!(g.edge_effect_for("waiting"), Some(GlowEffect::Comet));
         assert_eq!(g.edge_effect_for("completed"), Some(GlowEffect::Breathing));
         assert!(g.burst_effect_for("completed").is_none(), "「无」= 不放全屏");
-        assert_eq!(g.burst_effect_for("terminated"), Some("scan"));
+        assert_eq!(g.burst_effect_for("failed"), Some("scan"));
         assert_eq!(g.burst_effect_for("thinking"), Some("fog"));
     }
 

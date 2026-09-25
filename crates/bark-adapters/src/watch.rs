@@ -113,9 +113,9 @@ fn remove_snapshot_dir(dir: &Path) {
 /// 「会话行从库里消失」的闭环事件（WorkBuddy / TraeWork 统一口径，§1.12a）。
 ///
 /// 归一成 **RunAborted**（中止）而不是 RunFailed（失败）：行消失意味着用户删了
-/// 会话，不是任务失败——RunFailed 会弹「任务失败」通知 + 亮终止色 + 终止音，
-/// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮终止色」，自己先亮终止色等于
-/// 换个时机复现同一问题。RunAborted 不通知、不亮终止色（TraeWork 一直如此）。
+/// 会话，不是任务失败——RunFailed 会弹「任务失败」通知 + 亮失败色 + 失败音，
+/// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮失败色」，自己先亮失败色等于
+/// 换个时机复现同一问题。RunAborted 不通知、不亮失败色（TraeWork 一直如此）。
 fn emit_lost_row(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
@@ -204,7 +204,7 @@ fn run_event(prev: &str, status: &str, suppress: bool, first: bool) -> Option<Ev
         "completed" if !is_terminal(prev) => Some(EventKind::RunCompleted),
         "terminated" | "error" if !is_terminal(prev) => Some(EventKind::RunFailed),
         // 运行中被归档：turn 实际已结束，闭环掉状态表条目，避免它 10 分钟后
-        // 被当僵死判死误亮终止色。
+        // 被当僵死判死误亮失败色。
         // 归一成 RunAborted 而不是 RunCompleted：归档不是「跑完了」，
         // 亮完成色属于谎报完成（用户实测就见过这个完成色）。
         "archived" if was_running => Some(EventKind::RunAborted),
@@ -228,8 +228,8 @@ fn needs_heartbeat(status: &str, prev: Option<&SeenSession>, round: u64, every: 
 /// 清理轮询状态表，防止 last 无界增长。
 /// 返回本轮被遗忘的「运行中」条目 id——运行中会话的行从库里消失意味着
 /// 会话被删除（不会有终态跃迁），需由调用方发 RunAborted 闭环 daemon 侧状态表
-/// （§1.12a：用户删的会话按「中止」收场，不弹「任务失败」、不亮终止色），
-/// 否则它会在 10 分钟后被当僵死判死、在不相干的事件里误亮终止色。
+/// （§1.12a：用户删的会话按「中止」收场，不弹「任务失败」、不亮失败色），
+/// 否则它会在 10 分钟后被当僵死判死、在不相干的事件里误亮失败色。
 ///
 /// 其余规则：
 /// 1. 连续 MISSING_KEEP_ROUNDS 轮未再出现的条目一律遗忘；
@@ -414,8 +414,8 @@ impl WatchAdapter for WorkBuddyWatch {
                         }
                         for id in prune_last(&mut last, &mut tombstone, round) {
                             // 运行中的行从库里消失 = 会话被删除，没有终态跃迁；
-                            // 主动闭环（RunAborted：不通知、不亮终止色，§1.12a），
-                            // 别等 daemon 侧 10 分钟僵死判死在随机时刻亮终止色
+                            // 主动闭环（RunAborted：不通知、不亮失败色，§1.12a），
+                            // 别等 daemon 侧 10 分钟僵死判死在随机时刻亮失败色
                             emit_lost_row(&stop, &tx, kind, &id, "WorkBuddy");
                         }
                         first = false;
@@ -1112,15 +1112,15 @@ mod tests {
     // ---- §1.12 / §2.7 回归 --------------------------------------------------
 
     /// §1.12a：「会话行消失」的闭环必须是 RunAborted（中止）而不是 RunFailed（失败）。
-    /// WorkBuddy 曾发 RunFailed——弹「任务失败 · WorkBuddy」+ 亮终止色 + 终止音，
-    /// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮终止色」；与 TraeWork 口径统一。
+    /// WorkBuddy 曾发 RunFailed——弹「任务失败 · WorkBuddy」+ 亮失败色 + 失败音，
+    /// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮失败色」；与 TraeWork 口径统一。
     #[test]
     fn lost_row_reports_run_aborted_not_failed() {
         let (tx, mut rx) = mpsc::channel(4);
         let stop = AtomicBool::new(false);
         emit_lost_row(&stop, &tx, AgentKind::WorkBuddy, "sess-lost", "WorkBuddy");
         let ev = rx.try_recv().expect("必须发出闭环事件");
-        assert_eq!(ev.kind, EventKind::RunAborted, "行消失按中止收场（不通知不亮终止色）");
+        assert_eq!(ev.kind, EventKind::RunAborted, "行消失按中止收场（不通知不亮失败色）");
         assert!(!ev.kind.should_notify(), "不该弹「任务失败」通知");
         assert_eq!(ev.session_id, "sess-lost");
         assert!(ev.message.contains("WorkBuddy"), "正文要说明来源: {}", ev.message);

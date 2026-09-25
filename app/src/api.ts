@@ -125,9 +125,9 @@ export interface UpdateInfo {
 /** 「屏幕光效」每状态的效果类型（对应后端 StateEffects） */
 export interface StateEffects {
   thinking: string;
-  warning: string;
+  waiting: string;
   completed: string;
-  terminated: string;
+  failed: string;
 }
 
 export interface GlowConfig {
@@ -224,14 +224,14 @@ export const BURST_EFFECTS: { id: string; label: string }[] = [
 
 export interface BarkConfig {
   server: { port: number; token: string };
-  /** 每个状态（思考/警告/完成/终止）各自的音效；全部默认不响。enabled 为「声音」区总开关 */
+  /** 每个状态（思考/等待/完成/失败）各自的音效；全部默认不响。enabled 为「声音」区总开关 */
   notify: {
     /** 总开关：关闭后所有状态音效都不响（各状态自己的设置保留） */
     enabled: boolean;
     thinking: StateSound;
-    warning: StateSound;
+    waiting: StateSound;
     completed: StateSound;
-    terminated: StateSound;
+    failed: StateSound;
   };
   rules: { aggregate_window_ms: number; quiet_hours: string[] };
   channels: {
@@ -382,20 +382,20 @@ export const EVENT_LABELS: Record<EventKind, string> = {
 
 /**
  * 事件徽标四色规范，与屏幕光效（glow.rs `GlowState::color`）同一套色板：
- * 🔵 思考 · 🟠 警告 · 🟢 完成 · 🔴 终止。色值定义在 style.css 的 --state-*。
+ * 🔵 思考 · 🟠 等待 · 🟢 完成 · 🔴 失败。色值定义在 style.css 的 --state-*。
  * 工具失败例外用中性灰：agent 会自行重试，不需要用户行动——
- * 橙色「警告」留给「等你确认/输入」这类需要人的场景。
+ * 橙色「等待」留给「等你确认/输入」这类需要人的场景。
  */
 export function eventBadgeClass(kind: EventKind): string {
   switch (kind) {
     // 会话开始 = 思考的起点
     case "session_start": return "badge thinking";
     case "run_completed": return "badge completed";
-    // 失败与中止都归「终止」色
+    // 失败与中止都归「失败」色
     case "run_failed":
-    case "run_aborted": return "badge terminated";
+    case "run_aborted": return "badge failed";
     case "permission_required":
-    case "input_required": return "badge warning";
+    case "input_required": return "badge waiting";
     // 工具级失败：中性（可排查、不吓人）
     case "tool_failed": return "badge";
     default: return "badge";
@@ -414,7 +414,7 @@ export function phaseBadgeClass(phase: SessionPhase): string {
     case "thinking":
     case "tool_running": return "badge thinking";
     case "waiting_permission":
-    case "waiting_input": return "badge warning";
+    case "waiting_input": return "badge waiting";
     // 未知 phase（后端新增/坏推送）：中性灰，别渲染成无样式裸字
     default: return "badge";
   }

@@ -897,7 +897,7 @@ export function apply(ctx) {
     if (!wasRunning || isSettledOf(keys)) return;
     const reason = reasonOf(keys);
     if (reason === "aborted" || reason === "interrupted") {
-      // 用户主动中止：既不是完成（不亮完成色、不谎报跑完）也不是失败（不亮终止色、不弹「任务失败」）
+      // 用户主动中止：既不是完成（不亮完成色、不谎报跑完）也不是失败（不亮失败色、不弹「任务失败」）
       void settle("run_aborted", agent, session, { sessionId, message: "回合已中止" });
       return;
     }
@@ -1110,7 +1110,7 @@ mod tests {
             "max-tokens 必须单独处理（否则会被报成「任务完成」）"
         );
         // 用户主动中止必须是独立的「中止」语义：报完成会亮完成色（谎报跑完），
-        // 报失败会亮终止色并弹「任务失败」（用户自己按的停止）
+        // 报失败会亮失败色并弹「任务失败」（用户自己按的停止）
         assert!(
             js.contains("void settle(\"run_aborted\""),
             "aborted/interrupted 要归一成 run_aborted"

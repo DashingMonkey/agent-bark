@@ -5,7 +5,7 @@
 //
 // **颜色不在这里定义**：payload 的 color / burst_color 来自 `src-tauri/src/glow.rs`
 // 的 `GlowState::color`（唯一来源）。本文件里的 hex 只是坏色值时的兜底，
-// 状态一律用角色名（思考 / 警告 / 完成 / 终止）；改配色时同步下面的兜底分量。
+// 状态一律用角色名（思考 / 等待 / 完成 / 失败）；改配色时同步下面的兜底分量。
 
 import { listen } from "@tauri-apps/api/event";
 
@@ -118,7 +118,7 @@ function render(p: GlowPayload) {
   root.style.setProperty("--c", p.color);
   root.style.setProperty("--rgb", rgbTriplet(p.color));
   // 全屏特效走独立的颜色通道：多会话并行时，边缘保持思考色持续呼吸，
-  // 全屏按事件角色（完成 / 终止）补放——两层互不覆盖。
+  // 全屏按事件角色（完成 / 失败）补放——两层互不覆盖。
   // burst_color 缺失时回退边缘色（等价于状态切换触发的同色全屏）。
   burstEl.style.setProperty("--burst-rgb", rgbTriplet(p.burst_color || p.color));
   applyWidth(p);

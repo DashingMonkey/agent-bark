@@ -6,12 +6,12 @@
 //! | 状态 | 角色 | 含义 | 触发 |
 //! | --- | --- | --- | --- |
 //! | `Running` | **思考颜色** | 思考中 / 执行工具 | 心跳 `Thinking` / `ToolRunning` |
-//! | `Waiting` | **警告颜色** | 等你确认或输入 | `WaitingPermission` / `WaitingInput` |
+//! | `Waiting` | **等待颜色** | 等你确认或输入 | `WaitingPermission` / `WaitingInput` |
 //! | `Completed` | **完成颜色** · 停留后淡出 | 任务完成 | `RunCompleted` |
-//! | `Failed` | **终止颜色** · 停留后淡出 | 意外终止（失败 / 判死） | `RunFailed` / 心跳超时判死 |
+//! | `Failed` | **失败颜色** · 停留后淡出 | 意外终止（失败 / 判死） | `RunFailed` / 心跳超时判死 |
 //!
 //! 全仓库只认这四个**角色名**，不写色系名与 hex（见 [`GlowState::color`]）；
-//! **用户主动中止**（`RunAborted`）是另一回事，它不亮灯，叫「中止」不叫「终止」。
+//! **用户主动中止**（`RunAborted`）是另一回事，它不亮灯，叫「中止」不叫「失败」。
 //!
 //! 边缘表现按**状态**各选各的（`glow.edge_effects`：无 / 呼吸 / 流光），`glow.edge`
 //! 是边缘灯带总开关；打开 `glow.fullscreen` 后，**每次颜色亮起**还会按触发角色的
@@ -19,10 +19,10 @@
 //!
 //! ## 双通道：边缘状态 × 全屏事件
 //! 多会话并行时这两层各司其职、互不覆盖：
-//! - **边缘（常驻）**按会话表聚合推导（警告 > 思考 > 空表才看终态）——
+//! - **边缘（常驻）**按会话表聚合推导（等待 > 思考 > 空表才看终态）——
 //!   只要还有会话在跑/在等，边缘就持续表达它们的聚合状态；
-//! - **全屏（一次性）**是独立的**事件通道**：一个会话完成/终止时，哪怕其余
-//!   会话还在跑，也以事件角色色（完成 / 终止）补放一次雾散（见 [`burst_only`]）——
+//! - **全屏（一次性）**是独立的**事件通道**：一个会话完成/失败时，哪怕其余
+//!   会话还在跑，也以事件角色色（完成 / 失败）补放一次雾散（见 [`burst_only`]）——
 //!   「有一个完成了」是值得立刻知道的事件，「还有的在跑」是持续状态，两者不互斥。
 //!
 //! ## 关键取舍
@@ -71,7 +71,7 @@ const GLOW_OPACITY: f32 = 0.9;
 const GLOW_BURST_MS: u32 = 3_000;
 /// 「完成」绿色停留时长（ms），到点自动淡出
 const GLOW_COMPLETED_HOLD_MS: u64 = 6_000;
-/// 「终止」（意外终止）色停留时长（ms）
+/// 「失败」（意外终止）色停留时长（ms）
 const GLOW_FAILED_HOLD_MS: u64 = 12_000;
 
 /// 颜色特效的触发序号：每亮一次 +1。
@@ -103,11 +103,11 @@ pub enum GlowState {
     Idle,
     /// 运行中（思考 / 执行工具）：思考色呼吸
     Running,
-    /// 等待用户确认或输入：警告色呼吸
+    /// 等待用户确认或输入：等待色呼吸
     Waiting,
     /// 任务完成：完成色常亮后淡出
     Completed,
-    /// 意外终止（失败 / 心跳超时）：终止色脉冲后淡出
+    /// 意外终止（失败 / 心跳超时）：失败色脉冲后淡出
     Failed,
 }
 
@@ -115,7 +115,7 @@ impl GlowState {
     /// 状态对应的主色。
     ///
     /// **这里是全仓库唯一的配色来源**：改色只改这个函数 + `palette_is_locked` 那个
-    /// 锁配色的测试。其它地方一律用角色名（思考 / 警告 / 完成 / 终止），不写色系名、
+    /// 锁配色的测试。其它地方一律用角色名（思考 / 等待 / 完成 / 失败），不写色系名、
     /// 更不写 hex——`.md` 文档与注释里出现 hex 就是漏改的前兆。
     ///
     /// 色值取 GitHub Primer **深色主题**的语义色（初版用浅色主题的暗色变体，用户实测
@@ -127,15 +127,15 @@ impl GlowState {
             // Idle 不显示，不会有人看到这个色；与 Running 同色只是为了少一个分支
             GlowState::Idle => "#4493f8",
             GlowState::Running => "#4493f8",   // 思考颜色 · 蓝
-            GlowState::Waiting => "#f0883e",   // 警告颜色 · 橙
+            GlowState::Waiting => "#f0883e",   // 等待颜色 · 橙
             GlowState::Completed => "#3fb950", // 完成颜色 · 绿
-            GlowState::Failed => "#f85149",    // 终止颜色 · 红
+            GlowState::Failed => "#f85149",    // 失败颜色 · 红
         }
     }
 
     /// 该状态的停留时长（ms）。0 = 常驻，直到下一个状态覆盖它。
     ///
-    /// 只有终态（完成 / 终止）会自己淡出：思考中 / 警告中必须由后续事件驱散，
+    /// 只有终态（完成 / 失败）会自己淡出：思考中 / 等待中必须由后续事件驱散，
     /// 否则「还在跑但灯灭了」比不亮更糟。
     pub fn hold_ms(self) -> u64 {
         match self {
@@ -155,9 +155,9 @@ impl GlowState {
     pub fn config_key(self) -> &'static str {
         match self {
             GlowState::Idle | GlowState::Running => "thinking",
-            GlowState::Waiting => "warning",
+            GlowState::Waiting => "waiting",
             GlowState::Completed => "completed",
-            GlowState::Failed => "terminated",
+            GlowState::Failed => "failed",
         }
     }
 }
@@ -195,8 +195,8 @@ pub struct GlowPayload {
     pub burst: u64,
     /// 一次全屏特效的时长（ms）
     pub burst_ms: u32,
-    /// 全屏特效的颜色，与边缘色**解耦**：多会话并行时一个会话完成/终止，
-    /// 边缘保持思考色持续呼吸，全屏按事件角色（完成 / 终止）补放一次。
+    /// 全屏特效的颜色，与边缘色**解耦**：多会话并行时一个会话完成/失败，
+    /// 边缘保持思考色持续呼吸，全屏按事件角色（完成 / 失败）补放一次。
     pub burst_color: String,
 }
 
@@ -236,8 +236,8 @@ fn payload_with_burst(cfg: &GlowConfig, state: GlowState, burst: GlowState) -> G
 
 /// 由「会话状态表 + 刚到的事件」推导流光状态并应用。
 ///
-/// 边缘优先级：**警告 > 思考 > 终态**。
-/// - 警告（等待确认 / 等待输入）的会话需要人去点一下，比「还在跑」更值得打断你；
+/// 边缘优先级：**等待 > 思考 > 终态**。
+/// - 等待（等待确认 / 等待输入）的会话需要人去点一下，比「还在跑」更值得打断你；
 /// - 终态只在**没有任何活跃会话**时才接管边缘——A 完成了但 B 还在跑，
 ///   边缘持续表达 B 的思考状态。
 ///
@@ -246,8 +246,8 @@ fn payload_with_burst(cfg: &GlowConfig, state: GlowState, burst: GlowState) -> G
 /// 不该因为边缘还在表达 B 的状态就被静默吞掉。
 pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &NormalizedEvent, running_lost: bool) {
     let desired = desired_state(state);
-    // 事件通道：还有别的活跃会话（边缘不会切终态）时，完成/终止/判死仍补放全屏。
-    // 表空的情形由下面的正常推导接管——边缘切完成/终止色时 apply 本身就会触发
+    // 事件通道：还有别的活跃会话（边缘不会切终态）时，完成/失败/判死仍补放全屏。
+    // 表空的情形由下面的正常推导接管——边缘切完成/失败色时 apply 本身就会触发
     // 同色全屏特效，这里再补就是双闪。
     if desired.is_some() {
         if let Some(burst) = burst_for_event(ev.kind, running_lost) {
@@ -262,7 +262,7 @@ pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &Normalized
 
 /// 事件通道补放什么全屏特效（纯函数，§1.3）：`None` = 不补放。
 ///
-/// `RunAborted` **一律不 burst**：手动中止不亮终止色全屏特效——即便同一瞬间恰好有
+/// `RunAborted` **一律不 burst**：手动中止不亮失败色全屏特效——即便同一瞬间恰好有
 /// 别的会话被心跳判死（`running_lost`）、判死者是另一会话，RunAborted 也不是判死
 /// 来源。保持简单、与另外两处口径对齐（`derive` 里 RunAborted 先于判死收光、
 /// `sound_key_for` 里手动中止永远不响）：「手动中止不提醒」，音/光优先级必须一致。
@@ -271,7 +271,7 @@ fn burst_for_event(kind: EventKind, running_lost: bool) -> Option<GlowState> {
         EventKind::RunCompleted => Some(GlowState::Completed),
         EventKind::RunFailed => Some(GlowState::Failed),
         EventKind::RunAborted => None,
-        // 任意事件捎带的心跳判死 = 意外终止（agent 进程没了）→ 终止色补放
+        // 任意事件捎带的心跳判死 = 意外终止（agent 进程没了）→ 失败色补放
         _ if running_lost => Some(GlowState::Failed),
         _ => None,
     }
@@ -279,7 +279,7 @@ fn burst_for_event(kind: EventKind, running_lost: bool) -> Option<GlowState> {
 
 /// 「只补放一次全屏特效」：边缘状态不动，以 `burst` 的角色色推一次 payload。
 ///
-/// 这是与边缘状态解耦的**事件通道**：多会话并行时一个会话完成/终止，
+/// 这是与边缘状态解耦的**事件通道**：多会话并行时一个会话完成/失败，
 /// 边缘继续表达其余会话的聚合状态，全屏则按事件角色闪一下。
 ///
 /// 取舍：
@@ -334,12 +334,12 @@ fn desired_state(state: &Arc<AppState>) -> Option<GlowState> {
 /// agent 被杀或回合被中断之后可能**再也不发任何事件**，只靠事件路径改流光就会一直停在
 /// 思考色。这里借「中性事件」`Activity` 走同一个 `derive`——它只对 `RunCompleted` /
 /// `RunFailed` / `running_lost` 特殊处理，正好表达「只看会话表 + 是否判死」：
-/// 还有活跃会话就按它们显示（警告/思考优先），一个不剩且判死了思考中的会话才转终止色，
-/// 否则保持不动（判死一个警告中的会话不该把终态色掐掉）。
+/// 还有活跃会话就按它们显示（等待/思考优先），一个不剩且判死了思考中的会话才转失败色，
+/// 否则保持不动（判死一个等待中的会话不该把终态色掐掉）。
 pub fn refresh_from_sessions(app: &AppHandle, state: &Arc<AppState>, running_lost: bool) {
     let desired = desired_state(state);
     // 判死发生在还有别的活跃会话时：边缘不动（继续表达它们），但「意外终止」
-    // 是事件，终止色全屏照放（对称于显式的 RunFailed，见 burst_only 的双通道说明）。
+    // 是事件，失败色全屏照放（对称于显式的 RunFailed，见 burst_only 的双通道说明）。
     if running_lost && desired.is_some() {
         burst_only(app, state, GlowState::Failed);
     }
@@ -358,7 +358,7 @@ fn derive(desired: Option<GlowState>, kind: EventKind, running_lost: bool) -> Op
         None => match kind {
             EventKind::RunCompleted => Some(GlowState::Completed),
             EventKind::RunFailed => Some(GlowState::Failed),
-            // 用户主动中止：没有别的会话在跑就**直接收起流光**——不亮终止色（不是失败）
+            // 用户主动中止：没有别的会话在跑就**直接收起流光**——不亮失败色（不是失败）
             // 也不亮完成色（没跑完）。还有别的会话在跑时走上面那个分支，照常显示它们的状态。
             EventKind::RunAborted => Some(GlowState::Idle),
             // 心跳超时被判死 = agent 进程没了（被杀时不会有 Stop 事件）→ 意外终止
@@ -563,14 +563,14 @@ fn open_session(
 
 /// 预览要恢复到的状态：**终态不复活**，一律映射成空闲。
 ///
-/// 完成 / 终止是「亮几秒就自己淡出」的短命状态（前端按 `hold_ms` 淡出，6s / 12s），
+/// 完成 / 失败是「亮几秒就自己淡出」的短命状态（前端按 `hold_ms` 淡出，6s / 12s），
 /// 而一次预览至少占 3s、默认 6s——它的停留时长基本被预览吃完了。恢复时还把终态
 /// 推回去，前端会当成新点亮重新计一遍停留时长，表现就是「预览播放完，又补了一个
 /// 绿色的完成动效」。绿色最常见只是统计巧合：上次任务残留的完成绿是恢复槽里
 /// 最常见的值（状态机里终态不过期，见 [`GlowState::hold_ms`]）；预览「完成」
 /// 本身也会在结束时再补一次绿，同一条根因。
 ///
-/// 运行中 / 警告是常驻显示（`hold_ms` 为 0、背后多半真有会话在跑 / 在等），
+/// 运行中 / 等待是常驻显示（`hold_ms` 为 0、背后多半真有会话在跑 / 在等），
 /// 照常恢复。
 fn restore_target(live: GlowState) -> GlowState {
     if live.is_terminal() {
@@ -1071,15 +1071,15 @@ mod tests {
     /// 锁配色：四个角色 ↔ 四个色值。
     ///
     /// 本测试是**唯一**允许写死 hex 的地方（连同 `GlowState::color`）。改配色时
-    /// 只改这两处，其余全仓库用角色名（思考 / 警告 / 完成 / 终止）。故意让改色
+    /// 只改这两处，其余全仓库用角色名（思考 / 等待 / 完成 / 失败）。故意让改色
     /// 必须动测试：色值悄悄漂移过一版（黄 → 蓝），当时就是靠人眼发现漏改的。
     #[test]
     fn palette_is_locked() {
         let palette = [
             (GlowState::Running, "思考", "#4493f8"),
-            (GlowState::Waiting, "警告", "#f0883e"),
+            (GlowState::Waiting, "等待", "#f0883e"),
             (GlowState::Completed, "完成", "#3fb950"),
-            (GlowState::Failed, "终止", "#f85149"),
+            (GlowState::Failed, "失败", "#f85149"),
         ];
         let mut seen = std::collections::HashSet::new();
         for (state, role, hex) in palette {
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn only_terminal_states_hold() {
-        // 思考中 / 警告中必须常驻：靠后续事件驱散，不能自己熄灭
+        // 思考中 / 等待中必须常驻：靠后续事件驱散，不能自己熄灭
         assert_eq!(GlowState::Running.hold_ms(), 0);
         assert_eq!(GlowState::Waiting.hold_ms(), 0);
         assert_eq!(GlowState::Completed.hold_ms(), GLOW_COMPLETED_HOLD_MS);
@@ -1198,7 +1198,7 @@ mod tests {
         use bark_core::StateEffects;
         let cfg = GlowConfig {
             edge_effects: StateEffects { thinking: "none".into(), completed: "comet".into(), ..Default::default() },
-            burst_effects: StateEffects { completed: "scan".into(), terminated: "none".into(), ..Default::default() },
+            burst_effects: StateEffects { completed: "scan".into(), failed: "none".into(), ..Default::default() },
             ..Default::default()
         }
         .sanitize();
@@ -1212,10 +1212,10 @@ mod tests {
         assert!(p.edge);
         assert_eq!(p.effect, "comet");
         assert_eq!(p.fullscreen_effect, "scan");
-        // 双通道：边缘是思考行（无），全屏触发角色是终止行（无 → 不放）
+        // 双通道：边缘是思考行（无），全屏触发角色是失败行（无 → 不放）
         let p = payload_with_burst(&cfg, GlowState::Running, GlowState::Failed);
         assert!(!p.edge);
-        assert!(!p.fullscreen, "终止行选「无」时全屏也不放");
+        assert!(!p.fullscreen, "失败行选「无」时全屏也不放");
         assert_eq!(p.burst_color, GlowState::Failed.color());
     }
 
@@ -1230,7 +1230,7 @@ mod tests {
         // 状态切换（表空、边缘转终态）触发的全屏仍与边缘同色
         let p = payload(&cfg, GlowState::Completed);
         assert_eq!(p.burst_color, p.color);
-        // 终止通道对称：终止色全屏
+        // 失败通道对称：失败色全屏
         let p = payload_with_burst(&cfg, GlowState::Running, GlowState::Failed);
         assert_eq!(p.burst_color, GlowState::Failed.color());
     }
@@ -1241,7 +1241,7 @@ mod tests {
         assert_eq!(derive(Some(GlowState::Running), EventKind::RunCompleted, false), Some(GlowState::Running));
         // 等待确认优先于思考：需要人去点一下
         assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunFailed, false), Some(GlowState::Waiting));
-        // 无活跃会话 + 终态事件 → 完成 / 终止
+        // 无活跃会话 + 终态事件 → 完成 / 失败
         assert_eq!(derive(None, EventKind::RunCompleted, false), Some(GlowState::Completed));
         assert_eq!(derive(None, EventKind::RunFailed, false), Some(GlowState::Failed));
         // 心跳超时判死 → 意外终止
@@ -1252,17 +1252,17 @@ mod tests {
 
     #[test]
     fn user_abort_hides_glow_unless_other_sessions_run() {
-        // 用户自己按的停止：没有别的会话在跑 → **收起流光**（不亮终止色、不亮完成色）
+        // 用户自己按的停止：没有别的会话在跑 → **收起流光**（不亮失败色、不亮完成色）
         assert_eq!(derive(None, EventKind::RunAborted, false), Some(GlowState::Idle));
-        // 还有别的会话在跑 → 照常显示它们的状态（思考 / 警告优先）
+        // 还有别的会话在跑 → 照常显示它们的状态（思考 / 等待优先）
         assert_eq!(derive(Some(GlowState::Running), EventKind::RunAborted, false), Some(GlowState::Running));
         assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunAborted, false), Some(GlowState::Waiting));
-        // 中止不是心跳判死，不许被 running_lost 覆盖成终止色
+        // 中止不是心跳判死，不许被 running_lost 覆盖成失败色
         assert_eq!(derive(None, EventKind::RunAborted, true), Some(GlowState::Idle));
     }
 
     /// §1.3 回归 + 音/光对称（对齐 state.rs 的 `sound_key_follows_event_roles`）：
-    /// 用户主动中止**永远**不放终止色全屏特效，即便同一瞬间恰好有别的会话被判死
+    /// 用户主动中止**永远**不放失败色全屏特效，即便同一瞬间恰好有别的会话被判死
     /// （running_lost=true、判死者是另一会话）——手动中止不提醒，音/光优先级必须一致
     #[test]
     fn abort_never_bursts_even_with_running_lost() {
@@ -1271,7 +1271,7 @@ mod tests {
         // 普通终态按事件角色补放
         assert_eq!(burst_for_event(EventKind::RunCompleted, false), Some(GlowState::Completed));
         assert_eq!(burst_for_event(EventKind::RunFailed, false), Some(GlowState::Failed));
-        // 任意事件捎带的心跳判死 = 意外终止 → 终止色（与音效 "terminated" 同口径）
+        // 任意事件捎带的心跳判死 = 意外终止 → 失败色（与音效 "failed" 同口径）
         assert_eq!(burst_for_event(EventKind::Activity, true), Some(GlowState::Failed));
         assert_eq!(burst_for_event(EventKind::SessionStart, true), Some(GlowState::Failed));
         assert_eq!(burst_for_event(EventKind::ToolFinished, true), Some(GlowState::Failed));

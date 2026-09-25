@@ -25,7 +25,7 @@
         （外阴影、外发光都不行）：窗口恰好是卡片大小，圆角外的像素会被
         窗口的矩形边界硬裁切，在桌面上留下一圈带直边的色块。
 
-        颜色四态与主应用 --state-* / glow.rs 同一套（思考/警告/完成/终止）。
+        颜色四态与主应用 --state-* / glow.rs 同一套（思考/等待/完成/失败）。
       */
       :root {
         /* 具体值由 <head> 里的内联脚本与 src/theme.ts 写到 data-theme 上 */
@@ -106,18 +106,18 @@
       }
       /* 四态配色：与主应用 --state-* / glow.rs GlowState::color 同源（Primer） */
       .state.thinking { color: #4493f8; } .state.thinking .dot { background: #4493f8; }
-      .state.warning { color: #f0883e; } .state.warning .dot { background: #f0883e; }
+      .state.waiting { color: #f0883e; } .state.waiting .dot { background: #f0883e; }
       .state.completed { color: #3fb950; } .state.completed .dot { background: #3fb950; }
-      .state.terminated { color: #f85149; } .state.terminated .dot { background: #f85149; }
+      .state.failed { color: #f85149; } .state.failed .dot { background: #f85149; }
       :root[data-theme="light"] .name { color: #232327; }
       :root[data-theme="light"] .state.thinking { color: #0969da; }
       :root[data-theme="light"] .state.thinking .dot { background: #0969da; }
-      :root[data-theme="light"] .state.warning { color: #bc4c00; }
-      :root[data-theme="light"] .state.warning .dot { background: #bc4c00; }
+      :root[data-theme="light"] .state.waiting { color: #bc4c00; }
+      :root[data-theme="light"] .state.waiting .dot { background: #bc4c00; }
       :root[data-theme="light"] .state.completed { color: #1a7f37; }
       :root[data-theme="light"] .state.completed .dot { background: #1a7f37; }
-      :root[data-theme="light"] .state.terminated { color: #cf222e; }
-      :root[data-theme="light"] .state.terminated .dot { background: #cf222e; }
+      :root[data-theme="light"] .state.failed { color: #cf222e; }
+      :root[data-theme="light"] .state.failed .dot { background: #cf222e; }
 
       .idle {
         color: #9a9aa2;

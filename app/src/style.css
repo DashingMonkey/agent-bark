@@ -25,13 +25,13 @@
   --scrollbar-thumb: rgba(121, 121, 121, .4);
   --scrollbar-thumb-hover: rgba(121, 121, 121, .55);
   --tooltip-shadow: 0 4px 14px rgba(0, 0, 0, .4);
-  /* 四态色板（思考/警告/完成/终止）：与屏幕光效同一套语义色。
+  /* 四态色板（思考/等待/完成/失败）：与屏幕光效同一套语义色。
      深色取 GitHub Primer 深色语义色（= glow.rs GlowState::color），
      浅色取对应浅色语义色（徽标文字在浅底上需要更深才够对比） */
   --state-thinking: #4493f8;
-  --state-warning: #f0883e;
+  --state-waiting: #f0883e;
   --state-completed: #3fb950;
-  --state-terminated: #f85149;
+  --state-failed: #f85149;
   /* 表单控件规格：高度 / 圆角 / 底色 / 描边抽成一套变量，输入框、下拉框、时间框、
      数字框共用一套几何，避免「每个控件各撑一个高度」。深色下用比卡片略亮的
      面板底色（VS Code 的做法：控件是浮起来的），浅色下换成白底描边（见下方媒体查询）。 */
@@ -75,9 +75,9 @@
   --scrollbar-thumb-hover: rgba(100, 100, 100, .5);
   --tooltip-shadow: 0 4px 14px rgba(0, 0, 0, .16);
   --state-thinking: #0969da;
-  --state-warning: #bc4c00;
+  --state-waiting: #bc4c00;
   --state-completed: #1a7f37;
-  --state-terminated: #cf222e;
+  --state-failed: #cf222e;
   /* 浅色下控件用白底 + 描边（macOS / Codex 设置页的做法）：
      卡片本身就是白的，再给灰底会显得控件是「不可用」的 */
   --field-bg: #ffffff;
@@ -230,12 +230,12 @@ body:not(.no-hover) .sidebar .nav-item.active:hover { background: var(--brand-2)
 .badge.on { color: var(--brand); background: color-mix(in srgb, var(--brand) 16%, transparent); }
 .badge.err { color: var(--err); background: color-mix(in srgb, var(--err) 14%, transparent); }
 .badge.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
-/* 四态徽标（思考/警告/完成/终止）：配色与屏幕光效同一套 --state-*，
+/* 四态徽标（思考/等待/完成/失败）：配色与屏幕光效同一套 --state-*，
    事件流与悬浮窗共用这套类（类名由 api.ts 的 eventBadgeClass / phaseBadgeClass 产出） */
 .badge.thinking { color: var(--state-thinking); background: color-mix(in srgb, var(--state-thinking) 15%, transparent); }
-.badge.warning { color: var(--state-warning); background: color-mix(in srgb, var(--state-warning) 15%, transparent); }
+.badge.waiting { color: var(--state-waiting); background: color-mix(in srgb, var(--state-waiting) 15%, transparent); }
 .badge.completed { color: var(--state-completed); background: color-mix(in srgb, var(--state-completed) 15%, transparent); }
-.badge.terminated { color: var(--state-terminated); background: color-mix(in srgb, var(--state-terminated) 15%, transparent); }
+.badge.failed { color: var(--state-failed); background: color-mix(in srgb, var(--state-failed) 15%, transparent); }
 
 /* 按钮参考 VS Code：悬停/按压用明确的底色变化（不靠 opacity 糊一层），
    键盘 Tab 有品牌色焦点环 */
@@ -262,9 +262,9 @@ button.danger { background: transparent; border: 1px solid color-mix(in srgb, va
 body:not(.no-hover) button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 10%, transparent); }
 /* 「屏幕光效」预览按钮：边缘（描边）直接用对应状态色（--state-* 与光效同一套语义色） */
 button.ghost.state-thinking { border-color: var(--state-thinking); }
-button.ghost.state-warning { border-color: var(--state-warning); }
+button.ghost.state-waiting { border-color: var(--state-waiting); }
 button.ghost.state-completed { border-color: var(--state-completed); }
-button.ghost.state-terminated { border-color: var(--state-terminated); }
+button.ghost.state-failed { border-color: var(--state-failed); }
 
 /* ---- 表单控件 ----
    几何一律走 --control-h / --control-radius：定高、定圆角、指定内边距。

@@ -515,7 +515,7 @@ fn home(env: &InstallEnv) -> PathBuf {
 ///   「已中止」——会话确实结束了，语义成立（中止不通知，无噪音）。
 /// - `PostToolUse` → ToolFinished（工具收尾，官方文档的事件子集内）：**等待状态
 ///   解除的唯一信号**——答完 AskUserQuestion / 批完权限后到下一个 PreToolUse 之间
-///   没有别的事件，不收它的话相位会一直卡在「等待中/执行工具」、警告色亮到下一个
+///   没有别的事件，不收它的话相位会一直卡在「等待中/执行工具」、等待色亮到下一个
 ///   工具开始（§1.11，与 zcode.rs 的 EVENTS 表同口径）。
 /// - `PostToolUseFailure` → ToolFailed（工具级失败，官方确认存在）。
 pub fn claude_code() -> ClaudeStyleAdapter {
@@ -659,13 +659,13 @@ pub fn codebuddy() -> ClaudeStyleAdapter {
 /// 事件表取**两个版本都支持的交集**，安全且无功能损失：
 /// - `UserPromptSubmit` / `PreToolUse` → Activity 心跳（会话实时状态：思考中 / 执行工具）
 /// - `Notification` → InputRequired；payload 带 `notification_type="permission_prompt"` 时
-///   由 `normalize` 升级成 PermissionRequired → 警告色「需要确认」（两版实测一致）
-/// - `PostToolUseFailure` → ToolFailed（工具级失败，agent 会自行重试，不亮终止色不通知）
+///   由 `normalize` 升级成 PermissionRequired → 等待色「需要确认」（两版实测一致）
+/// - `PostToolUseFailure` → ToolFailed（工具级失败，agent 会自行重试，不亮失败色不通知）
 /// - `Stop` → RunCompleted（payload 的 `last_assistant_message` 是助手回复全文，
 ///   已被 extract_message 优先取作通知正文）
 /// - `SessionEnd` → **RunAborted**：**用户主动中断回合时只有它、没有 Stop**（实测），
 ///   不注册的话那条会话会永远留在「运行中」列表、流光一直停在思考色。按「中止」归一
-///   而不是「终止」：用户自己按的停止不该亮终止色、更不该弹「任务失败」；正常回合
+///   而不是「失败」：用户自己按的停止不该亮失败色、更不该弹「任务失败」；正常回合
 ///   Stop 之后紧跟的那条会被状态机的「终态回声」抑制，不重复通知、也不压掉完成色。
 ///
 /// 没注册的两个（都是交集之外、且实测无功能损失）：
@@ -927,8 +927,8 @@ mod tests {
     #[test]
     fn tool_failure_is_not_run_failure() {
         // PostToolUseFailure 是工具级失败（agent 会自行重试），归一成 ToolFailed：
-        // 不通知、不亮终止色，事件仍入历史与事件流（中性色「工具失败」可排查）。
-        // 以前映射成 RunFailed 时，一次瞬时工具失败会亮终止色全屏特效 + 弹「任务失败」
+        // 不通知、不亮失败色，事件仍入历史与事件流（中性色「工具失败」可排查）。
+        // 以前映射成 RunFailed 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」
         // （实测 ZCode 编辑前没先读文件、失败后立刻重试成功，全是噪音）。
         // 用真实规格测：钉死 Claude Code 的事件映射不漂移。
         let adapter = claude_code();
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn qoder_covers_permission_wait_and_interrupt() {
         let adapter = qoder();
-        // 实测（国际版与国内版一致）：Notification 带着 permission_prompt 来 → 警告色（需要确认）
+        // 实测（国际版与国内版一致）：Notification 带着 permission_prompt 来 → 等待色（需要确认）
         let ev = adapter
             .normalize(
                 "Notification",
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(ev.kind.default_title(), "需要确认");
 
         // 实测：用户主动中断回合只有 SessionEnd（没有 Stop）→ 必须能清掉「运行中」。
-        // 归一成 RunAborted（中止）而不是 RunFailed：用户自己按的停止不该亮终止色，
+        // 归一成 RunAborted（中止）而不是 RunFailed：用户自己按的停止不该亮失败色，
         // 也不该弹「任务失败」。
         let ev = adapter
             .normalize("SessionEnd", &json!({ "session_id": "s", "reason": "other" }))
@@ -1127,7 +1127,7 @@ mod tests {
 
     /// ToolFinished 是**等待状态解除的唯一信号**（bark-core event.rs）：答完
     /// AskUserQuestion / 批完权限后到下一个 PreToolUse 之间没有别的事件，
-    /// 不注册 PostToolUse 的 MAP 会让相位卡「等待中/执行工具」、警告色一直亮到
+    /// 不注册 PostToolUse 的 MAP 会让相位卡「等待中/执行工具」、等待色一直亮到
     /// 下一个工具开始。四条 MAP 逐条钉死（§1.11）。
     #[test]
     fn claude_code_map_has_post_tooluse_tool_finished() {

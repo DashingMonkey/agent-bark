@@ -21,7 +21,7 @@
 //!
 //! 中止检测（手动 Esc 取消回合）：官方事件页没有 abort 语义文档，但社区插件
 //! （opencode-auto-resume）实证 Esc 取消走 `session.error` 且错误名为
-//! `MessageAbortedError`——归一成 `run_aborted`（不亮终止色不通知），并压制
+//! `MessageAbortedError`——归一成 `run_aborted`（不亮失败色不通知），并压制
 //! 其后 10s 内的 `session.idle`（否则中止紧跟一条绿色「完成」，谎报跑完）。
 //! 判定是防御式字符串匹配：匹配不上回落 `run_failed`，最坏情况 = 无中止检测的旧行为。
 //!
@@ -197,7 +197,7 @@ async function handle(eventName, payload) {{
 
   // 中止检测：用户 Esc 取消回合时 OpenCode 走 session.error，错误名为
   // MessageAbortedError（社区插件 opencode-auto-resume 以同名错误判定 ESC 取消）。
-  // 归一成 run_aborted 而不是 run_failed——自己按的停止不亮终止色、不弹「任务失败」。
+  // 归一成 run_aborted 而不是 run_failed——自己按的停止不亮失败色、不弹「任务失败」。
   // 判定用防御式字符串匹配（官方事件页未给出 session.error 的载荷 schema）：
   // 匹配不上就按原样走 run_failed，最坏情况 = 旧行为。
   if (eventName === "session.error") {{
@@ -269,7 +269,7 @@ async function handle(eventName, payload) {{
     if (hasPartId) toolPosted.delete(part.id);
     if (st === "error") {{
       // 工具级失败 ≠ 回合失败：agent 会自行重试。归一 tool_failed——会话保持
-      // 运行中（相位回落思考中）、不通知、不亮终止色，事件中性色入事件流
+      // 运行中（相位回落思考中）、不通知、不亮失败色，事件中性色入事件流
       await post("tool_failed", {{ sessionID: sid, cwd, is_subagent: sub, tool_name: part.tool ?? "", message: part.state?.error ?? "" }});
     }}
     return;
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn generated_plugin_detects_abort() {
-        // 中止链路：session.error(MessageAbortedError) → run_aborted（不亮终止色），
+        // 中止链路：session.error(MessageAbortedError) → run_aborted（不亮失败色），
         // 其后的 session.idle 在 10s 内压制（否则中止会紧跟一条绿色「完成」）
         let js = plugin_js(1234, "tok");
         assert!(js.contains("MessageAbortedError"), "中止判定必须覆盖 MessageAbortedError");

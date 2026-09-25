@@ -461,7 +461,7 @@ pub async fn glow_off(webview: Webview, app: AppHandle, state: State<'_, Arc<App
 /// 设置页组合预览：边缘亮 `edge` 状态、全屏以 `burst` 状态的颜色补放一次。
 ///
 /// 用于预览双通道并存的效果——「一个完成、其余还在跑」这类多会话场景：
-/// 边缘保持思考色呼吸，全屏按事件角色（完成 / 终止）闪一下。预览的临时接管与
+/// 边缘保持思考色呼吸，全屏按事件角色（完成 / 失败）闪一下。预览的临时接管与
 /// 自动恢复语义与 `glow_preview` 一致。
 #[tauri::command]
 pub async fn glow_preview_burst(

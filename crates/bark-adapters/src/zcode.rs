@@ -42,13 +42,13 @@ use std::path::{Path, PathBuf};
 /// 我们全部注册。其中 `PostToolUse` → `ToolFinished`（工具收尾）：
 /// 它是**等待状态解除的唯一信号**——答完 `AskUserQuestion` / 批完权限后，agent 要先
 /// 思考一段时间才可能调下一个工具，这期间既没有 `PreToolUse` 也没有
-/// `UserPromptSubmit`，不收它的话会话相位会一直卡在「等待中」、警告色一直亮到
+/// `UserPromptSubmit`，不收它的话会话相位会一直卡在「等待中」、等待色一直亮到
 /// 下一个工具开始（实测复现）。曾经以「进程开销翻倍」为由不注册它，是误判：
 /// 每轮多 3 次起进程的代价很小，而「答完问题卡橙色几十秒」的代价是用户每天可见的。
 ///
 /// `PostToolUseFailure` 归一成 `ToolFailed` 而不是 `RunFailed`：它是**工具级失败**
 /// （如编辑前没先读文件），agent 下一步就会重试——按回合失败处理会让一次瞬时
-/// 失败亮终止色全屏特效 + 弹「任务失败」（实测纯噪音）。真回合失败不发任何 hook
+/// 失败也亮失败色全屏特效 + 弹「任务失败」（实测纯噪音）。真回合失败不发任何 hook
 /// （实测 2026-09-19：模型请求致命失败时 7 个事件一个都不触发），由看门狗读日志的
 /// `turn.failed` 合成，见下方「中断与回合失败推断」一节；心跳判死仍是最后兜底，
 /// 见 `EventKind::ToolFailed` 的文档。
@@ -701,14 +701,14 @@ impl HookAdapter for ZcodeAdapter {
         // （计划模式批准 ExitPlanMode 走 PermissionRequest，默认就是 PermissionRequired，
         //   不需要特例）。PostToolUse 刻意**不**升级：它是「用户已答完」的收尾信号
         // （ToolFinished），正要把相位从等待中打回思考中——升回 InputRequired 等于
-        // 把卡住的警告色又钉回去。
+        // 把卡住的等待色又钉回去。
         if is_ask_user_question(raw)
             && matches!(kind, EventKind::Activity | EventKind::PermissionRequired)
         {
             kind = EventKind::InputRequired;
         }
         // 工具失败若是**用户打断**引起的（is_interrupt），按「中止」归一：
-        // 不通知、不亮终止色。注：实测（见 doc/agent-integration.md §6）当前版本
+        // 不通知、不亮失败色。注：实测（见 doc/agent-integration.md §6）当前版本
         // 的中断路径上这个字段从未出现——ZCode 中断时 1ms 内就取消了 hook 进程，
         // 真中断的秒级信号由 abort_watch 读日志合成；这里是按字段名的防御式处理。
         if kind == EventKind::ToolFailed && raw.get("is_interrupt").is_some_and(|v| v.as_bool() == Some(true)) {
@@ -877,7 +877,7 @@ pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
     // 结构化字段三档判定：status 是枚举值、不随文案改版漂移——明确是 "cancelled"
     // 才算中断，明确不是（"failed" 及未来新增的终态）**不再看文案**，否则
     // "status": "failed" 但文案恰好含 cancel 的失败会被静默吞成中断（不通知、
-    // 不亮终止色，真实失败无声消失）。只有 status 缺失才退回 cancel 文案兜底。
+    // 不亮失败色，真实失败无声消失）。只有 status 缺失才退回 cancel 文案兜底。
     let cancelled_shape = match v.get("status").and_then(|s| s.as_str()) {
         Some("cancelled") => true,
         Some(_) => false,
@@ -1459,7 +1459,7 @@ mod tests {
 
         // 工具收尾：PostToolUse 一律 ToolFinished（相位回落思考中）。
         // 答完 AskUserQuestion 的收尾也必须是它——升回「等待输入」等于把
-        // 卡住的警告色又钉回去（回归：实测答完问题后警告色一直亮到下一个工具）
+        // 卡住的等待色又钉回去（回归：实测答完问题后等待色一直亮到下一个工具）
         for tool in ["Bash", "AskUserQuestion"] {
             let ev = a
                 .normalize("PostToolUse", &json!({ "session_id": "s", "tool_name": tool }))
@@ -1476,7 +1476,7 @@ mod tests {
 
         // 工具失败 / 回合完成
         // 工具失败是「工具级」失败（agent 会自行重试），归一成 ToolFailed：
-        // 不通知、不亮终止色，但事件仍入历史与事件流（中性色可排查）
+        // 不通知、不亮失败色，但事件仍入历史与事件流（中性色可排查）
         let ev = a
             .normalize("PostToolUseFailure", &json!({ "session_id": "s", "error": "boom", "is_interrupt": false }))
             .unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
         assert_eq!(ev.message, "boom");
         assert!(!ev.kind.should_notify(), "工具失败 agent 会自行重试，不该弹「任务失败」");
 
-        // 打断型工具失败（is_interrupt）按「中止」归一：不亮终止色（防御式分支，
+        // 打断型工具失败（is_interrupt）按「中止」归一：不亮失败色（防御式分支，
         // 实测当前版本中断路径上该字段从未出现）
         let ev = a
             .normalize("PostToolUseFailure", &json!({ "session_id": "s", "error": "用户取消", "is_interrupt": true }))
@@ -1644,7 +1644,7 @@ mod tests {
     #[test]
     fn turn_failed_status_tiers_subagent_and_dedup_fallback() {
         // status = "failed" 但文案含 cancel：**不**得吞成中断——结构化字段明确时
-        // 文案只作参考，否则真实失败会静默消失（不通知、不亮终止色）
+        // 文案只作参考，否则真实失败会静默消失（不通知、不亮失败色）
         let sig = parse_log_signal(
             r#"{"event":"turn.failed","status":"failed","sessionId":"sess_abc12345","turnId":"turn_a","error":{"message":"Request was cancelled by upstream","cause":{"message":"upstream reset"}}}"#,
         )
@@ -1754,7 +1754,7 @@ mod tests {
 
         // 清理/重建导致文件变短：视同换新文件、从当前末尾开始——**不得重放历史**。
         // 历史行里的失败信号去重键互不相同（会话|回合）、30 秒窗口拦不住，
-        // 重放会把正在跑的会话批量误杀（假「任务失败」通知 + 误亮终止色 + 摘表）
+        // 重放会把正在跑的会话批量误杀（假「任务失败」通知 + 误亮失败色 + 摘表）
         std::fs::write(&log, format!("{REAL_STOP_LINE}\n{REAL_CANCEL_LINE}\n")).unwrap();
         assert!(tail.poll(&dir).is_empty(), "重建后的旧内容属于历史，不得重放");
 

@@ -188,7 +188,7 @@ function normalizeGlowEffects(cfg: BarkConfig) {
 }
 
 function normalizeStateEffects(map: StateEffects | undefined, known: Set<string>, fallback: string): StateEffects {
-  const m = map ?? { thinking: "", warning: "", completed: "", terminated: "" };
+  const m = map ?? { thinking: "", waiting: "", completed: "", failed: "" };
   for (const key of SOUND_ROWS) {
     if (!known.has(m[key])) m[key] = fallback;
   }
@@ -227,14 +227,14 @@ async function stopNow() {
 
 // ---- 声音 ----
 
-/** 「声音」与「屏幕光效」两区的四行：与流光四色状态同语义（思考 / 警告 / 完成 / 终止） */
-const SOUND_ROWS = ["thinking", "warning", "completed", "terminated"] as const;
+/** 「声音」与「屏幕光效」两区的四行：与流光四色状态同语义（思考 / 等待 / 完成 / 失败） */
+const SOUND_ROWS = ["thinking", "waiting", "completed", "failed"] as const;
 
 const SOUND_ROW_LABELS: Record<(typeof SOUND_ROWS)[number], string> = {
   thinking: "思考",
-  warning: "警告",
+  waiting: "等待",
   completed: "完成",
-  terminated: "终止",
+  failed: "失败",
 };
 
 const testing = ref("");
@@ -378,9 +378,9 @@ onUnmounted(glowOffSafely);
         <span class="section-label">预览</span>
         <div class="row mt-8">
           <button class="ghost state-thinking" :disabled="!!previewing || stopping" @click="previewGlow('running')">思考</button>
-          <button class="ghost state-warning" :disabled="!!previewing || stopping" @click="previewGlow('waiting')">警告</button>
+          <button class="ghost state-waiting" :disabled="!!previewing || stopping" @click="previewGlow('waiting')">等待</button>
           <button class="ghost state-completed" :disabled="!!previewing || stopping" @click="previewGlow('completed')">完成</button>
-          <button class="ghost state-terminated" :disabled="!!previewing || stopping" @click="previewGlow('failed')">终止</button>
+          <button class="ghost state-failed" :disabled="!!previewing || stopping" @click="previewGlow('failed')">失败</button>
           <button class="ghost" :disabled="stopping || !!previewing" @click="stopNow">熄灭</button>
         </div>
       </div>

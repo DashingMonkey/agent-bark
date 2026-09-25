@@ -2,7 +2,7 @@
 //
 // 独立入口，与主窗口的 Vue 应用无关。职责只有两件事：
 // 1. 展示「当前活动」：进行中的会话（图标 + 四态状态）+ 最近一次
-//    完成/终止事件的短暂驻留——状态口径与事件流、屏幕光效完全一致；
+//    完成/失败事件的短暂驻留——状态口径与事件流、屏幕光效完全一致；
 // 2. 窗口行为：按住拖动（右键菜单「固定位置」可锁住）、位置记忆
 //    （经 save_widget_position 落盘，重启原位恢复）、右键菜单
 //    （固定位置 / 关闭悬浮窗）、双击打开主面板（主窗口启动时不自动显示，
@@ -50,7 +50,7 @@ const CARD_W = init.width;
 const ROW_H = 26;
 const PAD_V = 12;
 const IDLE_H = 38;
-/** 完成/终止事件的驻留时长：与屏幕光效的完成色停留同量级 */
+/** 完成/失败事件的驻留时长：与屏幕光效的完成色停留同量级 */
 const TERMINAL_HOLD_MS = 6000;
 /** 拖动停止多久后再读窗口位置落盘（等 OS 拖拽循环安静下来） */
 const SAVE_DELAY_MS = 220;
@@ -59,7 +59,7 @@ const HIDE_DELAY_MS = 2000;
 /** 淡入 / 淡出时长（CSS 过渡同值，见 widget.html） */
 const FADE_MS = 160;
 
-type StateColor = "thinking" | "warning" | "completed" | "terminated";
+type StateColor = "thinking" | "waiting" | "completed" | "failed";
 
 let pinned = init.pinned;
 let dragging = false;
@@ -72,7 +72,7 @@ interface Row {
   label: string;
   state: StateColor;
   /**
-   * 需要关注（自动隐藏状态机的「有事」档）：等待确认 / 等待输入（警告）、
+   * 需要关注（自动隐藏状态机的「有事」档）：等待确认 / 等待输入（等待）、
    * 任务完成、任务失败。思考类（思考中 / 执行工具）与手动中止（已中止）不算——
    * 中止是用户自己按的停止，不值得把卡片弹回来（与光效同口径）
    */
@@ -107,7 +107,7 @@ async function loadSessions() {
   }
 }
 
-/** 完成/终止事件 → 驻留行（思考/警告由会话表表达，终态靠这里短暂展示） */
+/** 完成/失败事件 → 驻留行（思考/等待由会话表表达，终态靠这里短暂展示） */
 function onEvent(ev: NormalizedEvent) {
   // 推送负载兜底：null / 异常负载直接忽略，别把整个渲染循环冻在旧帧
   if (!ev || typeof ev !== "object") {
@@ -117,8 +117,8 @@ function onEvent(ev: NormalizedEvent) {
   if (ev.is_subagent) return;
   const map: Partial<Record<NormalizedEvent["type"], [StateColor, string]>> = {
     run_completed: ["completed", "任务完成"],
-    run_failed: ["terminated", "任务失败"],
-    run_aborted: ["terminated", "已中止"],
+    run_failed: ["failed", "任务失败"],
+    run_aborted: ["failed", "已中止"],
   };
   const hit = map[ev.type];
   if (!hit) return;
@@ -153,15 +153,15 @@ function scheduleExpiry() {
 function currentRows(): Row[] {
   const out: Row[] = sessions.map((s) => {
     const state: StateColor =
-      s.phase === "waiting_permission" || s.phase === "waiting_input" ? "warning" : "thinking";
+      s.phase === "waiting_permission" || s.phase === "waiting_input" ? "waiting" : "thinking";
     return {
       key: `${s.agent}|${s.session_id}`,
       agent: s.agent,
       // 未知 phase 兜底显示原值：undefined 漏进 escapeHtml 会抛 TypeError、悬浮窗冻结在旧帧
       label: PHASE_LABELS[s.phase] ?? String(s.phase),
       state,
-      // 警告（等待确认 / 等待输入）要人管 = 有事；思考类（思考中 / 执行工具）不用
-      attention: state === "warning",
+      // 等待（等待确认 / 等待输入）要人管 = 有事；思考类（思考中 / 执行工具）不用
+      attention: state === "waiting",
       session: true,
     };
   });

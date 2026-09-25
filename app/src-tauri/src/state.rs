@@ -17,7 +17,7 @@ use crate::glow::GlowState;
 
 pub const HISTORY_CAP: usize = 500;
 
-/// 会话实时状态（由 Activity 心跳与打断/终止事件推导，前端经 bark://sessions 订阅）
+/// 会话实时状态（由 Activity 心跳与打断/终态事件推导，前端经 bark://sessions 订阅）
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
@@ -89,7 +89,7 @@ fn parse_stale_override(raw: &str) -> Option<i64> {
 /// 状态表上限：超出时淘汰最久未活动的（防泄漏，正常同时活跃会话远达不到）
 const ACTIVE_SESSIONS_CAP: usize = 64;
 /// 回合刚结束后的「空闲回声」宽限窗：TraeCode 实测每回合 Stop 后都会立即跟一条
-/// Notification（空闲类），若按打断处理，流光会在完成色后误转警告色。宽限窗内的
+/// Notification（空闲类），若按打断处理，流光会在完成色后误转等待色。宽限窗内的
 /// 打断事件（仅限无活跃条目时）视为回声：不建档、不通知，完成色照常停留淡出。
 pub const IDLE_ECHO_GRACE_MS: i64 = 10_000;
 
@@ -457,7 +457,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
 
         // 0.3 空 session_id 的事件不进状态机/glow/音效/通知聚合，只入历史与事件流：
         //     stdin 超时的空 payload 照样能 normalize 出事件（§2.11），session_key 会
-        //     建出 `"agent|"` 幻影会话——心跳判死时还会凭空亮终止色。幻影会话没有任何
+        //     建出 `"agent|"` 幻影会话——心跳判死时还会凭空亮失败色。幻影会话没有任何
         //     展示价值，但事件本身要留痕（排查「hook 超时」要用）。
         if skips_state_machine(&event) {
             tracing::debug!(agent = %event.agent, "empty session_id, publish only");
@@ -486,12 +486,12 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         // 0.6 屏幕边缘流光：会话表已更新完，据此推导颜色。
         //     放在锁外——内部可能要建窗口（会派发到主线程）。
         //     终态回声（如上文 Stop 之后紧跟的 SessionEnd）不改状态表，也不该改流光，
-        //     否则正常回合的完成色会被压成终止色；但心跳判死仍需照常显终止色。
+        //     否则正常回合的完成色会被压成失败色；但心跳判死仍需照常显失败色。
         //     陈旧补投（stale）不驱动 glow/音效（§1.6）：它声称的状态早已过时，
-        //     照常驱动会「开局红光 + 终止音」；历史与通知保留（离线兜底的本意）。
+        //     照常驱动会「开局红光 + 失败音」；历史与通知保留（离线兜底的本意）。
         if should_drive_glow(stale, suppressed_echo, running_lost) {
             crate::glow::update_from_event(&app, &state, &event, running_lost);
-            // 状态音效与流光同一套四状态语义（思考/警告/完成/终止），默认全部未选
+            // 状态音效与流光同一套四状态语义（思考/等待/完成/失败），默认全部未选
             // = 静音。子代理事件不响（与通知的子代理过滤同口径，否则一个任务拆出
             // 十几个子代理会连响十几声）。
             if !event.is_subagent {
@@ -684,15 +684,15 @@ fn claim_pending(
 
 /// 本次事件是否驱动 glow/音效（纯函数，§1.6）。
 ///
-/// 陈旧补投（stale）**不驱动**：它声称的状态早已过时，照常驱动会「开局红光 + 终止音」
+/// 陈旧补投（stale）**不驱动**：它声称的状态早已过时，照常驱动会「开局红光 + 失败音」
 /// （启动补投一条 40 分钟前的 RunFailed 即复现）；历史与通知保留（离线兜底的本意）。
-/// 终态回声不驱动（完成色不能被压成终止色），但回声捎带的心跳判死（running_lost）要驱动。
+/// 终态回声不驱动（完成色不能被压成失败色），但回声捎带的心跳判死（running_lost）要驱动。
 fn should_drive_glow(stale: bool, suppressed_echo: bool, running_lost: bool) -> bool {
     !stale && (!suppressed_echo || running_lost)
 }
 
 /// 空 session_id 的事件只入历史与事件流（§2.11）：stdin 超时的空 payload 照样
-/// normalize 出事件，进状态机会建出 `"agent|"` 幻影会话（判死时凭空亮终止色）。
+/// normalize 出事件，进状态机会建出 `"agent|"` 幻影会话（判死时凭空亮失败色）。
 fn skips_state_machine(ev: &NormalizedEvent) -> bool {
     ev.session_id.trim().is_empty()
 }
@@ -740,12 +740,12 @@ fn sound_key_for(event: &NormalizedEvent, running_lost: bool) -> Option<&'static
         return None;
     }
     if running_lost {
-        return Some("terminated");
+        return Some("failed");
     }
     match event.kind {
         EventKind::RunCompleted => Some("completed"),
-        EventKind::RunFailed => Some("terminated"),
-        EventKind::PermissionRequired | EventKind::InputRequired => Some("warning"),
+        EventKind::RunFailed => Some("failed"),
+        EventKind::PermissionRequired | EventKind::InputRequired => Some("waiting"),
         EventKind::Activity if event.tool_name.is_none() => Some("thinking"),
         _ => None,
     }
@@ -817,7 +817,7 @@ fn drop_agent_sessions(state: &AppState, agent: &str) -> (bool, bool) {
 /// 即时清理。历史上后者只手写了 `drop_agent_sessions` 而漏掉流光那一步，后果是一盏
 /// 熄不掉的灯：关掉最后一个在跑的 agent 接入后，它的事件从此被门丢弃（`changed` 永远
 /// 为 false，再也走不到善后），判死巡检也因表已空而无变化、在 `sweep_stale_sessions`
-/// 的 `!changed` 分支早退——思考色 / 警告色会一直挂在屏幕上，只有托盘「重置流光」能解。
+/// 的 `!changed` 分支早退——思考色 / 等待色会一直挂在屏幕上，只有托盘「重置流光」能解。
 ///
 /// 流光不区分 agent，所以摘完要按**剩余**会话重新推导，而不是只在一处分叉上处理：
 /// - 表已空：当前不是终态指示（会自己过期的绿/红不受影响）时收回，免得留下僵尸色；
@@ -976,7 +976,7 @@ struct PruneResult {
     changed: bool,
     /// 被淘汰的条目里是否有「正在运行中」的会话。
     /// 这类会话是被心跳超时判死的（agent 进程被杀不会有 Stop 事件），
-    /// 对屏幕边缘流光来说就是「意外终止」→ 终止色。
+    /// 对屏幕边缘流光来说就是「意外终止」→ 失败色。
     running_lost: bool,
 }
 
@@ -1056,7 +1056,7 @@ fn prune_and_snapshot(
 /// 或回合被用户中断之后可能**再也不发任何事件**（实测 ZCode 手动终止：既没有 `Stop`、
 /// 也没有任何「会话结束」类事件）——于是流光永远停在思考色（用户实测复现），状态表条目也只在
 /// 15s 轮询的快照过滤里「看不见」，并没有真正被清掉。这里让判死自己发生：
-/// 清表 + 推前端快照 + 该转终止色的转终止色、该收回的收回。
+/// 清表 + 推前端快照 + 该转失败色的转失败色、该收回的收回。
 pub fn sweep_stale_sessions(state: &Arc<AppState>, app: &AppHandle) {
     let (changed, running_lost, snapshot) = {
         let mut sessions = lock(&state.active_sessions);
@@ -1068,19 +1068,19 @@ pub fn sweep_stale_sessions(state: &Arc<AppState>, app: &AppHandle) {
     let _ = app.emit("bark://sessions", &snapshot);
     if running_lost {
         // 心跳判死 = 意外终止（agent 进程没了 / 回合被用户中断且没有终态事件）：
-        // 还有别的活跃会话就按它们显示，一个不剩才转终止色。
+        // 还有别的活跃会话就按它们显示，一个不剩才转失败色。
         crate::glow::refresh_from_sessions(app, state, true);
         // 意外终止的事件通道（burst_only）不经过事件管道，音效在这里补上
-        play_state_sound(state, "terminated");
+        play_state_sound(state, "failed");
     } else if snapshot.is_empty() && !crate::glow::current(state).is_terminal() {
-        // 判死的是等待中的会话（警告色）：没有活跃会话了就该收回，别把警告色留在屏幕上
+        // 判死的是等待中的会话（等待色）：没有活跃会话了就该收回，别把等待色留在屏幕上
         crate::glow::reset(app, state);
     } else {
         crate::glow::refresh_from_sessions(app, state, false);
     }
 }
 
-/// 心跳/打断/终止事件 → 状态表跃迁。返回 true 表示状态表有变化（应推送前端）。
+/// 心跳/打断/终态事件 → 状态表跃迁。返回 true 表示状态表有变化（应推送前端）。
 ///
 /// 心跳语义按 tool_name 是否存在区分：
 /// - 无 tool_name（UserPromptSubmit）→ 新回合：Thinking，重置 started_at，记 prompt；
@@ -1098,7 +1098,7 @@ pub fn sweep_stale_sessions(state: &Arc<AppState>, app: &AppHandle) {
 ///   也可能是「空闲回声」：agent 发心跳（如 TraeCode），Stop 后紧跟一条 Notification。
 ///   两者用行为特征区分——只有 `finished` 里记录了「该会话刚因终态移除过条目」
 ///   （= 它会发心跳且刚才真的在跑、现已结束），宽限窗内的打断才判定为回声：
-///   不建档、不通知，否则完成色会被误压成警告色。
+///   不建档、不通知，否则完成色会被误压成等待色。
 /// 会话表更新入口（测试用包装：stale 恒为 false；生产管道走 `apply_session_event_inner`）
 #[cfg(test)]
 fn apply_session_event(
@@ -1155,8 +1155,8 @@ fn apply_session_event_inner(
             {
                 // 终态回声：同一次回合结束会被两个事件报告（实测 Qoder 系是
                 // Stop + SessionEnd，相隔约 150ms）。第二条不该再通知一次，
-                // 也不该把刚亮起的完成色压成终止色——用户主动中断的回合则只有
-                // SessionEnd 一条，不在此列，照常按「已中止」处理（收起流光，不亮终止色）。
+                // 也不该把刚亮起的完成色压成失败色——用户主动中断的回合则只有
+                // SessionEnd 一条，不在此列，照常按「已中止」处理（收起流光，不亮失败色）。
                 tracing::debug!(agent = %ev.agent, "terminal echo after terminal, suppress");
                 delta.suppressed_echo = true;
             }
@@ -1221,7 +1221,7 @@ fn apply_session_event_inner(
                 // 带工具名的心跳**不可能开启新回合**：会话刚终态（宽限窗内）又来的
                 // PreToolUse/PostToolUse 是乱序回声——Stop 与工具 hook 是两个独立进程，
                 // 没有全局顺序保证（工具 hook 慢几百毫秒就会「先完成、后心跳」）。
-                // 放它建档会把刚收起的完成色复活成思考色，10 分钟后被判死又亮终止色。
+                // 放它建档会把刚收起的完成色复活成思考色，10 分钟后被判死又亮失败色。
                 // 不带工具名的心跳（UserPromptSubmit）是真实新回合，照常建档。
                 if ev.tool_name.is_some()
                     && finished
@@ -1244,7 +1244,7 @@ fn apply_session_event_inner(
         EventKind::ToolFailed => {
             // 工具级失败 ≠ 回合失败：agent 会自行重试（实测 ZCode 编辑前没先读文件，
             // 失败后立刻重试成功），会话**留在表里**继续表达「在跑」，只把相位回落
-            // 「思考中」（失败的工具已不在执行）。不摘表、不通知、不触发终止色；
+            // 「思考中」（失败的工具已不在执行）。不摘表、不通知、不触发失败色；
             // 事件本身仍入历史与事件流（中性色「工具失败」，可排查不吓人）。
             // 无条目时建档：PostToolUseFailure 可能是低频心跳 agent（Claude Code 系
             // 不订阅 PreToolUse）唯一的「正在跑」信号，漏建会让流光在失败瞬间熄掉。
@@ -1267,8 +1267,8 @@ fn apply_session_event_inner(
             // 工具收尾（PostToolUse）当心跳：工具已结束、回合仍在跑，相位回落思考中，
             // 会话留在表里。它是**等待状态解除的第一信号**——答完 AskUserQuestion /
             // 批完权限之后到下一个工具开始之前没有任何 PreToolUse，不收它的话相位
-            // 会一直卡在 Waiting*、警告色一直亮到下一个工具开始（实测 ZCode）。
-            // 与 ToolFailed 同款：不摘表、不通知、不触发终止色；不入历史（见
+            // 会一直卡在 Waiting*、等待色一直亮到下一个工具开始（实测 ZCode）。
+            // 与 ToolFailed 同款：不摘表、不通知、不触发失败色；不入历史（见
             // run_pipeline），音效也不响（sound_key_for 落在通配臂）。
             match sessions.get_mut(&key) {
                 Some(s) => {
@@ -1280,7 +1280,7 @@ fn apply_session_event_inner(
                     // 无条目 + 宽限窗内有终态记录 = 乱序回声：Stop 与工具 hook 是两个
                     // 独立进程、没有全局顺序保证，PostToolUse 慢几百毫秒就会「先完成、
                     // 后收尾」。放它建档会把刚收起的完成色复活成思考色，10 分钟后被
-                    // 判死又亮终止色（同 Activity 分支对带工具名心跳的防回声处理）。
+                    // 判死又亮失败色（同 Activity 分支对带工具名心跳的防回声处理）。
                     if finished
                         .get(&key)
                         .is_some_and(|t| echo_within_grace(*t, ev.timestamp))
@@ -1351,7 +1351,7 @@ fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
 /// 陈旧补投判定：事件时间戳比现在还老过判死阈值。离线兜底落盘的事件
 /// （hook 写 pending.jsonl、daemon 启动补投，上限 1 小时）会带着旧时间戳
 /// 重新进管道——它声称的「正在跑 / 等人」状态早已不可信，不应建档
-/// （否则启动 30s 内就被 sweep 判死，开局红光 + 终止音）。事件本身仍入
+/// （否则启动 30s 内就被 sweep 判死，开局红光 + 失败音）。事件本身仍入
 /// 历史与通知。阈值与 sweep 判死同源（stale_after_ms，可用环境变量覆盖）。
 fn is_stale_replay(ev: &NormalizedEvent) -> bool {
     bark_core::now_millis().saturating_sub(ev.timestamp) > stale_after_ms()
@@ -1546,14 +1546,14 @@ mod tests {
         let mut e = ev(EventKind::RunCompleted, 1000, None, "");
         assert_eq!(sound_key_for(&e, false), Some("completed"));
         e.kind = EventKind::RunFailed;
-        assert_eq!(sound_key_for(&e, false), Some("terminated"));
+        assert_eq!(sound_key_for(&e, false), Some("failed"));
         // 用户主动中止不响（与流光同口径：那是你自己按的停止）
         e.kind = EventKind::RunAborted;
         assert_eq!(sound_key_for(&e, false), None);
         e.kind = EventKind::PermissionRequired;
-        assert_eq!(sound_key_for(&e, false), Some("warning"));
+        assert_eq!(sound_key_for(&e, false), Some("waiting"));
         e.kind = EventKind::InputRequired;
-        assert_eq!(sound_key_for(&e, false), Some("warning"));
+        assert_eq!(sound_key_for(&e, false), Some("waiting"));
         // 新回合开始（无工具名的心跳）= 思考；同回合的工具心跳不重复响
         e.kind = EventKind::Activity;
         e.tool_name = None;
@@ -1564,13 +1564,13 @@ mod tests {
         e.kind = EventKind::ToolFinished;
         assert_eq!(sound_key_for(&e, false), None);
         // 心跳判死优先于事件本身：agent 进程没了 = 意外终止
-        assert_eq!(sound_key_for(&e, true), Some("terminated"));
+        assert_eq!(sound_key_for(&e, true), Some("failed"));
         // 用户主动中止永远不响，即便同一瞬间恰好有别的会话被判死
         // （音与流光的优先级必须一致：derive 里 RunAborted 也先于判死收光）
         let mut a = ev(EventKind::RunAborted, 1000, None, "");
         assert_eq!(sound_key_for(&a, true), None);
         a.kind = EventKind::RunCompleted;
-        assert_eq!(sound_key_for(&a, true), Some("terminated"), "普通终态事件在判死时仍报终止音");
+        assert_eq!(sound_key_for(&a, true), Some("failed"), "普通终态事件在判死时仍报失败音");
     }
 
     #[test]
@@ -1579,8 +1579,8 @@ mod tests {
         assert!(!should_play_state_sound("thinking", false), "保活心跳不重播思考音");
         // 其余状态音不被门拦：终态会把条目摘掉（无从比对相位），打断是一次性事件
         assert!(should_play_state_sound("completed", false));
-        assert!(should_play_state_sound("terminated", false));
-        assert!(should_play_state_sound("warning", false));
+        assert!(should_play_state_sound("failed", false));
+        assert!(should_play_state_sound("waiting", false));
     }
 
     #[test]
@@ -1615,7 +1615,7 @@ mod tests {
     fn late_tool_heartbeat_does_not_revive_finished_session() {
         // Stop 与工具 hook 是独立进程，无顺序保证：RunCompleted 先到、
         // 带工具名的心跳（PreToolUse/PostToolUse）后到 = 乱序回声。
-        // 不得复活会话（否则 10 分钟后被判死，亮终止色 + 播终止音）。
+        // 不得复活会话（否则 10 分钟后被判死，亮失败色 + 播失败音）。
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
         assert!(apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 2000, None, "done")).changed);
@@ -1733,7 +1733,7 @@ mod tests {
     fn tool_finished_returns_phase_to_thinking() {
         // PostToolUse 是等待状态解除的第一信号：
         // - 工具收尾 → 思考中（工具之间的间隙也是思考期）
-        // - 等待输入被回答 → 思考中（实测 ZCode：答完 AskUserQuestion 后警告色
+        // - 等待输入被回答 → 思考中（实测 ZCode：答完 AskUserQuestion 后等待色
         //   一直亮到下一个工具开始，就是缺这条信号）
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
@@ -1768,7 +1768,7 @@ mod tests {
     #[test]
     fn tool_finished_after_terminal_is_echo_within_grace() {
         // Stop 与工具 hook 是两个独立进程，PostToolUse 乱序晚到 = 回声：
-        // 宽限窗内不得复活会话（否则思考色挂 10 分钟后被判死又亮终止色）
+        // 宽限窗内不得复活会话（否则思考色挂 10 分钟后被判死又亮失败色）
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 2000, None, "done"));
@@ -1829,7 +1829,7 @@ mod tests {
 
         // 紧随其后的 SessionEnd（映射为 RunAborted）= 终态回声
         let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunAborted, 2150, None, ""));
-        assert!(d.suppressed_echo, "正常回合的第二条终态事件必须被抑制（否则会多一条通知、完成色被压成终止色）");
+        assert!(d.suppressed_echo, "正常回合的第二条终态事件必须被抑制（否则会多一条通知、完成色被压成失败色）");
         assert!(!d.changed);
         assert!(sessions.is_empty());
 
@@ -1845,7 +1845,7 @@ mod tests {
     #[test]
     fn idle_echo_after_completion_does_not_relight_waiting() {
         // TraeCode 实测序列：回合结束后 Stop 立即跟一条 Notification，
-        // 流光应在完成色后停留淡出，而不是被压成警告色
+        // 流光应在完成色后停留淡出，而不是被压成等待色
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, None, "问题"));
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 2000, None, ""));
@@ -2075,21 +2075,21 @@ mod tests {
     #[test]
     fn sweep_prunes_dead_running_session_and_flags_running_lost() {
         // 用户实测场景：ZCode 手动终止后既没有 Stop 也没有任何终态事件，
-        // 流光一直停在思考色——必须靠定时巡检把这条会话判死（→ 终止色 + 清表）
+        // 流光一直停在思考色——必须靠定时巡检把这条会话判死（→ 失败色 + 清表）
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
         assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::ToolRunning);
 
         let (changed, running_lost, snapshot) = prune_and_snapshot(&mut sessions, 1000 + STALE_AFTER_MS);
         assert!(changed, "僵死条目必须被淘汰");
-        assert!(running_lost, "运行中的会话判死 = 意外终止（流光转终止色）");
+        assert!(running_lost, "运行中的会话判死 = 意外终止（流光转失败色）");
         assert!(snapshot.is_empty(), "快照里不该再有僵死条目");
         assert!(sessions.is_empty(), "状态表本身也要清掉，不能只靠快照过滤");
     }
 
     #[test]
     fn sweep_prunes_dead_waiting_session_without_claiming_running_lost() {
-        // 等待中的会话判死不是「意外终止」：不该转终止色，而是收回光标（调用方负责 reset）
+        // 等待中的会话判死不是「意外终止」：不该转失败色，而是收回光标（调用方负责 reset）
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::PermissionRequired, 1000, None, ""));
 
@@ -2251,7 +2251,7 @@ mod tests {
         assert!(!should_drive_glow(true, false, false), "陈旧补投不驱动光效/音效");
         assert!(!should_drive_glow(true, false, true));
         assert!(!should_drive_glow(true, true, false));
-        // 新鲜事件照常；终态回声不驱动（完成色不被压成终止色），
+        // 新鲜事件照常；终态回声不驱动（完成色不被压成失败色），
         // 但回声捎带的心跳判死（running_lost）仍要驱动
         assert!(should_drive_glow(false, false, false));
         assert!(!should_drive_glow(false, true, false));
@@ -2390,7 +2390,7 @@ mod tests {
     }
 
     /// §2.11 回归：空 session_id 事件只入历史与事件流，不进状态机/glow/音效/通知聚合
-    ///（否则 `"agent|"` 幻影会话凭空建档、判死时凭空亮终止色）
+    ///（否则 `"agent|"` 幻影会话凭空建档、判死时凭空亮失败色）
     #[test]
     fn empty_session_id_events_skip_state_machine() {
         assert_eq!(session_key("claude-code", ""), "claude-code|", "幻影键形态（回归说明）");
