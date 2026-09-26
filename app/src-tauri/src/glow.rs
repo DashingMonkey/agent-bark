@@ -38,14 +38,20 @@
 
 use bark_core::{EventKind, GlowConfig, GlowEffect, MonitorTarget, NormalizedEvent};
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, EventTarget, Manager, Monitor, WebviewUrl, WebviewWindowBuilder};
 
 use crate::state::{lock, read, AppState, SessionPhase, SessionStatus};
 
 /// glow 窗口 label 前缀（实际 label 形如 `glow-0`）
 pub const GLOW_PREFIX: &str = "glow-";
+/// 全屏特效窗口 label 前缀（实际 label 形如 `glow-burst-0`）。
+///
+/// 「位置=顶部」时灯带与特效分窗：边缘窗口缩成顶部条带（见 [`rect_of`]），
+/// 特效要有自己的整屏画布，就放在这套独立窗口里。仍以 `glow-` 开头，
+/// capabilities 里 `glow-*` 的通配自动覆盖，无需另配。
+const BURST_PREFIX: &str = "glow-burst-";
 /// 状态推送事件名（前端 src/glow.ts 监听）
 pub const GLOW_EVENT: &str = "glow://state";
 
@@ -73,6 +79,18 @@ const GLOW_BURST_MS: u32 = 3_000;
 const GLOW_COMPLETED_HOLD_MS: u64 = 6_000;
 /// 「失败」（意外终止）色停留时长（ms）
 const GLOW_FAILED_HOLD_MS: u64 = 12_000;
+/// 「位置=顶部」时覆盖窗的条带高度（逻辑 px）。
+///
+/// 只亮顶部时窗口不再覆盖整块显示器（见 [`rect_of`]）：前端把灯效**重绘**成
+/// 贴顶边的一条横条（glow.html `data-sides="top"` 的独立渲染路径，不是四周
+/// 渲染的裁剪），窗口只需装下顶边辉光坡的可见深度（呼吸坡 100px 模糊 +
+/// 32px 扩散 = 132px，坡深 × `--glow`）加余量。150 = 132 + 18 余量。
+/// 旧值 280 是裁剪版的账（140px 裁剪带 + 132px 被裁剪线藏住的**底边**辉光
+/// + 8 余量）：重绘后底边 / 左右边根本不画，不再需要预留。
+/// **与 glow.html 顶部横条的坡深是一对耦合数值，改任何一个必须同步另一个**
+/// （同 `rect_of` ↔ `#glow` inset 的惯例）。`--glow` 目前写死 1.00
+/// （[`GLOW_INTENSITY_CSS`]），强度若开放成可调，本值要跟着坡深缩放。
+const GLOW_TOP_STRIP_H: f64 = 150.0;
 
 /// 颜色特效的触发序号：每亮一次 +1。
 ///
@@ -83,6 +101,41 @@ static BURST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 预览会话序号：每点一次预览 +1，恢复定时器靠它认领自己那一轮。
 static PREVIEW_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 现存 glow 窗口是按哪种「位置」形态建的（true = 顶部条带）。
+///
+/// `align` 靠它识别**模式切换**：数量没变但形态变了时不能就地缩放——旧页面的
+/// 渲染状态（比如还没拿到带 `data-sides` 的 payload）配上新窗口尺寸，会在屏幕
+/// 中间闪出一条光带；必须整组重建，让新页面带着正确的初始态一帧成型。
+/// 只在主线程读写（align / create_all 都在主线程），原子量只为免锁。
+static BUILT_TOP_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次下发给窗口的特效序号。
+///
+/// `emit` 是所有 payload 的必经漏斗，靠它识别「这次推送是不是新的一次颜色特效」
+/// （序号前进 = 是）：只有新触发才为顶部模式按需建特效窗口，同步 / 巡检 / 预览
+/// 恢复这类序号不变的重推只补发、不建窗、不重放。仅主线程读写（emit 全在主线程）。
+static LAST_EMITTED_BURST: AtomicU64 = AtomicU64::new(0);
+
+/// 最近一次下发的 payload 原文（页面就绪补发用，见 [`resend_latest`]）。
+///
+/// 新建窗口在页面加载完之前收不到任何 emit——前端 `listen` 还没注册，事件直接丢。
+/// 建窗时的 initialization_script 只能带上**建窗那一刻**的状态，之后到页面就绪
+/// 之间到达的推送（连点第二下预览就是典型）全部丢失：表现是「第二下没有任何反应、
+/// 灯按第一下的旧定时器熄灭」。补发要发**补发时刻**的最新值而不是建窗时的旧值，
+/// 否则会把过期状态盖回去。主线程读写（emit / 补发都在主线程），Mutex 只为免 unsafe。
+static LAST_PAYLOAD: Mutex<Option<GlowPayload>> = Mutex::new(None);
+
+/// 特效窗口播完后的回收缓冲（ms）：动画时长之外再留一段页面加载 / 渐隐尾巴，
+/// 防止窗口在动画真正结束前被销毁（新建窗口的页面加载会推迟动画起点）。
+const BURST_DESTROY_BUFFER_MS: u64 = 800;
+
+/// 建窗后的「页面就绪补发」延时（ms，自 PageLoadEvent::Finished 起算）。
+///
+/// Finished 时模块脚本一般已跑完，但 `listen` 的注册是一次 IPC 往返、可能还差
+/// 几毫秒——两级补发兜住这个尾巴。多发无害：`render` 幂等，全屏特效按 burst
+/// 序号判重不会重放；少发就是「连点第二下没反应」那类残缺。
+const RESEND_DELAYS_MS: [u64; 2] = [250, 1_200];
 
 /// 记一次「颜色特效被触发」，返回新的序号
 fn bump_burst() -> u64 {
@@ -174,6 +227,19 @@ pub struct GlowPayload {
     /// 边缘光效类型："breathing" | "comet"（前端 data-effect），
     /// 取**当前边缘状态那一行**（`edge_effects`）的设置
     pub effect: String,
+    /// 边缘光效位置："top"=只画顶部（前端重绘成顶边一条横条，窗口本身
+    /// 也按 [`GLOW_TOP_STRIP_H`] 缩成条带）/ "all"=四周（旧行为）。
+    /// 取配置 `edge_position` 经 `edge_sides()` 归一后的值。
+    /// 全屏特效窗口恒收 "all"（见 [`burst_view`]：特效永远整屏）
+    pub sides: String,
+    /// 本次下发要不要让边缘灯带「熄灭重放」（前端掐掉 opacity 过渡、立即熄一帧
+    /// 再重新淡入——不能靠反转进行中的过渡，见 glow.ts render 的实现注释）。
+    ///
+    /// 只有**设置页预览点按**为 true：用户连点预览时，第二下要看得见是新的一次
+    /// 播放（熄灭 → 重新点亮 + 重置停留计时），而不是同色重触发毫无反应、灯按
+    /// 第一下的旧定时器熄灭。真实事件 / 预览恢复 / 页面就绪补发一律 false——
+    /// 真实事件要平滑换色（`burst_only` 更是「边缘不动」），补发是幂等重推。
+    pub restart_edge: bool,
     /// 灯效速度倍率（已格式化的 CSS 值，如 "1.00"）：
     /// CSS 里所有时长都写成 `calc(参考时长 / var(--speed))`
     pub speed: String,
@@ -217,6 +283,9 @@ fn payload_with_burst(cfg: &GlowConfig, state: GlowState, burst: GlowState) -> G
         burst_color: burst.color().to_string(),
         edge: cfg.edge && edge_effect.is_some(),
         effect: edge_effect.unwrap_or(GlowEffect::Breathing).id().to_string(),
+        sides: cfg.edge_sides().to_string(),
+        // 默认不重放灯带；只有预览点按会改写成 true（见 GlowPayload::restart_edge）
+        restart_edge: false,
         speed: GLOW_SPEED_CSS.to_string(),
         intensity: GLOW_INTENSITY_CSS.to_string(),
         hold_ms: state.hold_ms(),
@@ -286,12 +355,14 @@ fn burst_for_event(kind: EventKind, running_lost: bool) -> Option<GlowState> {
 /// - **不动 `glow` / `glow_preview`**：不改任何常驻状态，也不是「预览接管」；
 ///   payload 里的 state/color/hold_ms 原样带回当前边缘态，前端只多看到
 ///   burst 序号变了 + 特效色是事件角色色；
-/// - **窗口不存在时不建窗**：懒创建原则——不为一次 3 秒的特效建常驻覆盖层。
-///   已知代价：托盘「重置流光」或关开关收掉窗口后，若仍有会话在跑且紧接着来了
-///   终态事件，这一次雾散会被丢掉（`apply` 因边缘状态没变而早退，窗口也不会重建）。
-///   取舍见上：不值得为一次特效重建常驻覆盖层；
+/// - **边缘窗口不存在时不建窗**：懒创建原则——不为一次 3 秒的特效点亮整个
+///   覆盖层。已知代价：托盘「重置流光」或关开关收掉窗口后，若仍有会话在跑且
+///   紧接着来了终态事件，这一次雾散会被丢掉（`apply` 因边缘状态没变而早退，
+///   窗口也不会重建）。取舍见上：不值得为一次特效重建常驻覆盖层；
+///   顶部模式下的**特效窗口**例外——它本就是按需创建、播完即毁的（见
+///   [`emit`]），为这一次特效建它正是它的本职；
 /// - `fullscreen` 关闭或总开关关闭时整条路径 no-op（闭包**执行时**复查开关，
-///   与 [`push`] 同样的竞态防御）；
+///   与 [`apply_inner`] 同样的竞态防御）；
 /// - **比较/早退/编号/构造 payload/emit 整体在同一个主线程闭包里执行**（§2.2）：
 ///   编号（`bump_burst`）与 payload 构造若留在调用线程，两个触发线程交错时会
 ///   「A 线程 bump=5 构造 payload → B 线程 bump=6 构造并 emit → A 线程 emit」，
@@ -304,14 +375,14 @@ fn burst_only(app: &AppHandle, state: &Arc<AppState>, burst: GlowState) {
         if !cfg.enabled || !cfg.fullscreen {
             return;
         }
-        if glow_labels(&app).is_empty() {
+        if edge_labels(&app).is_empty() {
             return;
         }
         let edge = *lock(&state.glow);
         // 编号必须在构造 payload 之前 +1（payload 在本闭包内同步构造）
         bump_burst();
         let p = payload_with_burst(&cfg, edge, burst);
-        emit(&app, &p);
+        emit(&app, &cfg, &p);
     }) {
         tracing::warn!("流光全屏特效推送失败（主线程不可用？）: {e}");
     }
@@ -485,24 +556,62 @@ pub fn reset(app: &AppHandle, state: &Arc<AppState>) {
 ///
 /// 返回本轮预览的**序号**，调用方的恢复定时器要拿它回调 [`end_preview`]。
 pub fn preview(app: &AppHandle, state: &Arc<AppState>, next: GlowState) -> u64 {
-    let cfg = read(&state.config).glow.sanitize();
-    let seq = begin_preview(state, next);
-    push(app, state, cfg, next, true);
-    seq
+    dispatch_preview(app, state, next, None)
 }
 
 /// 组合预览：边缘亮 `edge` 状态、全屏特效以 `burst` 的颜色补放一次——
 /// 用于预览双通道并存的效果（如「一个完成、其余还在跑」= 思考色呼吸 + 完成色雾散）。
 /// 预览的临时接管/恢复语义与 [`preview`] 完全一致。
 pub fn preview_burst(app: &AppHandle, state: &Arc<AppState>, edge: GlowState, burst: GlowState) -> u64 {
-    let cfg = read(&state.config).glow.sanitize();
-    let seq = begin_preview(state, edge);
-    let p = payload_with_burst(&cfg, edge, burst);
-    push_payload(app, state, cfg, p, true);
-    seq
+    dispatch_preview(app, state, edge, Some(burst))
+}
+
+/// 预览的整段接管在**同一个主线程闭包**里执行，返回本轮序号（经 channel 交还）。
+///
+/// 与 [`apply_inner`] 同一纪律（§2.2）：登记会话 / 写状态 / 特效编号 / 构造
+/// payload / 建窗下发必须不可分割。拆到调用线程做的话，连点两下预览会交错出
+/// 两种怪象（2026-09-26 用户实测「连续点击第二次毫无反应」）：
+/// - 两次触发**共用一个序号**（后点的 bump 插进了先点的「bump → 构造 payload」
+///   缝里）：前端按序号判重，第二下被吞掉——特效不重放；
+/// - **后点的反而先登记**恢复槽：先点那轮的恢复定时器认领成功，在第一轮的 6s
+///   处把灯掐灭，之后再没有任何一轮把它点亮。
+///
+/// 序号在闭包里分配（与登记同步），调用方的恢复定时器拿它认领自己那一轮。
+/// `burst`：组合预览的特效角色（`None` = 边缘与特效同角色）。
+/// 预览无视总开关（用户点预览就是想先看效果，不该被开关挡住），故不查 `enabled`。
+fn dispatch_preview(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    edge: GlowState,
+    burst: Option<GlowState>,
+) -> u64 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app2 = app.clone();
+    let state2 = state.clone();
+    if let Err(e) = app.clone().run_on_main_thread(move || {
+        let cfg = read(&state2.config).glow.sanitize();
+        let seq = begin_preview(&state2, edge);
+        let mut p = match burst {
+            Some(b) => payload_with_burst(&cfg, edge, b),
+            None => payload(&cfg, edge),
+        };
+        // 预览是用户主动点按：灯带要看得见地「熄灭重放」（见 restart_edge）
+        p.restart_edge = true;
+        push_or_create(&app2, &cfg, &p);
+        let _ = tx.send(seq);
+    }) {
+        tracing::warn!("流光预览派发失败（主线程不可用？）: {e}");
+        return 0;
+    }
+    // 闭包正常执行后 send 必然成功；失败（闭包 panic）返回 0——
+    // 恢复定时器拿 0 认领不到任何一轮，宁可不恢复也不误恢复
+    rx.recv().unwrap_or(0)
 }
 
 /// 开一轮预览会话：登记恢复槽、点亮边缘态、（非空闲时）给特效编号。
+///
+/// 仅由 [`dispatch_preview`] 在主线程闭包内调用——登记 / 写状态 / 编号与随后的
+/// payload 构造必须是一个不可分割的序列（§2.2，见 dispatch_preview 的文档）。
 fn begin_preview(state: &Arc<AppState>, edge: GlowState) -> u64 {
     let seq = PREVIEW_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     {
@@ -619,7 +728,7 @@ pub fn sync(app: &AppHandle, state: &Arc<AppState>) {
         }
         let p = payload(&cfg, current(&state));
         align(&app, &cfg, &p);
-        emit(&app, &p);
+        emit(&app, &cfg, &p);
     }) {
         tracing::warn!("流光窗口同步失败: {e}");
     }
@@ -645,36 +754,18 @@ pub fn maintain(app: &AppHandle, state: &Arc<AppState>) {
     }
 }
 
-/// 建窗口（如果需要）+ 推事件。全程派发到主线程。
-///
-/// `ignore_enabled`：预览专用——预览就是要在开关关闭时也能点亮。
-/// 正常路径必须传 false：闭包**执行时**再查一次开关。入队时开关还是开的、
-/// 执行时用户已经关掉，是真实存在的竞态（保存配置与事件并发）；不复查的话，
-/// 后入队的建窗闭包会在 sync 的销毁闭包之后把窗口重建出来——等待中的会话
-/// 没有后续事件，这个「已禁用却复活的橙色」就永远没人回收了。
-fn push(app: &AppHandle, state: &Arc<AppState>, cfg: GlowConfig, next: GlowState, ignore_enabled: bool) {
-    let p = payload(&cfg, next);
-    push_payload(app, state, cfg, p, ignore_enabled);
-}
-
-fn push_payload(app: &AppHandle, state: &Arc<AppState>, cfg: GlowConfig, p: GlowPayload, ignore_enabled: bool) {
-    let app = app.clone();
-    let state = state.clone();
-    if let Err(e) = app.clone().run_on_main_thread(move || {
-        if !ignore_enabled && !read(&state.config).glow.enabled {
-            return;
-        }
-        push_or_create(&app, &cfg, &p);
-    }) {
-        tracing::warn!("流光状态更新失败（主线程不可用？）: {e}");
-    }
-}
-
 /// 建窗口（如果需要）+ 推事件。**仅主线程调用**（payload 已在主线程构造）。
 fn push_or_create(app: &AppHandle, cfg: &GlowConfig, p: &GlowPayload) {
-    if glow_labels(app).is_empty() {
-        // 懒创建：这一次建窗**是**某次颜色触发的产物，注入的初始态允许放雾散
-        create_all(app, cfg, p, true);
+    if edge_labels(app).is_empty() {
+        // 懒创建：这一次建窗**是**某次颜色触发的产物，注入的初始态允许放雾散。
+        // 顶部模式注入 edge_view：条带窗口不背特效通道——raw p 的 fullscreen
+        // 会让 #burst 在条带里播一次，emit 随后摘掉也来不及（动画已经启动）
+        if p.sides == "top" {
+            let init = edge_view(p);
+            create_all(app, cfg, &init, true);
+        } else {
+            create_all(app, cfg, p, true);
+        }
     } else if p.state != GlowState::Idle {
         // 窗口已存在且这次不是「收起光效」：此刻任务栏可能已经重新升到我们上面
         // （屏幕底部那条会被它整条盖住），趁这次点亮压回去。新窗口不必——刚建的
@@ -682,23 +773,206 @@ fn push_or_create(app: &AppHandle, cfg: &GlowConfig, p: &GlowPayload) {
         // （与 [`keep_topmost`] 同一口径）。
         raise(app);
     }
-    emit(app, p);
+    emit(app, cfg, p);
 }
 
-fn emit(app: &AppHandle, p: &GlowPayload) {
-    for label in glow_labels(app) {
-        if let Err(e) = app.emit_to(EventTarget::webview_window(label), GLOW_EVENT, p) {
+/// 把一份 payload 按窗口角色拆开下发。
+///
+/// 灯带与特效的 payload 本就是两个独立通道（`edge` / `fullscreen`），分窗只是把
+/// 两个通道分别发给各自的画布：
+/// - **四周模式**：边缘窗口就是特效的画布，`p` 原样下发——与旧版逐字节一致；
+/// - **顶部模式**：边缘窗口（条带）拿 [`edge_view`]（摘掉 fullscreen 通道，特效
+///   不在条带里放），特效由专属的整屏窗口（[`burst_view`]，摘掉灯带通道）播放。
+///
+/// 特效窗口**按需创建、播完即毁**（见 [`ensure_burst_windows`]）：全屏矩形只在
+/// 特效的几秒里存在，平时屏幕上只有顶部条带——「防全屏误判」的收益不受影响。
+fn emit(app: &AppHandle, cfg: &GlowConfig, p: &GlowPayload) {
+    remember_payload(p);
+    let is_new_trigger = p.burst != LAST_EMITTED_BURST.swap(p.burst, Ordering::Relaxed);
+    let top_mode = p.sides == "top";
+    let edge_payload;
+    let edge_ref = if top_mode {
+        edge_payload = edge_view(p);
+        &edge_payload
+    } else {
+        p
+    };
+    for label in edge_labels(app) {
+        if let Err(e) = app.emit_to(EventTarget::webview_window(label), GLOW_EVENT, edge_ref) {
+            tracing::warn!("流光事件推送失败: {e}");
+        }
+    }
+    if !top_mode {
+        return;
+    }
+    // 顶部模式的特效窗口：只有**新的一次触发**才按需建窗（同步 / 巡检 / 预览
+    // 恢复这类序号不变的重推只补发不建窗——前端按序号判重，本来也不会重放）。
+    // 刚建好的窗口页面还没加载完，此刻 emit 的事件会丢：payload 已由
+    // initialization_script 注入且注入即本次触发，新窗口不再补发
+    // （与 [`push_or_create`] 懒创建边缘窗口的口径一致）。
+    // 但**建窗后到页面就绪之间**到达的后续推送（连点预览第二下就落在这段
+    // 真空期）不能丢——由 [`create`] 的页面就绪补发捡回来（见 [`resend_latest`]）。
+    let is_trigger = is_new_trigger && p.fullscreen && p.state != GlowState::Idle;
+    let fresh = if is_trigger {
+        ensure_burst_windows(app, cfg, p)
+    } else {
+        Vec::new()
+    };
+    let burst = burst_labels(app);
+    if burst.is_empty() {
+        return;
+    }
+    if is_trigger {
+        schedule_burst_destroy(app, p);
+    }
+    let burst_payload = burst_view(p);
+    for label in burst {
+        if fresh.iter().any(|f| f == &label) {
+            continue;
+        }
+        if let Err(e) = app.emit_to(EventTarget::webview_window(label), GLOW_EVENT, &burst_payload) {
             tracing::warn!("流光事件推送失败: {e}");
         }
     }
 }
 
-fn glow_labels(app: &AppHandle) -> Vec<String> {
+/// 确保全屏特效窗口存在（顶部模式专用，仅主线程）：每块目标显示器一个窗口，
+/// 矩形按**这次特效的类型**定形（见 [`burst_rect_of`]），注入的初始态就是这次
+/// 的 payload（建窗即本次触发，允许直接播放）。
+///
+/// 与 `align` 不同，这里不做数量校正：特效窗口生命周期只有几秒，期间显示器
+/// 变化由下一次触发自然重建。返回**本次新建**的窗口 label（调用方跳过对它们的
+/// 补发）；已有窗口直接复用（连发两次特效 = 复用窗口，按新序号重放动画），
+/// 复用时按当前类型的区域就地校正位置尺寸——两次特效类型不同、区域不同也能
+/// 无缝接管（等值校正无视觉变化，与 `align` 的差量对齐同一套写法）。
+fn ensure_burst_windows(app: &AppHandle, cfg: &GlowConfig, p: &GlowPayload) -> Vec<String> {
+    let rects = monitor_rects_with(app, cfg, |m| burst_rect_of(m, &p.fullscreen_effect));
+    if rects.is_empty() {
+        return Vec::new();
+    }
+    let init = burst_view(p);
+    let mut fresh = Vec::new();
+    for (i, r) in rects.iter().enumerate() {
+        let label = format!("{BURST_PREFIX}{i}");
+        match app.get_webview_window(&label) {
+            Some(w) => {
+                let (x, y, w_, h_) = *r;
+                let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                let _ = w.set_size(tauri::LogicalSize::new(w_, h_));
+            }
+            None => {
+                if let Err(e) = create(app, &label, *r, &init, true) {
+                    tracing::warn!(label = %label, "全屏特效窗口创建失败: {e}");
+                    continue;
+                }
+                fresh.push(label);
+            }
+        }
+    }
+    fresh
+}
+
+/// 特效窗口「播完即毁」的定时器：`burst_ms` + 渐隐缓冲后，若期间没有更新的
+/// 一次特效（序号对不上即作废——与预览恢复定时器的认领模式同一套路），整组销毁。
+/// 连发特效时窗口被复用，只有最后一次触发的定时器真正动手。
+fn schedule_burst_destroy(app: &AppHandle, p: &GlowPayload) {
+    let seq = p.burst;
+    let ms = u64::from(p.burst_ms) + BURST_DESTROY_BUFFER_MS;
+    let app = app.clone();
+    // 必须用 tauri::async_runtime::spawn 而不是 tokio::spawn：本函数在 emit 的
+    // 主线程调用链上，主线程不在 tokio 运行时上下文里，tokio::spawn 会当场
+    // panic（"must be called from the context of a Tokio 1.x runtime"）并穿透
+    // 事件循环把整个进程带崩（2026-09-25 实测：点预览即闪退）。
+    // async_runtime 持有全局运行时句柄，任意线程都能安全派发。
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        let _ = app.clone().run_on_main_thread(move || {
+            if current_burst() == seq {
+                destroy_burst_windows(&app);
+            }
+        });
+    });
+}
+
+/// 边缘（灯带）窗口 label：`glow-{数字}`。特效窗口（`glow-burst-*`）虽以
+/// `glow-` 开头，但后缀不是纯数字，不会混进来。
+fn edge_labels(app: &AppHandle) -> Vec<String> {
     app.webview_windows()
         .keys()
-        .filter(|l| l.starts_with(GLOW_PREFIX))
+        .filter(|l| edge_index(l).is_some())
         .cloned()
         .collect()
+}
+
+/// 全屏特效窗口 label：`glow-burst-{数字}`
+fn burst_labels(app: &AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .keys()
+        .filter(|l| l.starts_with(BURST_PREFIX))
+        .cloned()
+        .collect()
+}
+
+/// `glow-0` → `Some(0)`；特效窗口 / 其它带 `glow-` 前缀的 label → `None`
+fn edge_index(label: &str) -> Option<usize> {
+    label.strip_prefix(GLOW_PREFIX)?.parse().ok()
+}
+
+/// 边缘窗口视角的 payload：摘掉 fullscreen 通道。顶部模式的条带窗口不负责
+/// 全屏特效（#burst 永远不会 `.on`），特效由独立的整屏窗口播放。
+fn edge_view(p: &GlowPayload) -> GlowPayload {
+    let mut v = p.clone();
+    v.fullscreen = false;
+    v
+}
+
+/// 全屏特效窗口视角的 payload：摘掉灯带通道（`edge=false` → 前端按
+/// `data-edge="off"` 隐藏灯带层），`sides` 恒为 "all"——特效窗口不吃「顶部」
+/// 的横条形态与线宽换算口径，窗口区域按特效类型定形（见 [`burst_rect_of`]），
+/// 雾散/扫描保持完整表现。
+fn burst_view(p: &GlowPayload) -> GlowPayload {
+    let mut v = p.clone();
+    v.edge = false;
+    v.sides = "all".to_string();
+    v
+}
+
+/// 按窗口角色挑一份 payload 的下发视角（补发用；emit 的拆分口径同款）：
+/// 边缘窗口拿 [`edge_view`]（顶部模式）或原样（四周），特效窗口拿 [`burst_view`]。
+fn view_for(label: &str, p: &GlowPayload) -> GlowPayload {
+    if edge_index(label).is_some() {
+        if p.sides == "top" {
+            edge_view(p)
+        } else {
+            p.clone()
+        }
+    } else {
+        burst_view(p)
+    }
+}
+
+fn remember_payload(p: &GlowPayload) {
+    *lock(&LAST_PAYLOAD) = Some(p.clone());
+}
+
+fn last_payload() -> Option<GlowPayload> {
+    lock(&LAST_PAYLOAD).clone()
+}
+
+/// 页面就绪补发（主线程）：把**当前最新**的 payload 按窗口角色重发给一个窗口。
+///
+/// 窗口刚建好时页面还在加载，此前的 emit 会丢（前端 `listen` 未注册）——
+/// 补发就是把这些推送捡回来。发的是补发时刻的最新值，绝不会拿建窗时的旧值
+/// 覆盖更新的状态；窗口已销毁则静默跳过（特效窗口「播完即毁」是常态）。
+fn resend_latest(app: &AppHandle, label: &str) {
+    let Some(p) = last_payload() else { return };
+    if app.get_webview_window(label).is_none() {
+        return;
+    }
+    let view = view_for(label, &p);
+    if let Err(e) = app.emit_to(EventTarget::webview_window(label.to_string()), GLOW_EVENT, &view) {
+        tracing::warn!(label = %label, "流光事件补发失败: {e}");
+    }
 }
 
 /// 把覆盖窗重新按到最上层——压住任务栏，让**屏幕底部**那条光带可见。
@@ -721,7 +995,7 @@ fn glow_labels(app: &AppHandle) -> Vec<String> {
 /// 不动位置尺寸、不抢焦点；中间那一瞬的「非置顶」不可见（窗口内容一帧都没变）。
 /// 期间任务栏、开始菜单、通知中心**照常可用**——本层点击穿透且不可聚焦。
 fn raise(app: &AppHandle) {
-    for label in glow_labels(app) {
+    for label in all_glow_labels(app) {
         if let Some(w) = app.get_webview_window(&label) {
             let _ = w.set_always_on_top(false);
             let _ = w.set_always_on_top(true);
@@ -735,7 +1009,7 @@ fn raise(app: &AppHandle) {
 /// - 空闲：整层全透明，抢层级没有任何视觉收益，只会无谓地压在开始菜单、
 ///   通知中心这类系统面板之上；
 /// - 终态（绿/红）：几秒后由前端按 `hold_ms` 淡出，窗层随之看不见；它刚亮起的
-///   那几秒由 [`push_payload`] 里那一次置顶覆盖，不需要按周期续保。
+///   那几秒由 [`push_or_create`] 里那一次置顶覆盖，不需要按周期续保。
 ///
 /// 调用方是 `lib.rs` 的 5s 定时器（任务栏随时可能重新升上来，周期要够短才不被察觉）。
 pub fn keep_topmost(app: &AppHandle, state: &Arc<AppState>) {
@@ -749,13 +1023,39 @@ pub fn keep_topmost(app: &AppHandle, state: &Arc<AppState>) {
     }
 }
 
-/// 销毁所有 glow 窗口（关闭开关 / 退出时调用，主线程）
+/// 销毁所有 glow 窗口（关闭开关 / 退出 / 模式切换重建前调用，主线程）。
+/// 灯带窗口与全屏特效窗口一起收——特效窗口本就短命，提前收掉也无妨，
+/// 挂着的回收定时器随后会因找不到窗口而空转一次。
 pub fn destroy_all(app: &AppHandle) {
-    for label in glow_labels(app) {
+    destroy_edge_windows(app);
+    destroy_burst_windows(app);
+}
+
+/// 只销毁灯带窗口
+fn destroy_edge_windows(app: &AppHandle) {
+    for label in edge_labels(app) {
         if let Some(w) = app.get_webview_window(&label) {
             let _ = w.destroy();
         }
     }
+}
+
+/// 只销毁全屏特效窗口（「播完即毁」的回收路径用；灯带窗口不受影响）
+fn destroy_burst_windows(app: &AppHandle) {
+    for label in burst_labels(app) {
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.destroy();
+        }
+    }
+}
+
+/// 灯带窗口 + 全屏特效窗口的全部 label
+fn all_glow_labels(app: &AppHandle) -> Vec<String> {
+    app.webview_windows()
+        .keys()
+        .filter(|l| l.starts_with(GLOW_PREFIX))
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -764,8 +1064,8 @@ pub fn destroy_all(app: &AppHandle) {
 
 /// 按当前显示器布局创建全套窗口。
 ///
-/// `replay_burst`：本次建窗是不是**一次颜色触发的产物**。true（走 [`push_payload`]）
-/// 时注入的初始态就是刚点亮的那次特效，允许前端放一次全屏雾散；false（走 [`align`]
+/// `replay_burst`：本次建窗是不是**一次颜色触发的产物**。true（走 [`dispatch_preview`] /
+/// [`apply_inner`]）时注入的初始态就是刚点亮的那次特效，允许前端放一次全屏雾散；false（走 [`align`]
 /// 的重建）时注入的只是「现在长什么样」的快照——payload 里的 `burst` 是上一次触发的
 /// 旧序号，而新页面的 `lastBurst` 初值是 0，不设防的话热插拔显示器 / 改「生效显示器」
 /// 都会白闪一次整屏（注释里说的「不 emit 以免重放全屏特效」只挡住了 emit，
@@ -782,22 +1082,31 @@ fn create_all(app: &AppHandle, cfg: &GlowConfig, init: &GlowPayload, replay_burs
             tracing::warn!(label = %label, "流光窗口创建失败: {e}");
         }
     }
+    // 记下这批窗口的「位置」形态，align 靠它识别模式切换（见 BUILT_TOP_ONLY）
+    BUILT_TOP_ONLY.store(cfg.edge_sides() == "top", Ordering::Relaxed);
 }
 
-/// 校正窗口数量与位置（显示器插拔、主屏↔全部切换后调用）。
-/// 数量不符 → 全量重建；数量相符 → 只校正位置尺寸（分辨率/DPI 可能变了）。
+/// 校正窗口数量与位置（显示器插拔、主屏↔全部切换、位置模式切换后调用）。
+/// 数量不符，或「位置=顶部/四周」形态与现存窗口不符 → 全量重建
+/// （模式切换不能就地缩放，见 [`BUILT_TOP_ONLY`]）；数量相符 → 只校正位置尺寸
+/// （分辨率/DPI 可能变了）。
 fn align(app: &AppHandle, cfg: &GlowConfig, init: &GlowPayload) {
+    // init 就是「当前长什么样」的最新快照，先记下来：巡检（maintain）走这条路
+    // 只重建不 emit，不记住的话页面就绪补发会拿更旧的 payload 把新窗口刚显示的
+    // 状态盖回去（比如一份旧的 Idle 把重建出来的灯条掐灭）。
+    remember_payload(init);
     let rects = monitor_rects(app, cfg);
     if rects.is_empty() {
         return;
     }
-    let mut existing = glow_labels(app);
+    let mut existing = edge_labels(app);
     // 按数字后缀排序：字典序会让 glow-10 排在 glow-2 前，>9 块屏时
     // 窗口与显示器按位 zip 会错位映射
     existing.sort_by_key(|l| {
         l.trim_start_matches(GLOW_PREFIX).parse::<usize>().unwrap_or(usize::MAX)
     });
-    if existing.len() != rects.len() {
+    let top_only = cfg.edge_sides() == "top";
+    if existing.len() != rects.len() || BUILT_TOP_ONLY.load(Ordering::Relaxed) != top_only {
         destroy_all(app);
         // 重建不是一次颜色触发：快照照常显示（还在跑的会话必须看得见），
         // 但不许把上次的全屏雾散重放一遍。
@@ -874,6 +1183,11 @@ fn create(
     let init_json = serde_json::to_string(init).unwrap_or_else(|_| "null".to_string());
     // 重建（align）注入的是快照：标记一下，让前端别把这次注入当成新触发（见 glow.ts）
     let init_flag = if replay_burst { "" } else { "window.__GLOW_INIT_SNAPSHOT__=true;" };
+    // 页面就绪补发（见 RESEND_DELAYS_MS / resend_latest）：窗口建好到前端
+    // `listen` 注册完之前，emit 的事件会丢。页面加载完就把最新 payload 补发
+    // 过去——连点预览第二下「毫无反应」的根因正是这段真空期。
+    let load_app = app.clone();
+    let load_label = label.to_string();
     let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App("glow.html".into()))
         .title("agent-bark 边缘流光")
         .transparent(true)
@@ -893,6 +1207,21 @@ fn create(
         .position(x, y)
         .inner_size(w, h)
         .initialization_script(format!("window.__GLOW_INIT__={init_json};{init_flag}"))
+        .on_page_load(move |_, event| {
+            if !matches!(event.event(), tauri::webview::PageLoadEvent::Finished) {
+                return;
+            }
+            let app = load_app.clone();
+            let label = load_label.clone();
+            tauri::async_runtime::spawn(async move {
+                for delay in RESEND_DELAYS_MS {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let app2 = app.clone();
+                    let label2 = label.clone();
+                    let _ = app.clone().run_on_main_thread(move || resend_latest(&app2, &label2));
+                }
+            });
+        })
         .build()?;
     // 点击穿透：所有鼠标事件落到下层窗口（WS_EX_TRANSPARENT / macOS ignoresMouseEvents）。
     // 失败必须销毁窗口：留下的将是一层可聚焦、可拦截点击的全屏置顶透明窗，
@@ -984,17 +1313,28 @@ fn friendly_name(raw: Option<&String>, index: usize) -> String {
     }
 }
 
-/// 目标显示器的逻辑坐标矩形 (x, y, w, h)
+/// 目标显示器的逻辑坐标矩形 (x, y, w, h)——按配置的「位置」决定形态
+/// （顶部 = 条带，见 [`rect_of`]；四周 = 整屏）
 fn monitor_rects(app: &AppHandle, cfg: &GlowConfig) -> Vec<(f64, f64, f64, f64)> {
+    monitor_rects_with(app, cfg, |m| rect_of(m, cfg.edge_sides() == "top"))
+}
+
+/// 同上，但每个显示器的矩形由 `rect_of_fn` 决定：全屏特效窗口按**特效类型**
+/// 传入自己的区域形态（见 [`burst_rect_of`]）。
+fn monitor_rects_with(
+    app: &AppHandle,
+    cfg: &GlowConfig,
+    rect_of_fn: impl Fn(&Monitor) -> (f64, f64, f64, f64),
+) -> Vec<(f64, f64, f64, f64)> {
     match cfg.monitor_target() {
         MonitorTarget::All => match app.available_monitors() {
-            Ok(ms) if !ms.is_empty() => return ms.iter().map(rect_of).collect(),
+            Ok(ms) if !ms.is_empty() => return ms.iter().map(|m| rect_of_fn(m)).collect(),
             Ok(_) => tracing::warn!("未枚举到任何显示器，回退主显示器"),
             Err(e) => tracing::warn!("枚举显示器失败，回退主显示器: {e}"),
         },
         MonitorTarget::Index(i) => match app.available_monitors() {
             Ok(ms) => match ms.get(i) {
-                Some(m) => return vec![rect_of(m)],
+                Some(m) => return vec![rect_of_fn(m)],
                 // 下标越界（拔掉了那块屏，或配置是从别的机器拷来的）：
                 // 回退主显示器，而不是一个窗口都不建——后者在用户眼里就是「流光坏了」
                 None => tracing::warn!(index = i, count = ms.len(), "生效显示器下标越界，回退主显示器"),
@@ -1004,7 +1344,7 @@ fn monitor_rects(app: &AppHandle, cfg: &GlowConfig) -> Vec<(f64, f64, f64, f64)>
         MonitorTarget::Primary => {}
     }
     match app.primary_monitor() {
-        Ok(Some(m)) => vec![rect_of(&m)],
+        Ok(Some(m)) => vec![rect_of_fn(&m)],
         Ok(None) => Vec::new(),
         Err(e) => {
             tracing::warn!("获取主显示器失败: {e}");
@@ -1041,15 +1381,70 @@ fn monitor_rects(app: &AppHandle, cfg: &GlowConfig) -> Vec<(f64, f64, f64, f64)>
 ///
 /// 偏移量按**物理**像素算（`1.0 / s`）：1 逻辑像素在 150% 屏上是 1.5 物理像素，取整后会在
 /// 1~2px 之间抖，而这里要的正是"恰好 1 个物理像素"这个最小值。
-fn rect_of(m: &Monitor) -> (f64, f64, f64, f64) {
+///
+/// ## `top_only`：位置=顶部 的条带形态
+/// 「位置=顶部」时窗口只保留屏幕顶部一条 [`GLOW_TOP_STRIP_H`] 高的带子（顶左与
+/// 显示器顶左对齐、宽度整屏，底边不再外扩——矩形本来就远不等于显示器矩形，
+/// 那个 1px 把戏只服务于「覆盖整屏但不重合」这组约束）。窗口矩形只盖住
+/// 屏顶一小条（150px ≈ 1080p 屏高的一成多），「无边框全屏应用」的一切矩形/覆盖率匹配（Windows 请勿打扰的
+/// 全屏判定、GeForce 游戏检测等）都落空——这正是该模式的动机。绘制侧是
+/// 独立的顶部横条渲染（glow.html 按 `data-sides="top"` 重绘成贴顶边的一条
+/// 线，不是四周渲染的裁剪），条带高度口径见 [`GLOW_TOP_STRIP_H`]。
+fn rect_of(m: &Monitor, top_only: bool) -> (f64, f64, f64, f64) {
     let s = scale_or_one(m.scale_factor());
     let p = m.position();
     let sz = m.size();
+    if top_only {
+        return (
+            p.x as f64 / s,
+            p.y as f64 / s,
+            sz.width as f64 / s,
+            GLOW_TOP_STRIP_H,
+        );
+    }
     (
         p.x as f64 / s,
         p.y as f64 / s,
         sz.width as f64 / s,
         sz.height as f64 / s + 1.0 / s,
+    )
+}
+
+/// 全屏特效各类型的画布形态：**每种特效类型一个自己的窗口区域**。
+///
+/// 新增特效类型的完整扩展点（四处，缺一不可）：
+/// 1. `config.rs` 的 `canon_burst_effect` / `fullscreen_effect_kind`（合法 id）；
+/// 2. `app/src/api.ts` 的 `BURST_EFFECTS`（设置页下拉）；
+/// 3. `app/glow.html` 的 `#burst[data-effect=…]`（动画表现）；
+/// 4. 这里（窗口区域）。
+///
+/// 当前全部类型（雾散 / 扫描）＝ 整屏、**顶部内缩 1 物理像素**：窗口矩形与
+/// 显示器矩形不再重合，与边缘窗口「底边外扩 1px」同防「矩形完全重合」式的
+/// 全屏误判（对按覆盖率判定的检测器无效，见 [`rect_of`] 的说明）；窗口完全
+/// 落在显示器内，与相邻显示器零重叠。顶部空出的 1px 由常驻的边缘窗口盖着
+/// （两种位置模式都从屏幕顶边起算），不会露壁纸亮线。底边与屏底对齐——
+/// `#glow` 的绘制内缩会少画屏底 1 像素，渐变尾部的 1px 差异不可感知，
+/// 不为它让窗口越过显示器底边。
+fn burst_rect_of(m: &Monitor, effect: &str) -> (f64, f64, f64, f64) {
+    match effect {
+        // 雾散 / 扫描：当前同一种形态。某类型要专属区域时单独成臂
+        "fog" | "scan" => rect_top_inset(m),
+        // 未识别 / 未来新增的类型：先按当前标准形态兜底
+        _ => rect_top_inset(m),
+    }
+}
+
+/// 整屏、顶部内缩 1 物理像素（`1.0 / s`，与 [`rect_of`] 的底边外扩同一换算口径：
+/// 1 逻辑像素在 150% 屏上是 1.5 物理像素，按物理像素算才不抖）
+fn rect_top_inset(m: &Monitor) -> (f64, f64, f64, f64) {
+    let s = scale_or_one(m.scale_factor());
+    let p = m.position();
+    let sz = m.size();
+    (
+        p.x as f64 / s,
+        p.y as f64 / s + 1.0 / s,
+        sz.width as f64 / s,
+        sz.height as f64 / s - 1.0 / s,
     )
 }
 
@@ -1118,6 +1513,8 @@ mod tests {
         // 观感参数写死下发（"1.00" 为两位小数格式，与旧 speed_css 口径一致）
         assert_eq!(p.speed, GLOW_SPEED_CSS);
         assert_eq!(p.intensity, GLOW_INTENSITY_CSS);
+        // 位置：默认配置下发「顶部」
+        assert_eq!(p.sides, "top");
         assert_eq!(p.width, GLOW_WIDTH);
         assert_eq!(p.radius, GLOW_RADIUS);
         assert_eq!(p.opacity, GLOW_OPACITY);
@@ -1127,6 +1524,72 @@ mod tests {
         let p = payload(&cfg, GlowState::Running);
         assert!(p.edge);
         assert!(!p.fullscreen);
+        // 位置="all"（四周）原样下发；乱值经 edge_sides 归一成顶部
+        let cfg = GlowConfig { edge_position: "all".into(), ..Default::default() };
+        assert_eq!(payload(&cfg, GlowState::Running).sides, "all");
+        let cfg = GlowConfig { edge_position: "bottom".into(), ..Default::default() };
+        assert_eq!(payload(&cfg, GlowState::Running).sides, "top");
+    }
+
+    #[test]
+    fn payload_views_split_edge_and_burst_channels() {
+        // 顶部模式分窗下发：边缘窗口摘 fullscreen（特效不进条带），
+        // 特效窗口摘 edge（不画灯带）且恒整屏（不吃顶部横条形态）
+        let cfg = GlowConfig { edge_position: "top".into(), ..Default::default() }.sanitize();
+        let p = payload(&cfg, GlowState::Completed);
+        assert!(p.edge);
+        assert!(p.fullscreen);
+        let e = edge_view(&p);
+        assert!(!e.fullscreen, "条带窗口不背全屏特效");
+        assert!(e.edge);
+        assert_eq!(e.sides, "top");
+        let b = burst_view(&p);
+        assert!(!b.edge, "特效窗口不画灯带");
+        assert_eq!(b.sides, "all", "特效窗口永远整屏");
+        assert!(b.fullscreen, "特效通道原样保留");
+        // 两个视图互不越界：状态、颜色、序号原样带回
+        assert_eq!(b.state, p.state);
+        assert_eq!(b.burst, p.burst);
+        assert_eq!(b.burst_color, p.burst_color);
+    }
+
+    #[test]
+    fn edge_index_distinguishes_edge_and_burst_labels() {
+        assert_eq!(edge_index("glow-0"), Some(0));
+        assert_eq!(edge_index("glow-10"), Some(10));
+        // 特效窗口虽以 glow- 开头，但不是灯带窗口——emit / 对齐 / 回收都要分开
+        assert_eq!(edge_index("glow-burst-0"), None);
+        assert_eq!(edge_index("glow-x"), None);
+        assert_eq!(edge_index("widget"), None);
+    }
+
+    #[test]
+    fn restart_edge_defaults_off_and_is_preview_only() {
+        // 灯带「熄灭重放」只属于设置页预览点按（dispatch_preview 手动置 true）：
+        // 真实事件要平滑换色、burst_only 要「边缘不动」、补发是幂等重推
+        let cfg = GlowConfig::default();
+        assert!(!payload(&cfg, GlowState::Completed).restart_edge);
+        assert!(!payload_with_burst(&cfg, GlowState::Running, GlowState::Completed).restart_edge);
+    }
+
+    #[test]
+    fn view_for_splits_by_window_role() {
+        // 页面就绪补发按窗口角色拆视角，与 emit 的口径必须一致
+        let cfg = GlowConfig { edge_position: "top".into(), ..Default::default() }.sanitize();
+        let mut p = payload(&cfg, GlowState::Completed);
+        p.restart_edge = true; // 模拟预览点按
+        let e = view_for("glow-0", &p);
+        assert!(!e.fullscreen, "条带窗口不背全屏特效");
+        assert!(e.restart_edge, "熄灭重放标记要带给条带窗口");
+        let b = view_for("glow-burst-0", &p);
+        assert!(!b.edge, "特效窗口不画灯带");
+        assert_eq!(b.sides, "all");
+        // 四周模式：边缘窗口就是特效画布，原样下发
+        let cfg = GlowConfig { edge_position: "all".into(), ..Default::default() };
+        let p = payload(&cfg, GlowState::Completed);
+        let e = view_for("glow-0", &p);
+        assert!(e.fullscreen, "四周模式特效就在边缘窗口里放");
+        assert_eq!(e.sides, "all");
     }
 
     #[test]

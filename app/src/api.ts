@@ -134,6 +134,11 @@ export interface GlowConfig {
   enabled: boolean;
   /** 边缘光效总开关：关掉后只隐藏边缘灯带，全屏特效照常 */
   edge: boolean;
+  /**
+   * 边缘光效位置："top" = 只亮顶部一条（默认，覆盖窗缩成顶部条带，
+   * 避免被判定为全屏）；"all" = 四周（旧行为）。后端按 edge_sides() 读时归一
+   */
+  edge_position: string;
   /** 旧版全局边缘类型：只作迁移源，运行时不再读（改它没有效果） */
   effect: string;
   /** 全屏特效总开关：每次颜色亮起时整屏补一次特效 */

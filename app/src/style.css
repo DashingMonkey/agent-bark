@@ -510,6 +510,40 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .switch input:checked + .track { background: var(--brand-2); }
 .switch input:checked + .track::after { transform: translateX(17px); }
 
+/* 按钮式单选（radio-button 分段控件）：互斥的小段选项（如光效「位置」顶部 / 四周）。
+   语义由原生 radio 承担（同 name 互斥、方向键切换、读屏可达），外观做成并排按钮：
+   激活段品牌色实底 + 白字，未激活段字段底色，悬停 / 聚焦与输入类控件同一套反馈。
+   不用 display:none 藏 input：保持键盘 Tab 与读屏可达，透明覆盖在按钮上方 */
+.radio-group {
+  display: inline-flex;
+  height: var(--control-h);
+  border: 1px solid var(--field-border);
+  border-radius: var(--control-radius);
+  overflow: hidden;
+}
+.radio-btn { position: relative; }
+.radio-btn + .radio-btn { border-left: 1px solid var(--field-border); }
+.radio-btn input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.radio-btn span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 14px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--field-bg);
+  cursor: pointer;
+  user-select: none;
+  transition: background .12s, color .12s;
+}
+.radio-btn:hover span { background: var(--hover-bg); }
+.radio-btn input:checked + span { background: var(--brand-2); color: #fff; }
+.radio-btn input:focus-visible + span { box-shadow: var(--focus-ring); }
+.radio-btn input:disabled { cursor: not-allowed; }
+.radio-btn input:disabled + span { opacity: .5; cursor: not-allowed; }
+.radio-btn input:disabled:hover + span { background: var(--field-bg); }
+
 .hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
 /* 提示框不再自带 margin-top，间距一律由 .mt-* 工具类显式给出 */
 .warn-box {

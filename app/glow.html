@@ -141,6 +141,138 @@
         display: none;
       }
 
+      /*
+        边缘位置=「顶部」（设置页「位置」）：灯效**不是**把四周渲染裁一条出来，
+        而是重绘成贴屏幕顶边的一条水平横条（裁剪版已退役——裁出来的顶边带着
+        左右两条竖垂的「边条残肢」和环形高光的变速扫动，读起来是「被裁的圈」
+        而不是「顶部一条线」）。宽度口径（--w）与两套灯效的语义、配色、节奏
+        全部不变，只把形态翻译成直线：
+
+          · 流光：一条常亮细线打底 + 高光沿直线循环流动（旋转 conic → 水平
+            渐变带平移 + 首尾相接），拖尾 smoothstep 细描与噪点抖动原样保留；
+          · 呼吸：不画细线，辉光坡从顶边往里渗——与四周模式的顶边同一条坡。
+
+        本节规则全部挂在 data-sides="top" 下；"all"（四周）不命中任何规则，
+        渲染路径与旧版逐字节一致。各层的基态定义见下面对应小节。
+      */
+      /*
+        呼吸的辉光坡（顶部）：元素向左右各伸出窗口 300px、向下伸到 600px——
+        inset 阴影就只剩**顶边**那一条坡落在窗口里（左右边的坡在窗外、底边的
+        坡远在窗外），衰减曲线与四周模式的顶边逐像素一致，一份 box-shadow
+        两种形态共用，不重写渐变。300 / 600 要盖过阴影的最深伸展
+        （100px 模糊 + 32px 扩散 × --glow；--glow 目前写死 1.00，
+        见 glow.rs 的 GLOW_INTENSITY_CSS，强度若开放成可调，这两个值要跟着缩放）。
+      */
+      #glow[data-sides="top"] .breathe i {
+        inset: 0 -300px auto -300px;
+        height: 600px;
+        border-radius: 0;
+      }
+
+      /*
+        流光的暗晕（顶部）：同上面的伸展套路，只留顶边那圈暗底——.shadow 的
+        两段 inset 阶梯一字不改。白亮头在浅色壁纸上的可见度靠它（见 .shadow
+        的实测注释）。
+      */
+      #glow[data-sides="top"] .comet .shadow {
+        inset: 0 -300px auto -300px;
+        height: 600px;
+        border-radius: 0;
+      }
+
+      /*
+        横条几何：整线 / 高光槽 / 噪点三层同形（.ring 的 mask 环带只服务四周的
+        空心圈，横条本身就是「带」，padding / mask / 圆角全部归零）。
+      */
+      #glow[data-sides="top"] .comet .ring {
+        inset: 0 0 auto 0;
+        height: var(--w);
+        padding: 0;
+        border-radius: 0;
+        -webkit-mask: none;
+        mask: none;
+      }
+
+      /*
+        高光（顶部）：145vmax 的旋转 conic 换成 50vw 的水平渐变带平移。拖尾仍
+        是 smoothstep 12 段细描——conic 的角度直接换算成直线百分比
+        （180° 尾迹 = 50vw ≈ 线长的一半），亮头在行进方向的最前（带子右端）。
+        ::after 是同一条带的 -100vw 副本，与本体拼成**首尾相接**的循环（环形
+        版本的「尾迹绕过接缝」翻译成直线的「从右端绕回左端」），任意时刻线上
+        一半被亮头照到、一半是底线——与四周模式同一比例。
+        节奏同款：每圈 3200ms / var(--speed)，圈 = 一条线长（100vw），
+        任意一点每 3200ms 被亮头经过一次，与四周「每圈经过一次」同频。
+        只动 transform，与 .spin 的性能口径一致（见文件头「性能取舍」）。
+      */
+      #glow[data-sides="top"] .comet .spin {
+        left: 0;
+        top: 0;
+        width: 50vw;
+        height: var(--w);
+        margin: 0;
+        background: linear-gradient(
+          to right,
+          transparent 0%,
+          rgba(var(--rgb), 0.011) 7.6%,
+          rgba(var(--rgb), 0.043) 15.2%,
+          rgba(var(--rgb), 0.086) 22.8%,
+          rgba(var(--rgb), 0.143) 30.4%,
+          rgba(var(--rgb), 0.208) 37.9%,
+          rgba(var(--rgb), 0.275) 45.6%,
+          rgba(var(--rgb), 0.342) 53.2%,
+          rgba(var(--rgb), 0.407) 60.7%,
+          rgba(var(--rgb), 0.464) 68.3%,
+          rgba(var(--rgb), 0.509) 75.9%,
+          rgba(var(--rgb), 0.538) 83.5%,
+          rgba(var(--rgb), 0.55) 91.1%,
+          color-mix(in srgb, rgb(var(--rgb)) 45%, #fff) 95.3%,
+          #fff 99.7%,
+          #fff 100%
+        );
+        animation: glow-sweep calc(3200ms / var(--speed)) linear infinite;
+      }
+
+      /* 绕回副本：同一条带（background: inherit 把父层的渐变原样搬过来），固定
+         错开一条线长。本体从 0 走到 100vw（正好一圈 = 一条线长），行进方向的
+         接缝（右端）由副本在 -100vw 处无缝接管——带头走出右端的同一瞬间副本的
+         带头恰好踏进左端，与环形接缝同一效果；副本超出左端的部分由 .core 的
+         overflow 收掉 */
+      #glow[data-sides="top"] .comet .spin::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: inherit;
+        transform: translateX(-100vw);
+      }
+
+      @keyframes glow-sweep {
+        from {
+          transform: translateX(0);
+        }
+        to {
+          transform: translateX(100vw);
+        }
+      }
+
+      /*
+        内侧深色发丝（顶部）：横条版就是紧贴细线下方的一根 1px 暗线，
+        职责与四周版相同（浅底上把色线和内容隔开，深底不可感知）。
+      */
+      #glow[data-sides="top"] .comet .inner-edge {
+        inset: var(--w) 0 auto 0;
+        height: 1px;
+        border: none;
+        border-radius: 0;
+        background: rgba(0, 0, 0, 0.6);
+      }
+
+      /*
+        全屏特效不在这套（条带）窗口里：顶部模式下它有专属的整屏窗口
+        （glow-burst-*，payload 恒带 sides="all"），雾散/扫描保持完整表现，
+        与灯带互不干涉。本窗口的 #burst 由 edge_view 摘掉 fullscreen 通道，
+        永远不会点亮。
+      */
+
       /* ==================== 呼吸（v3：无细线，单层辉光坡） ==================== */
 
       /*
@@ -754,7 +886,7 @@
     </style>
   </head>
   <body>
-    <div id="glow" data-state="idle" data-effect="breathing" data-edge="on">
+    <div id="glow" data-state="idle" data-effect="breathing" data-edge="on" data-sides="all">
       <!-- 全屏特效：每次颜色亮起补放一次（类型标记在 data-effect：fog=雾散 / scan=HUD 扫描） -->
       <div class="burst" id="burst" data-effect="fog">
         <i class="burst-pulse"></i>

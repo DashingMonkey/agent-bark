@@ -292,6 +292,13 @@ pub struct GlowConfig {
     pub enabled: bool,
     /// 边缘光效开关：关掉后只隐藏边缘灯带（各状态的边缘类型保留），全屏特效照常
     pub edge: bool,
+    /// 边缘光效位置："top"=只亮顶部一条（默认）/ "all"=四周（旧行为）。
+    ///
+    /// 默认顶部的动机：四周光效的覆盖窗与显示器矩形几乎重合（见 glow.rs `rect_of`
+    /// 的 1px 外扩），会被 Windows 请勿打扰按「全屏应用」自动静音、被游戏覆盖层类
+    /// 软件误判为游戏；顶部模式把窗口缩成顶部条带，矩形不再近似覆盖整屏，从根上
+    /// 避开这类判定。运行时经 [`edge_sides`](Self::edge_sides) 归一后下发。
+    pub edge_position: String,
     /// 旧版全局边缘类型：只作**迁移源**——`edge_effects` 里为空的状态按它补齐；
     /// 运行时一律读 `edge_effects`，再改这个不再有任何效果
     pub effect: String,
@@ -313,6 +320,9 @@ impl Default for GlowConfig {
         Self {
             enabled: true,
             edge: true,
+            // 顶部条带是默认体验：整屏覆盖窗容易被判成全屏（见 edge_position 的文档）。
+            // 老配置没有这个键，serde 补的也是它——升级后默认变顶部，切「四周」回旧行为
+            edge_position: "top".to_string(),
             effect: GlowEffect::Breathing.id().to_string(),
             // 全屏特效默认开：它是这一版的主角，用户进「屏幕光效」页第一眼就能看到
             fullscreen: true,
@@ -343,6 +353,18 @@ impl GlowConfig {
     /// 是否覆盖所有显示器
     pub fn all_monitors(&self) -> bool {
         self.monitor_target() == MonitorTarget::All
+    }
+
+    /// 边缘光效位置（无法识别的值一律按顶部处理）："top"=只亮顶部 / "all"=四周。
+    ///
+    /// 与 `monitor_target` 同款「读时归一」口径：手改出来的乱值不出现在运行时，
+    /// 不进 `sanitize`（设置页只会写这两个值）。
+    pub fn edge_sides(&self) -> &'static str {
+        if self.edge_position.trim().eq_ignore_ascii_case("all") {
+            "all"
+        } else {
+            "top"
+        }
     }
 
     /// 边缘光效类型（未知值回落到呼吸）
@@ -800,6 +822,9 @@ system = false
         let cfg: BarkConfig = serde_json::from_str(r#"{"agents":[{"kind":"claude-code"}]}"#).unwrap();
         assert!(cfg.glow.enabled);
         assert!(cfg.glow.edge, "边缘光效默认开");
+        // 老配置没有 edge_position 键：serde 按默认补「顶部」——升级后默认只亮顶部
+        assert_eq!(cfg.glow.edge_position, "top");
+        assert_eq!(cfg.glow.edge_sides(), "top");
         assert_eq!(cfg.glow.monitors, "primary");
         assert_eq!(cfg.glow.effect_kind(), GlowEffect::Breathing);
         assert!(cfg.glow.fullscreen, "全屏特效默认开");
@@ -841,6 +866,21 @@ system = false
         assert_eq!(t("显示器1"), MonitorTarget::Primary);
         assert!(GlowConfig { monitors: "all".into(), ..Default::default() }.all_monitors());
         assert!(!GlowConfig { monitors: "1".into(), ..Default::default() }.all_monitors());
+    }
+
+    #[test]
+    fn glow_edge_sides_parses_top_and_all() {
+        let t = |p: &str| GlowConfig { edge_position: p.to_string(), ..Default::default() }.edge_sides();
+        assert_eq!(t("top"), "top");
+        assert_eq!(t("all"), "all");
+        assert_eq!(t(" ALL "), "all");
+        // 手改乱值 / 旧值一律回落顶部（默认体验），不能让覆盖层拿到未知值后不知所措
+        assert_eq!(t(""), "top");
+        assert_eq!(t("bottom"), "top");
+        assert_eq!(t("TOP"), "top");
+        // 能存能读（设置页切到「四周」再保存的形态）
+        let cfg: BarkConfig = serde_json::from_str(r#"{"glow":{"edge_position":"all"}}"#).unwrap();
+        assert_eq!(cfg.glow.edge_sides(), "all");
     }
 
     #[test]

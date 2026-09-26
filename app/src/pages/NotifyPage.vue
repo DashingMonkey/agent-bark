@@ -340,6 +340,39 @@ onUnmounted(glowOffSafely);
                 <option v-for="e in EDGE_EFFECTS" :key="e.id" :value="e.id">{{ e.label }}</option>
               </select>
             </div>
+            <!-- 位置：按钮式单选（radio-button 分段控件）。「顶部」（默认，只亮
+                 顶部一条横线，覆盖窗缩成顶部条带，避免被系统/游戏软件判定为全屏）
+                 /「四周」（旧行为）。原生 radio 同 name 互斥 + 方向键切换，外观做成
+                 并排按钮；边缘开关关着时整组禁用，与上方四行下拉同口径。
+                 旧值（如历史配置里的 "bottom"）后端 edge_sides() 归一成顶部，
+                 这里按「不是 all 即顶部」回显，改选任一项都会写回合法值 -->
+            <div class="row">
+              <span class="hint field-label">位置</span>
+              <div class="radio-group" role="radiogroup" aria-label="边缘光效位置">
+                <label class="radio-btn">
+                  <input
+                    type="radio"
+                    name="glow-position"
+                    value="top"
+                    :checked="config.glow.edge_position !== 'all'"
+                    :disabled="!config.glow.edge"
+                    @change="commitGlow('edge_position', 'top')"
+                  />
+                  <span>顶部</span>
+                </label>
+                <label class="radio-btn">
+                  <input
+                    type="radio"
+                    name="glow-position"
+                    value="all"
+                    :checked="config.glow.edge_position === 'all'"
+                    :disabled="!config.glow.edge"
+                    @change="commitGlow('edge_position', 'all')"
+                  />
+                  <span>四周</span>
+                </label>
+              </div>
+            </div>
           </div>
         </div>
 
