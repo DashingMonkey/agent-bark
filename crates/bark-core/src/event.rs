@@ -116,18 +116,42 @@ pub struct NormalizedEvent {
 }
 
 impl NormalizedEvent {
-    /// 从 agent 原始 hook stdin JSON 提取公共字段并构造事件
+    /// 从 agent 原始 hook stdin JSON 提取公共字段并构造事件。
+    ///
+    /// 各宿主对同一字段的命名约定不同（事件名本身由 hook 命令的 `--event` 参数
+    /// 提供，不依赖 payload），这里按**首个命中**取值：
+    /// - 会话 id：Claude 系 `session_id`、Grok `sessionId`、Cursor `conversation_id`、
+    ///   Antigravity `conversationId`、Windsurf `trajectory_id`
+    /// - 工作目录：`cwd`；Cursor 给数组 `workspace_roots`、Antigravity 给
+    ///   `workspacePaths`（各取首项）、Grok 给标量 `workspaceRoot`
+    /// - 工具名：`tool_name` / `toolName`；Antigravity 嵌在 `toolCall.name`
     pub fn from_raw(agent: &str, kind: EventKind, raw: &Value) -> Self {
-        let session_id = raw
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| raw.get("sessionId").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
-        let cwd = raw
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .or_else(|| raw.get("workspace_roots").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|v| v.as_str()))
+        let session_id = first_str(
+            raw,
+            &[
+                "session_id",
+                "sessionId",
+                "conversation_id",
+                "conversationId",
+                "trajectory_id",
+                "trajectoryId",
+            ],
+        )
+        .unwrap_or("")
+        .to_string();
+        let cwd = first_str(raw, &["cwd", "workspaceRoot", "workspaceRootPath"])
+            .or_else(|| {
+                raw.get("workspace_roots")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                raw.get("workspacePaths")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+            })
             .unwrap_or("")
             .to_string();
         let message = truncate_chars(&extract_message(raw), MAX_MESSAGE_CHARS);
@@ -163,6 +187,13 @@ impl NormalizedEvent {
     }
 }
 
+/// 依序取第一个非空字符串字段（跨 agent payload 命名差异的兜底，见 from_raw）
+fn first_str<'a>(raw: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| raw.get(*k).and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// 子代理（subagent）事件判定启发式：
 /// 1. 显式布尔字段 `is_subagent` / `subagent` 优先——agent 明确告知时直接尊重；
 /// 2. 否则看 `agent_id` / `agent_type`：Claude Code 系 hook 只在「hook 在子代理内部
@@ -185,7 +216,16 @@ fn detect_subagent(raw: &Value) -> bool {
 }
 
 fn extract_tool_name(raw: &Value) -> Option<String> {
-    raw.get("tool_name")
+    // Antigravity 的工具事件不带 tool_name，工具名嵌在 toolCall.name 里
+    for key in ["tool_name", "toolName"] {
+        if let Some(s) = raw.get(key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    raw.get("toolCall")
+        .and_then(|t| t.get("name"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
@@ -331,6 +371,56 @@ mod tests {
         assert!(subagent_flag(json!({"subagent": true})));
         assert!(!subagent_flag(json!({"is_subagent": false, "agent_type": "coder"})));
         assert!(!subagent_flag(json!({"subagent": false, "agent_id": "abc"})));
+    }
+
+    /// 跨 agent 的 payload 命名差异靠别名兜底（2026-09 广度扩展）。
+    /// 没有别名兜底的话，这些 agent 的会话 id 为空 → 被管道的「幻影会话」门
+    /// 全部丢弃，等于整条接入失效。
+    #[test]
+    fn cross_agent_payload_aliases() {
+        // Cursor：conversation_id + workspace_roots（数组取首项）
+        let ev = NormalizedEvent::from_raw(
+            "cursor",
+            EventKind::Activity,
+            &json!({ "conversation_id": "c1", "workspace_roots": [r"D:\W\proj"] }),
+        );
+        assert_eq!(ev.session_id, "c1");
+        assert_eq!(ev.project.as_deref(), Some("proj"));
+
+        // Grok：camelCase sessionId / toolName + 标量 workspaceRoot
+        let ev = NormalizedEvent::from_raw(
+            "grok",
+            EventKind::Activity,
+            &json!({ "sessionId": "g1", "workspaceRoot": r"D:\W\grok", "toolName": "Bash" }),
+        );
+        assert_eq!(ev.session_id, "g1");
+        assert_eq!(ev.tool_name.as_deref(), Some("Bash"));
+
+        // Antigravity：conversationId + workspacePaths（数组取首项）+ toolCall.name
+        let ev = NormalizedEvent::from_raw(
+            "antigravity",
+            EventKind::Activity,
+            &json!({ "conversationId": "a1", "workspacePaths": [r"D:\W\ag"], "toolCall": {"name": "edit_file"} }),
+        );
+        assert_eq!(ev.session_id, "a1");
+        assert_eq!(ev.tool_name.as_deref(), Some("edit_file"));
+
+        // Windsurf：trajectory_id（无项目目录字段）
+        let ev = NormalizedEvent::from_raw(
+            "windsurf",
+            EventKind::RunCompleted,
+            &json!({ "trajectory_id": "t1", "agent_action_name": "post_cascade_response" }),
+        );
+        assert_eq!(ev.session_id, "t1");
+
+        // Claude 系 snake_case 主路径不受别名扩展影响
+        let ev = NormalizedEvent::from_raw(
+            "claude-code",
+            EventKind::Activity,
+            &json!({ "session_id": "s1", "cwd": r"D:\W\cc", "tool_name": "Read" }),
+        );
+        assert_eq!(ev.session_id, "s1");
+        assert_eq!(ev.tool_name.as_deref(), Some("Read"));
     }
 
     #[test]

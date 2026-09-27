@@ -33,6 +33,9 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 toml = "1"
+# Kimi Code CLI 的 hooks 是 TOML 配置（crates/bark-adapters/src/kimi_code.rs），
+# 必须格式保留编辑（注释/缩进/键序不动），toml 1.x 的解析序列化做不到
+toml_edit = "0.25"
 dirs = "7"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # TraeWork 会话库 SQLCipher 4 页面级解密（crates/bark-adapters/src/traework_db.rs）

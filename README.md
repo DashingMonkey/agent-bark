@@ -16,6 +16,16 @@
 | DeepSeek Harness | [插件](doc/agent-integration.md#8-deepseek-harness插件型) |
 | WorkBuddy | [Watch](doc/agent-integration.md#9-workbuddy监控型--非官方) |
 | TraeWork | [Watch](doc/agent-integration.md#10-traework监控型--非官方) |
+| Gemini CLI | [Hook](doc/agent-integration.md#11-gemini-cli) |
+| Qwen Code | [Hook](doc/agent-integration.md#12-qwen-code) |
+| Factory Droid | [Hook](doc/agent-integration.md#13-factory-droid) |
+| Grok CLI（Grok Build） | [Hook](doc/agent-integration.md#14-grok-cligrok-build) |
+| Cursor | [Hook](doc/agent-integration.md#15-cursor) |
+| Copilot CLI | [Hook](doc/agent-integration.md#16-copilot-cli) |
+| Windsurf | [Hook](doc/agent-integration.md#17-windsurf) |
+| Antigravity | [Hook](doc/agent-integration.md#18-antigravity) |
+| Kimi Code | [Hook](doc/agent-integration.md#19-kimi-code) |
+| Kimi Work | [Watch](doc/agent-integration.md#20-kimi-work监控型--非官方) |
 
 > **每种 agent 的配置路径、注册事件、需要你在应用侧做的动作（信任/重启）以及排障步骤，见 [doc/agent-integration.md](doc/agent-integration.md)。**
 

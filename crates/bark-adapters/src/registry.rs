@@ -1,7 +1,10 @@
 //! adapter 注册表：集中管理所有 hook 型与监控型适配器。
 
+use crate::antigravity;
 use crate::claude_style;
 use crate::dsh::DshAdapter;
+use crate::kimi_code;
+use crate::kimiwork::KimiWorkWatch;
 use crate::opencode::OpenCodeAdapter;
 use crate::watch::{TraeWorkWatch, WatchAdapter, WorkBuddyWatch};
 use crate::zcode::ZcodeAdapter;
@@ -16,6 +19,15 @@ pub fn hook_adapters() -> Vec<Box<dyn HookAdapter>> {
         Box::new(claude_style::codebuddy()),
         Box::new(claude_style::qoder()),
         Box::new(claude_style::codex()),
+        Box::new(claude_style::gemini_cli()),
+        Box::new(claude_style::qwen_code()),
+        Box::new(claude_style::droid()),
+        Box::new(claude_style::grok()),
+        Box::new(claude_style::cursor()),
+        Box::new(claude_style::copilot_cli()),
+        Box::new(claude_style::windsurf()),
+        Box::new(antigravity::antigravity()),
+        Box::new(kimi_code::kimi_code()),
         Box::new(ZcodeAdapter::new()),
         Box::new(OpenCodeAdapter),
         Box::new(DshAdapter),
@@ -23,7 +35,7 @@ pub fn hook_adapters() -> Vec<Box<dyn HookAdapter>> {
 }
 
 pub fn watch_adapters() -> Vec<Box<dyn WatchAdapter>> {
-    vec![Box::new(WorkBuddyWatch), Box::new(TraeWorkWatch)]
+    vec![Box::new(WorkBuddyWatch), Box::new(TraeWorkWatch), Box::new(KimiWorkWatch)]
 }
 
 /// 按种类查找 hook 型 adapter（hook 子命令归一化用）

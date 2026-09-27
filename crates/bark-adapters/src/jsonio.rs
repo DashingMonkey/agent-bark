@@ -237,8 +237,9 @@ pub(crate) const KNOWN_EXE_NAMES: &[&str] = &[
     "agent-bark",
 ];
 
-/// 取 shell 命令的第一个 token：支持双引号包裹的带空格路径
-fn first_token(command: &str) -> &str {
+/// 取 shell 命令的第一个 token：支持双引号包裹的带空格路径。
+/// `pub(crate)`：kimi_code 的 TOML 条目（无 JSON Value 外壳）复用同一判定。
+pub(crate) fn first_token(command: &str) -> &str {
     let s = command.trim_start();
     if let Some(rest) = s.strip_prefix('"') {
         rest.split('"').next().unwrap_or("")

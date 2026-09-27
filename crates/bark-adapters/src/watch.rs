@@ -42,7 +42,7 @@ pub trait WatchAdapter: Send + Sync {
     }
 }
 
-fn emit(
+pub(crate) fn emit(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
     kind: AgentKind,
@@ -50,6 +50,7 @@ fn emit(
     session_id: &str,
     cwd: &str,
     message: &str,
+    tool_name: Option<&str>,
 ) {
     // 停止标志置位后不再发事件：在飞行中的最后一轮也不能漏出
     if stop.load(Ordering::Relaxed) {
@@ -65,14 +66,14 @@ fn emit(
         message: message.to_string(),
         timestamp: now_millis(),
         is_subagent: false,
-        tool_name: None,
+        tool_name: tool_name.map(str::to_string),
     };
     // try_send：通道满时丢弃而不是阻塞轮询线程（否则 stop 标志永远等不到）
     let _ = tx.try_send(ev);
 }
 
 /// 可中断睡眠（秒粒度足够）
-fn sleep_interruptible(stop: &AtomicBool, secs: u64) -> bool {
+pub(crate) fn sleep_interruptible(stop: &AtomicBool, secs: u64) -> bool {
     for _ in 0..secs {
         if stop.load(Ordering::Relaxed) {
             return false;
@@ -131,6 +132,7 @@ fn emit_lost_row(
         id,
         "",
         &format!("会话记录已从{source}会话库消失（可能被删除）"),
+        None,
     );
 }
 
@@ -400,10 +402,10 @@ impl WatchAdapter for WorkBuddyWatch {
                             if hb {
                                 // 心跳（Activity，不通知不入历史）：让流光亮思考色 +
                                 // 会话进入「运行中会话」列表；message 用标题作 prompt 展示
-                                emit(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title);
+                                emit(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title, None);
                             }
                             if let Some(ev) = run_event(prev, &status, suppress, first) {
-                                emit(&stop, &tx, kind, ev, &session, &cwd, &terminal_message(&title, &status));
+                                emit(&stop, &tx, kind, ev, &session, &cwd, &terminal_message(&title, &status), None);
                             }
                             let last_hb = if hb {
                                 round
@@ -816,7 +818,16 @@ impl WatchAdapter for TraeWorkWatch {
                                 Self::HEARTBEAT_EVERY_ROUNDS,
                             );
                             if hb {
-                                emit(&stop, &tx, kind, EventKind::Activity, sid, cwd, title);
+                                emit(
+                                    &stop,
+                                    &tx,
+                                    kind,
+                                    EventKind::Activity,
+                                    sid,
+                                    cwd,
+                                    title,
+                                    None,
+                                );
                             }
                             sess.insert(
                                 sid.clone(),
@@ -838,7 +849,16 @@ impl WatchAdapter for TraeWorkWatch {
                                     .get(sid)
                                     .map(|(t, c)| (t.as_str(), c.as_str()))
                                     .unwrap_or(("", ""));
-                                emit(&stop, &tx, kind, ev, sid, cwd, &terminal_message(title, status));
+                                emit(
+                                    &stop,
+                                    &tx,
+                                    kind,
+                                    ev,
+                                    sid,
+                                    cwd,
+                                    &terminal_message(title, status),
+                                    None,
+                                );
                             }
                             turns.insert(turn_id.clone(), SeenTurn { status: status.clone(), last_seen: round });
                         }

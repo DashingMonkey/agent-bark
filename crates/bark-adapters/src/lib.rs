@@ -4,9 +4,12 @@
 //!
 //! 两种模式产出同一种 NormalizedEvent，下游无感。
 
+pub mod antigravity;
 pub mod claude_style;
 pub mod dsh;
 pub mod jsonio;
+pub mod kimi_code;
+pub mod kimiwork;
 pub mod opencode;
 pub mod registry;
 pub mod traework_db;

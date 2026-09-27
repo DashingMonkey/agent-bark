@@ -17,4 +17,12 @@
 | workbuddy.svg | [workbuddy.cn 官网 logo.svg](https://www.workbuddy.cn/) | WorkBuddy |
 | opencode.svg | opencode（单色，currentColor） | OpenCode |
 | dsh.svg | deepseek-color | DeepSeek Harness |
+| gemini-color.svg | gemini-color | Gemini CLI |
+| qwen-color.svg | qwen-color | Qwen Code |
+| kimi.svg | kimi（单色，currentColor；color 变体的主形是白色，浅色背景下看不清） | Kimi Code、Kimi Work |
+| cursor.svg | cursor（单色，currentColor；该图标无 color 变体） | Cursor |
+| copilot-color.svg | copilot-color | Copilot CLI |
+| windsurf.svg | windsurf（单色，currentColor；该图标无 color 变体） | Windsurf |
+| grok.svg | grok（单色，currentColor；该图标无 color 变体） | Grok CLI |
+| antigravity-color.svg | antigravity-color | Antigravity |
 | generic.svg | 自绘（描边风格，currentColor） | 无品牌图标的 agent 兜底 |

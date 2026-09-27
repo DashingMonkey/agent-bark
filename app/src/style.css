@@ -710,6 +710,31 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 /* Agents 页分组标题（已检测到 / 未检测到 / 暂不支持接入），用于把几类软件分开 */
 .group-title { font-size: 12px; color: var(--muted); margin: 6px 2px 8px; }
 
+/* 「未检测到」组的折叠头：整行可点展开/收起。未安装的卡片全是禁用态，
+   默认折叠避免把页面拉出长滚动条；chevron 收起时指向右、展开时指向下 */
+.group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  cursor: pointer;
+  user-select: none;
+}
+.group-toggle:hover { color: var(--text); }
+.group-toggle:focus-visible { outline: 1px solid var(--brand); border-radius: 4px; }
+.group-toggle .chev {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease;
+}
+.group-toggle .chev.open { transform: rotate(0deg); }
+
 .event-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
 .event-item:last-child { border-bottom: none; }
 .event-time { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }

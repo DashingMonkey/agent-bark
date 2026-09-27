@@ -145,6 +145,28 @@ const groups = computed(() => {
   ].filter((g) => g.items.length > 0);
 });
 
+// ---- 「未检测到」组折叠 ----
+// 未安装的 agent 占清单的大多数，而它们的卡片全是禁用态（开关不可用、没有
+// 配置路径与校验信息），展开的信息量为零、只会把页面拉出长滚动条——默认
+// 折叠成一行标题，点开才渲染卡片。展开偏好记在 localStorage，下次进页保持。
+const MISSING_OPEN_KEY = "agents.missing-open";
+const missingOpen = ref((() => {
+  try {
+    return localStorage.getItem(MISSING_OPEN_KEY) === "1";
+  } catch {
+    return false; // 个别隐私模式 localStorage 不可用：按默认折叠
+  }
+})());
+
+function toggleMissing() {
+  missingOpen.value = !missingOpen.value;
+  try {
+    localStorage.setItem(MISSING_OPEN_KEY, missingOpen.value ? "1" : "0");
+  } catch {
+    // 存不进去就算了，本次会话内折叠状态仍然生效
+  }
+}
+
 // ---- 一键开启 / 关闭 ----
 
 /// 参与批量操作的 agent：未安装、开发中的开关本身不可用，这里同样跳过
@@ -251,71 +273,89 @@ onMounted(refresh);
 
     <div v-else>
       <template v-for="g in groups" :key="g.key">
-        <div class="group-title">{{ g.title }}（{{ g.items.length }}）</div>
-
+        <!-- 未检测到组：标题整行可点，展开/收起（chevron 指向随状态翻转） -->
         <div
-          v-for="s in g.items"
-          :key="s.kind"
-          class="card"
-          :class="{ disabled: !s.installed || s.mode === 'planned' }"
+          v-if="g.key === 'missing'"
+          class="group-title group-toggle"
+          role="button"
+          tabindex="0"
+          :aria-expanded="missingOpen"
+          @click="toggleMissing"
+          @keydown.enter.prevent="toggleMissing"
+          @keydown.space.prevent="toggleMissing"
         >
-          <div class="between">
-            <div class="col grow">
-              <div class="row">
-                <span class="agent-icon" v-html="agentIcon(s.kind)"></span>
-                <span class="agent-name">{{ s.display_name }}</span>
-                <span :class="statusBadge(s).cls">{{ statusBadge(s).text }}</span>
-                <span v-if="s.mode === 'watch' && s.installed" class="badge warn">监控型</span>
-              </div>
-              <!-- 多路径（如 DeepseekHarness/OpenCode 的配置+插件）各占一行：
-                   用 · 拼一行时路径会在中途折断，哪段是哪个文件读不出来 -->
-              <span v-if="s.config_paths.length" class="agent-path">
-                <span v-for="(p, i) in s.config_paths" :key="i">{{ p }}</span>
-              </span>
-            </div>
-
-            <!-- 接入说明改为悬停显示的感叹号，不再常驻占一版面 -->
-            <span
-              v-if="s.trust_hint"
-              v-tooltip="s.trust_hint"
-              class="help-mark"
-              role="img"
-              :aria-label="s.trust_hint"
-            >
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <circle cx="8" cy="8" r="6.1" />
-                <path d="M8 4.9v4" />
-                <circle class="dot" cx="8" cy="11.1" r="0.9" />
-              </svg>
-            </span>
-
-            <label
-              v-tooltip="
-                !s.installed
-                  ? '未安装'
-                  : s.mode === 'planned'
-                    ? '开发中'
-                    : isOn(s)
-                      ? '已接入，点击关闭'
-                      : '未接入，点击写入配置'
-              "
-              class="switch"
-            >
-              <input
-                type="checkbox"
-                :checked="isOn(s)"
-                :disabled="!s.installed || s.mode === 'planned' || !!busy || bulkBusy"
-                :aria-label="`${s.display_name} 接入开关`"
-                @change="toggle(s, ($event.target as HTMLInputElement).checked)"
-              />
-              <span class="track"></span>
-            </label>
-          </div>
-
-          <div v-if="messages[s.kind]" class="warn-box mt-8">{{ messages[s.kind] }}</div>
-          <div v-else-if="problem(s)" class="warn-box mt-8">{{ problem(s) }}</div>
-          <div v-else-if="actionHint(s)" class="hint mt-8">{{ actionHint(s) }}</div>
+          <svg class="chev" :class="{ open: missingOpen }" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M4.25 6.5 8 10.25 11.75 6.5" />
+          </svg>
+          {{ g.title }}（{{ g.items.length }}）
         </div>
+        <div v-else class="group-title">{{ g.title }}（{{ g.items.length }}）</div>
+
+        <template v-if="g.key !== 'missing' || missingOpen">
+          <div
+            v-for="s in g.items"
+            :key="s.kind"
+            class="card"
+            :class="{ disabled: !s.installed || s.mode === 'planned' }"
+          >
+            <div class="between">
+              <div class="col grow">
+                <div class="row">
+                  <span class="agent-icon" v-html="agentIcon(s.kind)"></span>
+                  <span class="agent-name">{{ s.display_name }}</span>
+                  <span :class="statusBadge(s).cls">{{ statusBadge(s).text }}</span>
+                  <span v-if="s.mode === 'watch' && s.installed" class="badge warn">监控型</span>
+                </div>
+                <!-- 多路径（如 DeepseekHarness/OpenCode 的配置+插件）各占一行：
+                     用 · 拼一行时路径会在中途折断，哪段是哪个文件读不出来 -->
+                <span v-if="s.config_paths.length" class="agent-path">
+                  <span v-for="(p, i) in s.config_paths" :key="i">{{ p }}</span>
+                </span>
+              </div>
+  
+              <!-- 接入说明改为悬停显示的感叹号，不再常驻占一版面 -->
+              <span
+                v-if="s.trust_hint"
+                v-tooltip="s.trust_hint"
+                class="help-mark"
+                role="img"
+                :aria-label="s.trust_hint"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <circle cx="8" cy="8" r="6.1" />
+                  <path d="M8 4.9v4" />
+                  <circle class="dot" cx="8" cy="11.1" r="0.9" />
+                </svg>
+              </span>
+  
+              <label
+                v-tooltip="
+                  !s.installed
+                    ? '未安装'
+                    : s.mode === 'planned'
+                      ? '开发中'
+                      : isOn(s)
+                        ? '已接入，点击关闭'
+                        : '未接入，点击写入配置'
+                "
+                class="switch"
+              >
+                <input
+                  type="checkbox"
+                  :checked="isOn(s)"
+                  :disabled="!s.installed || s.mode === 'planned' || !!busy || bulkBusy"
+                  :aria-label="`${s.display_name} 接入开关`"
+                  @change="toggle(s, ($event.target as HTMLInputElement).checked)"
+                />
+                <span class="track"></span>
+              </label>
+            </div>
+  
+            <div v-if="messages[s.kind]" class="warn-box mt-8">{{ messages[s.kind] }}</div>
+            <div v-else-if="problem(s)" class="warn-box mt-8">{{ problem(s) }}</div>
+            <div v-else-if="actionHint(s)" class="hint mt-8">{{ actionHint(s) }}</div>
+          </div>
+        </template>
       </template>
     </div>
   </div>

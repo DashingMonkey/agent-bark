@@ -12,9 +12,9 @@
 
 | 类型 | 做法 | 使用者 |
 | --- | --- | --- |
-| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode |
+| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Windsurf、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
 | **插件型** | 生成插件文件并登记到宿主的插件配置里，插件内部直接 POST `/event` | OpenCode、DeepSeek Harness |
-| **监控型** | 轮询 agent 本地会话库（SQLite，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork |
+| **监控型** | 轮询 agent 本地会话库（SQLite / JSONL，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork、Kimi Work |
 
 **统一事件**（所有 agent 归一化到这 9 类；`activity` 与 `tool_finished` 只用于状态推导，不通知、不入历史）：
 
@@ -46,6 +46,11 @@
 | WorkBuddy | 运行中被归档 → run_aborted（实测） | 立即释放 |
 | TraeWork | `chat_turn.turn_status=canceled`（实测） | 立即释放（run_aborted） |
 | TraeCode / Codex | **无**（官方事件表就没有） | 卡原状态到 10 分钟判死；继续对话则刷新 |
+| Grok CLI | `StopCancelled`（官方事件，未实测） | **立即释放**——显式的用户取消信号，比 Claude 系干净 |
+| Kimi Code | `Interrupt`（官方事件，未实测） | **立即释放**（显式中断信号） |
+| Kimi Work | `turn.cancel`（本机 wire.jsonl 实测） | **立即释放**（run_aborted） |
+| Gemini CLI / Qwen Code / Factory Droid / Cursor / Copilot CLI | `SessionEnd`/`sessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
+| Windsurf / Antigravity | **无**（官方就没有会话级/中断事件） | 卡原状态到 10 分钟判死；继续对话则刷新 |
 
 **三条硬约束**（见 `crates/bark-cli/src/lib.rs` 模块注释，改 hook 逻辑必须守住）：
 1. 永远退出码 0——绝不能阻塞 agent；
@@ -351,7 +356,161 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 ---
 
-## 11. 已下线
+## 11. Gemini CLI
+
+> **2026-09 广度扩展**：以下 9 节（§11–§19）均基于**官方 hooks 文档 + AgentPet / lazyagent / tokscale 等开源实现交叉验证**接入，标注「未实测」的映射没有实机验证过；写错的事件名或路径由启动自愈 + 10 分钟判死兜底，实机探针（§23）核对后请回填实测结论。
+
+| 项 | 值 |
+| --- | --- |
+| id | `gemini-cli` |
+| 配置文件 | `~/.gemini/settings.json`（Windows `%USERPROFILE%\.gemini\settings.json`） |
+| 安装标记 | `~/.gemini/settings.json` 或 `~/.gemini/tmp` 存在。**不能**用 `~/.gemini` 目录本身：同家的 Antigravity 也会创建它（其配置在 `~/.gemini/config/`） |
+| 注册事件 | `BeforeAgent`/`BeforeTool`→activity、`AfterTool`→**tool_finished**（等待解除信号）、`Notification`→input_required、`AfterAgent`→run_completed、`SessionEnd`→run_aborted |
+| 需要你做 | 无信任环节（官方仅对**项目级** hooks 做指纹告警）；hooks 在会话启动时加载，注册后新开会话 |
+
+官方 11 个事件表的子集（**未实测**）；payload 为 snake_case（`session_id`/`cwd`/`hook_event_name`）。没有独立的权限等待事件，`Notification` 靠 `notification_type` 含 permission 字样升级为「需要确认」（与 Qoder 同机制）。
+
+---
+
+## 12. Qwen Code
+
+| 项 | 值 |
+| --- | --- |
+| id | `qwen-code` |
+| 配置文件 | `~/.qwen/settings.json` |
+| 安装标记 | `~/.qwen/settings.json` 或 `~/.qwen/projects` 存在 |
+| 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`PostToolUseFailure`→tool_failed、`Notification`→input_required、`PermissionRequest`→permission_required、`Stop`→run_completed、`StopFailure`→run_failed、`SessionEnd`→run_aborted |
+| 需要你做 | 无信任环节（项目级配置需目录受信，用户级不受影响） |
+
+Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格**（官方 22 个事件），映射与 Claude Code 同口径（**未实测**）。payload 为 snake_case 且带 `permission_mode`。`PermissionRequest` 是否真的触发未实测——有 `Notification` 兜底，即使不触发也能收到等待信号。
+
+---
+
+## 13. Factory Droid
+
+| 项 | 值 |
+| --- | --- |
+| id | `droid` |
+| 配置文件 | `~/.factory/hooks.json` |
+| 安装标记 | `~/.factory` 目录存在 |
+| 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`Notification`→**input_required**（权限/审批请求或 60s 空闲）、`Stop`→run_completed、`SessionEnd`→run_aborted |
+| 需要你做 | Droid 启动时快照 hooks，外部修改需在会话内 `/hooks` 面板**审核确认** |
+
+官方 9 个事件，Claude 同构嵌套 + snake_case payload（AgentPet 实现与官方一致，**未实测**）。官方事件表里没有 `StopFailure`，回合失败只有判死兜底。
+
+---
+
+## 14. Grok CLI（Grok Build）
+
+| 项 | 值 |
+| --- | --- |
+| id | `grok` |
+| 配置文件 | `~/.grok/hooks/agent-bark.json`（**专用文件**：该目录下每个 `*.json` 都是一份 hooks，独占文件名即不碰用户条目；目录不存在时 agent-bark 会补建最后一层） |
+| 安装标记 | `~/.grok` 目录存在 |
+| 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`PostToolUseFailure`→tool_failed、`Notification`→input_required、`Stop`→run_completed、`StopFailure`→run_failed、`StopCancelled`→**run_aborted**、`SessionEnd`→run_aborted |
+| 需要你做 | 无信任环节（官方仅**项目级** hooks 需要 `/hooks-trust`，用户级 `~/.grok/hooks` 直接加载） |
+
+官方 15 个事件的子集（**未实测**）。payload 是 **camelCase 键**（`sessionId`/`toolName`/`workspaceRoot`），且 `hookEventName` 携带 snake_case 值——事件名走 `--event` 参数不受影响，字段靠归一化层的别名兜底。`StopCancelled` 是显式的用户取消信号，中断回合**立即释放**，不用等判死——这是全部接入里最干净的中止信号。
+
+---
+
+## 15. Cursor
+
+| 项 | 值 |
+| --- | --- |
+| id | `cursor` |
+| 配置文件 | `~/.cursor/hooks.json`（**扁平结构** + 顶层 `version: 1`，文件不存在时 agent-bark 自动创建） |
+| 安装标记 | `~/.cursor` 目录存在 |
+| 注册事件 | `beforeSubmitPrompt`/`preToolUse`→activity、`postToolUse`→**tool_finished**（等待解除信号）、`stop`→run_completed、`sessionEnd`→run_aborted |
+| 需要你做 | 无信任环节 |
+
+官方 18 个 agent 事件的子集（**未实测**）；payload 用 `conversation_id` + `workspace_roots`（数组）。**没有等待类钩子**（官方无 Notification 类事件）——Cursor 只有运行/完成两态，权限等待退化为事件静止 + 判死。本节覆盖 IDE 端；Cursor CLI（`cursor-agent`）对 hooks 的支持官方未文档化，不承诺。
+
+---
+
+## 16. Copilot CLI
+
+| 项 | 值 |
+| --- | --- |
+| id | `copilot-cli` |
+| 配置文件 | `~/.copilot/hooks/agent-bark.json`（**专用文件**：官方按 `~/.copilot/hooks/*.json` 逐文件加载，独占文件名即不碰用户条目） |
+| 安装标记 | `~/.copilot` 目录存在 |
+| 注册事件 | `userPromptSubmitted`→activity、`postToolUse`→tool_finished、`postToolUseFailure`→tool_failed、`notification`→input_required、`permissionRequest`→permission_required、`agentStop`→run_completed、`sessionEnd`→run_aborted |
+| 需要你做 | 无信任环节 |
+
+⚠️ 事件名按**官方 CLI 文档的 camelCase 主事件集**（`agentStop` 而非 `Stop`、`userPromptSubmitted` 而非 `UserPromptSubmit`）——AgentPet 写的 PascalCase 集是 VS Code 兼容层。**未实测**；若实机只认 PascalCase 回调，把映射表切过去即可（代码注释有记录）。**故意不注册 `preToolUse`**：Copilot 的 command hook 是 fail-closed（hook 出错会阻塞用户工具），少一个高风险挂载点（本子命令恒退出 0，这是纵深防御）。
+
+---
+
+## 17. Windsurf
+
+| 项 | 值 |
+| --- | --- |
+| id | `windsurf` |
+| 配置文件 | `~/.codeium/windsurf/hooks.json`（扁平结构，**无** version 键） |
+| 安装标记 | `~/.codeium/windsurf` 目录存在 |
+| 注册事件 | `pre_user_prompt`→activity、`post_cascade_response`（及 `_with_transcript` 变体）→run_completed |
+| 需要你做 | 无信任环节；工作区处于**受限模式（Restricted Mode）**时 hooks 不会加载 |
+
+官方 12 个事件里只注册两个会话级事件（**未实测**）：其余工具级事件全是阻塞型 pre-hook，不注册；运行中相位靠回合开始心跳 + 判死兜底。**没有等待类钩子**——只有运行/完成两态。payload 用 `trajectory_id`（会话 id）+ `agent_action_name`，无项目目录字段，通知正文不带项目名属能力边界。
+
+---
+
+## 18. Antigravity
+
+| 项 | 值 |
+| --- | --- |
+| id | `antigravity` |
+| 配置文件 | `~/.gemini/config/hooks.json`（**命名组**结构：顶层每个键是一个组，agent-bark 独占 `agent-bark` 组，用户自己的组与 Gemini CLI 的配置互不影响） |
+| 安装标记 | `~/.gemini/config` 目录存在 |
+| 注册事件 | `PreInvocation`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`Stop`→run_completed |
+| 需要你做 | 在 Antigravity **设置中开启 Hooks** |
+
+官方 5 个事件里取 4 个（`PostInvocation` 与 `Stop` 重合，不重复注册）（**未实测**）。两个形态细节：`PreToolUse`/`PostToolUse` 是 matcher 事件，需要 `{"matcher": "*", "hooks": [...]}` 包装；`PreInvocation`/`Stop` 是裸 handler 列表。payload 为 camelCase（`conversationId`/`workspacePaths`/`toolCall.name`）且**没有事件名字段**——事件名由 hook 命令的 `--event` 参数提供，不受影响。没有会话级/中断事件，中止退化为判死。
+
+---
+
+## 19. Kimi Code
+
+| 项 | 值 |
+| --- | --- |
+| id | `kimi-code` |
+| 配置文件 | `~/.kimi-code/config.toml` 的 `[[hooks]]` 数组——**唯一的 TOML 宿主**，做格式保留编辑（toml_edit 语义：用户凭据、注释、键序、空行一律不动） |
+| 安装标记 | `~/.kimi-code` 目录存在；只装**桌面客户端**时补认 `%APPDATA%\kimi-code-app` |
+| 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`PostToolUseFailure`→tool_failed、`PermissionRequest`→permission_required、`Notification`→input_required、`Stop`→run_completed、`StopFailure`→run_failed、`Interrupt`→**run_aborted**、`SessionEnd`→run_aborted |
+| 需要你做 | 无信任环节（hooks 是 fail-open：超时/异常一律放行） |
+
+官方 20 个事件的子集（**未实测**）。`Interrupt` 是显式的用户中断信号，中断回合**立即释放**。旧版 `kimi-cli`（`~/.kimi`）官方已归档不接，只认继任者 kimi-code。
+
+**覆盖三个前端**：Kimi Code 的 CLI、桌面客户端（2026-09-17 发布）与 VS Code 插件共用 `~/.kimi-code/` 配置与会话数据（官方文档明示），hooks 对桌面端同样生效（官方文档 + 仓库 issue + Beacon 遥测实现三源印证）——接入这一条即覆盖三个形态。
+
+---
+
+## 20. Kimi Work（监控型 · 非官方）
+
+Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）：Goal 模式任务、定时任务、Agent Swarm。**2026-09 在本机实测逆向**了它的数据布局。
+
+| 项 | 值 |
+| --- | --- |
+| id | `kimi-work` |
+| 数据根 | `%APPDATA%\kimi-desktop\daimon-share\daimon\runtime\kimi-code\home\`（内嵌 daimon 守护进程的 KIMI_CODE_HOME；优先跟随 `%APPDATA%\kimi-desktop\daimon-share\daimon\config.json` 里 `agents.defaults.agentFile` 的指针，Work 数据迁移存储盘后仍能找对位置） |
+| 会话布局 | 与 Kimi Code CLI **完全同构**（逐文件核对）：`session_index.jsonl`（sessionId/sessionDir/workDir）+ `sessions/<工作区>/<会话id>/state.json`（标题）+ `agents/main/wire.jsonl`（协议 1.3 事件流） |
+| 事件映射 | `turn.prompt`→activity、`tool.call`→activity（带工具名）、`tool.result`→tool_finished、`step.end(finishReason=end_turn)`→run_completed、`turn.cancel`→**run_aborted**；其余记录忽略 |
+| 需要你做 | 无（不写盘、不需要 Kimi Work 任何设置）；Kimi Work 运行中即自动监控 |
+
+实测要点（协议 1.3，样本 4 回合 = 3 次 `end_turn` + 1 次 `turn.cancel` 全闭环）：
+- **没有 `turn.end` 记录**——模型给出最终回答就是最后一步 `step.end` 的 `finishReason=end_turn`；
+- `turn.cancel` 是显式用户中止，立即释放；
+- 通知正文用 `state.json` 的会话标题（wire 里只有流式分片，不拼装正文）；
+- 长思考回合没有 `tool.call` 心跳，靠 60s 运行态心跳保活（远小于 10 分钟判死线）。
+
+**为什么不做 Hook 型**：内核读的 `runtime/kimi-code/config.toml` 是**应用托管生成**的（内含 Daimon 权限规则、设备元数据，随应用启动重写），写入的 `[[hooks]]` 活不过一次 Kimi Work 重启；Watch 型零写盘，不受影响。
+
+**已知边界**：只看主 agent（`agents/main/wire.jsonl`），Agent Swarm 子智能体不出事件；协议 1.3 只有审批**解决**记录没有**请求**记录，「等待确认」相位推不出来（表现为执行工具直到审批完成）；数据布局按 2026-07 版本（daimon-bundle 0.5.36 / X-Msh-Version 0.22.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
+
+---
+
+## 21. 已下线
 
 | id | 说明 |
 | --- | --- |
@@ -365,7 +524,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 ---
 
-## 12. 通用排查清单
+## 22. 通用排查清单
 
 先看 **Agents 接入**页的徽标，再对症处理：
 
@@ -401,7 +560,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 ---
 
-## 13. 探针验证法（文档与实测冲突时用）
+## 23. 探针验证法（文档与实测冲突时用）
 
 要确认「某个 agent 到底读哪个配置文件」「哪些事件真的会触发」，唯一可靠的办法是埋一个探针：只记日志、永不阻断。
 

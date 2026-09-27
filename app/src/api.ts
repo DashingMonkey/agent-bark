@@ -15,6 +15,14 @@ import iconZcode from "./assets/agents/zcode.svg?raw";
 import iconWorkbuddy from "./assets/agents/workbuddy.svg?raw";
 import iconOpencode from "./assets/agents/opencode.svg?raw";
 import iconDsh from "./assets/agents/dsh.svg?raw";
+import iconGemini from "./assets/agents/gemini-color.svg?raw";
+import iconQwen from "./assets/agents/qwen-color.svg?raw";
+import iconKimi from "./assets/agents/kimi.svg?raw";
+import iconCursor from "./assets/agents/cursor.svg?raw";
+import iconCopilot from "./assets/agents/copilot-color.svg?raw";
+import iconWindsurf from "./assets/agents/windsurf.svg?raw";
+import iconGrok from "./assets/agents/grok.svg?raw";
+import iconAntigravity from "./assets/agents/antigravity-color.svg?raw";
 import iconGeneric from "./assets/agents/generic.svg?raw";
 
 /** agent id → 品牌 SVG（内联标记）。未收录的 agent 回落到 generic 兜底图标 */
@@ -29,6 +37,15 @@ const AGENT_ICONS: Record<string, string> = {
   workbuddy: iconWorkbuddy,
   opencode: iconOpencode,
   dsh: iconDsh,
+  "gemini-cli": iconGemini,
+  "qwen-code": iconQwen,
+  "kimi-code": iconKimi,
+  "kimi-work": iconKimi,
+  cursor: iconCursor,
+  "copilot-cli": iconCopilot,
+  windsurf: iconWindsurf,
+  grok: iconGrok,
+  antigravity: iconAntigravity,
 };
 
 export function agentIcon(id: string): string {

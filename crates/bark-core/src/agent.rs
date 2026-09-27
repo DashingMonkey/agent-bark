@@ -25,6 +25,30 @@ pub enum AgentKind {
     Dsh,
     TraeWork,
     WorkBuddy,
+    // ---- 2026-09 广度扩展（官方 hooks 文档 + AgentPet/lazyagent 等开源实现
+    // 双源交叉验证后接入；均未实机测试，依赖各家启动自愈 + 判死兜底）----
+    /// Google Gemini CLI（~/.gemini/settings.json，Claude 嵌套变体）
+    GeminiCli,
+    /// Qwen Code（~/.qwen/settings.json，官方 22 事件，Claude 风格）
+    QwenCode,
+    /// Factory Droid（~/.factory/hooks.json，Claude 同构嵌套）
+    Droid,
+    /// xAI Grok CLI（~/.grok/hooks/agent-bark.json 专用文件，payload 为 camelCase）
+    Grok,
+    /// Cursor（~/.cursor/hooks.json，扁平结构 + version:1）
+    Cursor,
+    /// GitHub Copilot CLI（~/.copilot/hooks/agent-bark.json 专用文件，官方事件为 camelCase）
+    CopilotCli,
+    /// Windsurf（~/.codeium/windsurf/hooks.json，扁平结构无 version，仅 2-3 个事件）
+    Windsurf,
+    /// Google Antigravity（~/.gemini/config/hooks.json 命名组，payload 无事件名字段）
+    Antigravity,
+    /// Kimi Code（Moonshot，~/.kimi-code/config.toml 的 [[hooks]]——唯一的 TOML 宿主；
+    /// hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用）
+    KimiCode,
+    /// Kimi Work（Kimi 电脑客户端 Work 模式，内嵌 daimon 守护进程跑 Kimi Code 内核，
+    /// 会话以 kimi-code 格式落盘在自己的 runtime home 下——监控型轮询，见 kimiwork.rs）
+    KimiWork,
 }
 
 /// adapter 的工作模式
@@ -42,7 +66,7 @@ impl AgentKind {
     /// 前两者没人用或被官方除名，后者并入了 Qoder。都不再注册 adapter，用户配置里
     /// 残留的旧 id 字符串无害——agents 段存的是 String，bark-cli 遇到未知 id 也只
     /// 打印一行并 exit 0）
-    pub const ALL: [AgentKind; 10] = [
+    pub const ALL: [AgentKind; 20] = [
         AgentKind::ClaudeCode,
         AgentKind::TraeCode,
         AgentKind::CodeBuddy,
@@ -53,6 +77,16 @@ impl AgentKind {
         AgentKind::Dsh,
         AgentKind::TraeWork,
         AgentKind::WorkBuddy,
+        AgentKind::GeminiCli,
+        AgentKind::QwenCode,
+        AgentKind::Droid,
+        AgentKind::Grok,
+        AgentKind::Cursor,
+        AgentKind::CopilotCli,
+        AgentKind::Windsurf,
+        AgentKind::Antigravity,
+        AgentKind::KimiCode,
+        AgentKind::KimiWork,
     ];
 
     pub fn id(&self) -> &'static str {
@@ -67,6 +101,16 @@ impl AgentKind {
             AgentKind::Dsh => "dsh",
             AgentKind::TraeWork => "trae-work",
             AgentKind::WorkBuddy => "workbuddy",
+            AgentKind::GeminiCli => "gemini-cli",
+            AgentKind::QwenCode => "qwen-code",
+            AgentKind::Droid => "droid",
+            AgentKind::Grok => "grok",
+            AgentKind::Cursor => "cursor",
+            AgentKind::CopilotCli => "copilot-cli",
+            AgentKind::Windsurf => "windsurf",
+            AgentKind::Antigravity => "antigravity",
+            AgentKind::KimiCode => "kimi-code",
+            AgentKind::KimiWork => "kimi-work",
         }
     }
 
@@ -85,12 +129,22 @@ impl AgentKind {
             AgentKind::Dsh => "DeepSeek Harness",
             AgentKind::TraeWork => "TraeWork",
             AgentKind::WorkBuddy => "WorkBuddy",
+            AgentKind::GeminiCli => "Gemini CLI",
+            AgentKind::QwenCode => "Qwen Code",
+            AgentKind::Droid => "Factory Droid",
+            AgentKind::Grok => "Grok CLI",
+            AgentKind::Cursor => "Cursor",
+            AgentKind::CopilotCli => "Copilot CLI",
+            AgentKind::Windsurf => "Windsurf",
+            AgentKind::Antigravity => "Antigravity",
+            AgentKind::KimiCode => "Kimi Code",
+            AgentKind::KimiWork => "Kimi Work",
         }
     }
 
     pub fn mode(&self) -> AdapterMode {
         match self {
-            AgentKind::TraeWork | AgentKind::WorkBuddy => AdapterMode::Watch,
+            AgentKind::TraeWork | AgentKind::WorkBuddy | AgentKind::KimiWork => AdapterMode::Watch,
             // DSH：生成原生 Cordis 插件并挂载（见 bark-adapters/src/dsh.rs）
             _ => AdapterMode::Hook,
         }
