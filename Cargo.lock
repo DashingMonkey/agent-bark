@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bark-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bark-adapters",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "bark-adapters"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "bark-channels"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bark-core",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "bark-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bark-adapters",
  "bark-core",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "bark-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "bark-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bark-core",
