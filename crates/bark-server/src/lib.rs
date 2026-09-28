@@ -171,6 +171,7 @@ mod tests {
             timestamp: 1,
             is_subagent: false,
             tool_name: None,
+            parent_session_id: None,
         }
     }
 

@@ -67,6 +67,7 @@ pub(crate) fn emit(
         timestamp: now_millis(),
         is_subagent: false,
         tool_name: tool_name.map(str::to_string),
+        parent_session_id: None,
     };
     // try_send：通道满时丢弃而不是阻塞轮询线程（否则 stop 标志永远等不到）
     let _ = tx.try_send(ev);

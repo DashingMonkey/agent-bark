@@ -51,6 +51,10 @@ pub struct SessionStatus {
     pub started_at: i64,
     /// 最近一次心跳（unix ms）
     pub last_activity: i64,
+    /// 父会话 key（子代理事件声明血缘，见 `NormalizedEvent::parent_session_id`）。
+    /// 供 [`touch_ancestors`] 递归向上传播存活心跳；前端不消费，不入快照。
+    #[serde(skip)]
+    pub parent: Option<String>,
 }
 
 /// 心跳静止超过该时长的会话视为僵死（agent 被杀时不会有 Stop 事件），
@@ -472,6 +476,19 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
             let mut sessions = lock(&state.active_sessions);
             let mut finished = lock(&state.recent_finished);
             let delta = apply_session_event_inner(&mut sessions, &mut finished, &event, stale);
+            // 子代理事件声明了血缘（parent_session_id）→ 存活心跳向祖先递归传播：
+            // 子代理干活期间父会话没有任何自己的事件（实测 DSH `Agent` 工具单次可跑
+            // 27 分钟），不传播会被判死巡检误判成「意外终止」。陈旧补投不算存活
+            // ——它只证明事件时刻活着，与 stale 不进状态表同口径。
+            if !stale {
+                if let Some(parent) = &event.parent_session_id {
+                    touch_ancestors_at(
+                        &mut sessions,
+                        session_key(&event.agent, parent),
+                        event.timestamp,
+                    );
+                }
+            }
             if delta.changed {
                 let snapshot = sessions_snapshot(&sessions, event.timestamp);
                 drop(sessions);
@@ -992,6 +1009,65 @@ fn prune_stale(sessions: &mut HashMap<String, SessionStatus>, now_ms: i64) -> Pr
     PruneResult { changed: before != sessions.len(), running_lost }
 }
 
+/// 日志存活心跳（正向存活信号）：把该会话的 `last_activity` 刷到现在。
+///
+/// 判死口径由此从「无 hook 心跳」收紧为「无 hook **且** 无日志活动」：长工具 /
+/// 长子代理 / 长思考期间 hook 静默是常态（实测 ZCode `Agent` 工具单次可跑 27 分钟、
+/// 父会话静默 21 分钟），但 agent 自己的日志还在写——静默 ≠ 死亡。真死亡（进程
+/// 被杀）日志同步停写，判死照常；用户中断后的会话不再产生日志行，判死兜底也照常
+/// （不会被续命）。当前只有 ZCode 有这个信号（看门狗尾随其日志，见 `abort_watch`）。
+///
+/// 只刷新时间戳：不改相位、不推快照（纯保活没有可见变化，UI 的15s 对账会带上新值）；
+/// 条目不存在时**不建档**——日志里有启动前/已结束的陈年会话，建档会造出幻影会话。
+pub fn touch_session(state: &AppState, agent: &str, session_id: &str) {
+    let mut sessions = lock(&state.active_sessions);
+    touch_session_at(&mut sessions, agent, session_id, bark_core::now_millis());
+}
+
+/// `touch_session` 的纯逻辑（便于测试）：返回是否刷到了已有条目
+fn touch_session_at(
+    sessions: &mut HashMap<String, SessionStatus>,
+    agent: &str,
+    session_id: &str,
+    now_ms: i64,
+) -> bool {
+    match sessions.get_mut(&session_key(agent, session_id)) {
+        Some(s) => {
+            s.last_activity = now_ms;
+            true
+        }
+        None => false,
+    }
+}
+
+/// 子代理活动向**祖先**递归传播存活心跳（纯逻辑，便于测试）。
+///
+/// 血缘边来自事件的 `parent_session_id`（建档时存进 [`SessionStatus::parent`]）：
+/// 子代理干活时父会话自己没有任何事件（实测 DSH `Agent` 工具单次可跑 27 分钟、
+/// 父会话静默 21 分钟），父条目会被「心跳静止判死」误杀成意外终止（红光 + 失败音）。
+/// 与 ZCode 日志存活的 parentSessionId 传播同一套口径。
+///
+/// 只刷 `last_activity`、不动相位（[`touch_session_at`] 同语义）——子代理的活动
+/// 不代表父会话的等待已被解除。链在中间断掉（祖先条目已不在表里）就到此为止：
+/// 再往上的祖先收不到本次心跳，属于已知残余缺口（祖先条目只会在其终态后缺席）。
+fn touch_ancestors_at(
+    sessions: &mut HashMap<String, SessionStatus>,
+    mut parent_key: String,
+    now_ms: i64,
+) {
+    // 深度上限防环：血缘来自外部输入（DSH 事件），出现环时宁可少刷也不死循环
+    for _ in 0..16 {
+        let Some(entry) = sessions.get_mut(&parent_key) else {
+            return;
+        };
+        entry.last_activity = now_ms;
+        let Some(next) = entry.parent.clone() else {
+            return;
+        };
+        parent_key = next;
+    }
+}
+
 /// 一次事件引起的状态表变化
 struct SessionDelta {
     /// 状态表内容有变化（含淘汰），应推前端快照
@@ -1345,6 +1421,11 @@ fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
         tool_calls: if ev.tool_name.is_some() { 1 } else { 0 },
         started_at: ev.timestamp,
         last_activity: ev.timestamp,
+        parent: ev
+            .parent_session_id
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| session_key(&ev.agent, p)),
     }
 }
 
@@ -1533,6 +1614,7 @@ mod tests {
             timestamp: ts,
             is_subagent: false,
             tool_name: tool.map(str::to_string),
+            parent_session_id: None,
         }
     }
 
@@ -1931,6 +2013,51 @@ mod tests {
     }
 
     #[test]
+    fn log_liveness_touch_defers_stale_judgment() {
+        // 日志存活心跳：长静默期间 agent 日志还在写 → 刷 last_activity，判死不触发
+        let stale = stale_after_ms();
+        let (mut sessions, mut finished) = table();
+        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Agent"), ""));
+        // hook 时间戳已超过判死阈值，但中途有日志活动续命
+        let now = 1000 + stale + 1;
+        assert!(touch_session_at(&mut sessions, "trae-code", "s1", now - stale / 2));
+        let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, now, Some("Read"), ""));
+        assert!(!d.running_lost, "日志活动续命后不得判死");
+        assert!(sessions.contains_key("trae-code|s1"), "条目应保留");
+
+        // 刷不到的会话不建档：日志里的陈年会话不该造出幻影条目
+        assert!(!touch_session_at(&mut sessions, "trae-code", "unknown", now));
+        assert!(!sessions.contains_key("trae-code|unknown"));
+    }
+
+    #[test]
+    fn subagent_activity_touches_ancestors_recursively() {
+        // 子代理活动沿血缘链向祖先传播存活：root ← mid ← leaf
+        let stale = stale_after_ms();
+        let (mut sessions, mut finished) = table();
+        for (sid, parent) in [("s1", None), ("s2", Some("s1")), ("s3", Some("s2"))] {
+            let mut e = ev(EventKind::Activity, 1000, Some("Agent"), "");
+            e.session_id = sid.into();
+            e.parent_session_id = parent.map(str::to_string);
+            apply_session_event(&mut sessions, &mut finished, &e);
+        }
+        assert_eq!(sessions.len(), 3, "三代会话都建档");
+        // leaf 的事件（管道里由 apply 刷自己的条目）向上传播：mid 与 root 都续命
+        let now = 1000 + stale + 1;
+        touch_ancestors_at(&mut sessions, session_key("trae-code", "s2"), now - 1);
+        for sid in ["s1", "s2"] {
+            let s = &sessions[&session_key("trae-code", sid)];
+            assert!(now - s.last_activity < stale, "{sid} 应被子代理活动续命");
+        }
+        // 中间断链（祖先条目不在表里）到此为止：不 panic、不建条目
+        touch_ancestors_at(&mut sessions, session_key("trae-code", "ghost"), now);
+        assert!(!sessions.contains_key(&session_key("trae-code", "ghost")));
+        // 环状血缘（外部输入不可信）不死循环：深度上限兜底
+        sessions.get_mut(&session_key("trae-code", "s1")).unwrap().parent = Some(session_key("trae-code", "s2"));
+        touch_ancestors_at(&mut sessions, session_key("trae-code", "s2"), now);
+    }
+
+    #[test]
     fn clear_history_by_kind_and_all() {
         let state = AppState::new(BarkConfig::default(), std::path::PathBuf::from("config.json"));
         let ids = {
@@ -2146,6 +2273,7 @@ mod tests {
             tool_calls: 1,
             started_at: last,
             last_activity: last,
+            parent: None,
         };
         let mut sessions = HashMap::new();
         sessions.insert("zcode|dead".into(), mk("dead", now - STALE_AFTER_MS));

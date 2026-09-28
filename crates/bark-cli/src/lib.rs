@@ -404,6 +404,7 @@ mod tests {
             timestamp: bark_core::now_millis(),
             is_subagent: false,
             tool_name: None,
+            parent_session_id: None,
         }
     }
 

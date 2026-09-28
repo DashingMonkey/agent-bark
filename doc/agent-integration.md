@@ -285,12 +285,31 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 | DSH 事件 | 模式 | → 统一事件 | 正文 |
 | --- | --- | --- | --- |
 | `agent/turn-stopping` | serial（无 `next()`） | `run_completed` | 会话日志里最后一条 `assistant/message` 的 text 块；取不到退「回合 N 结束」 |
-| `agent/status` running | emit | `activity` | 只发根会话，喂「运行中会话」与流光 |
+| `agent/status` running | emit | `activity` | **含子代理**（带 `is_subagent` + `parent_session_id` 血缘），喂「运行中会话」与流光 |
 | `agent/status` running→idle | emit | 兜底终态 | 本回合没被 `turn-stopping` 报过才发；按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮失败色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底） |
 | `agent/error` | emit | `run_failed` | `payload.error`（DSH 声明为 `unknown`）：字符串直用、对象取 `message`、否则截断 JSON |
 | `approval/request` | waterfall | `permission_required` | `toolName：reason`；观察完必须 `next()` |
 | `user-questions/request` | waterfall | `input_required` | 首个问题的 `header：question`；同样必须 `next()` |
-| `session/event` 的 `tool/call` | emit | `activity` | 带 `tool_name`，面板显示「执行工具」；只发根会话 |
+| `session/event` 的 `tool/call` | emit | `activity` | 带 `tool_name`，面板显示「执行工具」；**含子代理**（同上带血缘） |
+| `session/event` 其余事件 | emit | `tool_finished`（节流保活） | `user/*`、`approval/*`、提问审计除外；长思考/长子代理的静默窗口靠它续命 |
+
+**子代理语义**（2026-09-28，参考社区插件 dingyi222666/dsh-session-notification 的
+heldCompletions 与 dsh-notifier 的订阅修法）：
+
+- **完成通知会扣住**：回合结束但**后代会话还在跑**（沿 `session.header.parentSession`
+  血缘边递归查后代，等价社区的 `hasRunningDescendants`）时，`run_completed` 扣住不发，
+  等整个 fan-out 结束再补投；**失败/中止不扣**（错误是当下就要知道的事）。
+  不这么做的话，主 agent 派生子代理后回合间歇的「完成」会提前弹绿色完成特效；
+- **子代理活动驱动流光但不打扰人**：子代理心跳照发（`is_subagent` 门在 daemon 侧只挡
+  通知/音效/全屏特效），并经 `parent_session_id` 向祖先递归传播存活（daemon 侧
+  `touch_ancestors`）——否则子代理跑 20 分钟、父会话零心跳会被判死误亮失败色；
+- **监听器一律 `ctx.on(..., { global: true })`**（waterfall 两个除外）：DSH 经 scope
+  carrier 分发 scoped 事件，不带该选项会静默丢事件（社区 dsh-notifier 实测症状：
+  `turn/start` 到了、`turn/end` 永远不到，状态飘移）；
+- ⚠️ 以上血缘字段（`parentSession`）、scope 分发行径都取自 **Developer Preview** 的
+  DSH：升级可能改名/改语义。字段认不出时插件**不猜**，退化成修复前的行为（完成不扣、
+  心跳不向父传），不会更糟；DSH 升级后若「主 agent 等子代理时又提前亮完成色」，
+  优先检查插件里 `parentStringOf` 读的字段名。
 
 **坑**：
 - **cordis.patch.yml 是补丁层，不是条目清单**：顶层 `- id: xxx` 的语义是*覆盖基础树里已有的同名条目*，id 不存在时 DSH 只在 stderr 打一句 `patch: entry "xxx" not found` 然后跳过——插件根本不会挂载，且 GUI 看不到任何报错。新增插件必须写 `- insert: [{id, name}]`（早期版本写顶层 `{id, name}` 导致接入完全无效，已修；旧写法会被识别为漂移并在重新勾选时就地升级）。排障金标准：`dsh web --dump-config`（或 `dsh --profile <名> --dump-config`），条目没出现在输出里就是没挂上；
@@ -299,6 +318,8 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 - 字段实测（0.1.5-rc.1）：sessionId 取 `agent.id`；**cwd 取 `agent.session.header.cwd`**（`session.cwd` 不存在——早期版本取它，导致通知正文没有项目名、只剩一句 `turn N`；`Agent` 上也没有 `cwd` 字段）；最后一条 assistant 文本取 `assistant/message` 的 `data.message.content` 里的 text 块（`Session` 没有 `events` 字段，只有 `eventAt()` / `snapshotEvents()` / `ownEvents()`，`seq` 是「下一个可写偏移」即有效下标 `0..seq-1`）；子代理用 `session.header.origin === 'subagent'` **或** `header.delegationDepth > 0` 判定（DSH 权威口径是 `delegationDepthOf(agent) = max(header.delegationDepth, agent.options.subagentDepth)`——运行时深度「只能加深不能降低」，只读 header 在冷 resume / 策略覆盖时可能偏低）；
 - 选型参照社区插件（dsh-plugin-notify / dsh-notify / dsh-notification）：只挂 `agent/turn-stopping` 会漏掉「停下来等你确认/回答」这类会话终态，所以另挂 `agent/status` + `approval/request` + `user-questions/request`；
 - 两个 waterfall 事件（`approval/request`、`user-questions/request`）是**观察者**：必须把 `next()` 交还下去，否则会把审批/提问请求吞掉；两者的 `reason` / `header` 都是可选字段（键可能整个不出现），取值前要兜底，别把 `undefined` 拼进正文；
+- **等待类事件的历史 bug**（2026-09-28 修）：早期重构把通用 `post()` 删了、换成了 `postActivity`，但上面两个 waterfall 处理器还在调用 `post()`——`ReferenceError` 被 try/catch 吞掉，「等待授权 / 等待输入」**从未上报过**（症状：等待色/等待通知时有时无，即「状态显示不准确」的主要来源）。现在统一走 `postBestEffort`（失败补发一次），仿真用例 7 锁着它；
+- **开屏预创建空会话**（2026-09-28，DSH 0.1.5-rc.3 起）：web 打开一个工作区就**预创建一个空会话**（会话日志只有 header），但 agent 照样走 `agent/status: running`，甚至还会发零星生命周期类 session/event（未落盘）。插件必须有**建档门槛**：见过该会话的**回合级事件**（`turn/start` / `tool/call` / `assistant/message`）之前不发心跳、不折叠保活、`running→idle` 也不报兜底终态（`seenActivity` 表）——否则面板凭空多出一条「思考中」，它永远没有终态，挂满 10 分钟被判死巡检清掉（**红光 + 失败音**，每开一个工作区标签页埋一颗雷，实测复现）。第一版门槛取「有任何会话事件」被生命周期事件穿透（ProNet 实测），收紧为回合级后解决；三个类型名同时被 DSH 改名才会让插件整体静默，概率远低于单个。仿真用例 9 锁着；
 - `agent/turn-stopping` 是 serial 事件且 DSH 会 `await` 监听器返回的 Promise（这样终态不会因进程随即退出而丢），但 POST 必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被「只接受连接不响应」的进程占用时，否则会把回合收尾一起拖住；
 - **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，每次投递用**新的**事件 id，避免 daemon 按 id 去重把重投本身丢掉）；`markSettled` 只在**确认送达**的路径上调用；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把 idle 兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
 - 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为，覆盖首投失败重投、idle 兜底补报、新回合作废迟到终态、心跳不重试；本机没有 node 时该测试自动跳过）；
@@ -554,6 +575,7 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
 - 其它 agent 若进程被直接杀掉，不会有任何终态事件——这种情况靠**心跳静止判死**兜底（流光转失败色、条目清出列表）。
 - **判死时长**默认 10 分钟，由后台巡检每 30s 检查一次（不需要等下一条事件到来——早期版本只在有新事件时才算判死，所以会一直卡在思考色，已修）。想让中断后的反馈更快，用环境变量 `BARK_STALE_AFTER_MS`（毫秒，最小 5000）覆盖，例如 `BARK_STALE_AFTER_MS=60000` = 静默 1 分钟即判死；代价是**长时间跑单个工具**时可能被误判成「意外终止」。
+- **ZCode 不受长静默误判**：它的日志看门狗在读终态信号之余还做**存活心跳**——任何带会话 id 的日志行（含子代理行经 `parentSessionId` 向父会话传播）都会刷新 `last_activity`，判死口径是「无 hook **且** 无日志活动」。长工具 / 长子代理 / 长思考期间 hook 静默但日志还在写，不会被误判成意外终止；进程被杀后日志同步停写，判死照常。其余 hook 型 agent 没有这层信号，仍按 hook 心跳静止判死。
 - **不想等**：托盘菜单 →「重置流光」立刻驱散当前颜色（下一次事件到来时按正常逻辑重新点亮），会话条目也会在下一次快照时消失。
 
 **手动中止后流光为什么不亮失败色也不亮完成色**：这是刻意的。用户主动中止归一成 `run_aborted`——不是失败（不亮失败色、不弹「任务失败」）也不是完成（不亮完成色、不谎报跑完）；没有别的会话在跑时**直接收起光效**，还有别的会话在跑就照常显示它们的状态。若你看到某个 agent 中止后仍亮完成 / 失败色，说明它的中止信号还没被归到这一类（见 §0 的说明与各 agent 的「注册事件」一行）。

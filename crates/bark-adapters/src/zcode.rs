@@ -824,8 +824,20 @@ impl LogSignal {
     }
 }
 
-/// 从一行 ZCode 日志里解析回合终态信号（无关记录返回 None）。
-pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
+/// 一行 ZCode 日志的解析产物：会话活动 + 可能的回合终态信号。
+pub struct LogLine {
+    /// 本行归属的会话 id（`sess_` 前缀，与 hook 载荷同源）
+    pub session_id: String,
+    /// 子代理行里的 `context.parentSessionId`：子代理的日志活动同样证明父会话
+    /// 的回合还活着——父会话在子代理运行期间不写自己的日志（实测 `Agent` 工具
+    /// 单次可跑 27 分钟、父会话静默 21 分钟），不向父传播会被心跳判死误杀
+    pub parent_session_id: Option<String>,
+    /// 回合终态信号；无关记录是 `None`（但它仍是存活心跳）
+    pub signal: Option<LogSignal>,
+}
+
+/// 从一行 ZCode 日志里解析会话活动与回合终态信号（非会话级记录返回 None）。
+pub fn parse_log_line(line: &str) -> Option<LogLine> {
     // 行首 BOM 剥离（§4.16）：与 jsonio 的 BOM 口径一致——部分编辑器/轮转工具
     // 会给文件或行补 BOM，不剥的话整行解析失败、信号被静默丢弃
     let v: Value = serde_json::from_str(line.trim().trim_start_matches('\u{feff}')).ok()?;
@@ -834,6 +846,27 @@ pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
     if !session_id.starts_with("sess_") {
         return None;
     }
+    let parent_session_id = v
+        .get("context")
+        .and_then(|c| c.get("parentSessionId"))
+        .and_then(|p| p.as_str())
+        .filter(|p| p.starts_with("sess_"))
+        .map(str::to_string);
+    let signal = log_signal_from(&v, session_id);
+    Some(LogLine {
+        session_id: session_id.to_string(),
+        parent_session_id,
+        signal,
+    })
+}
+
+/// 从一行 ZCode 日志里解析回合终态信号（无关记录返回 None）。
+pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
+    parse_log_line(line).and_then(|l| l.signal)
+}
+
+/// 回合终态信号提取（[`parse_log_line`] 的内核）。
+fn log_signal_from(v: &Value, session_id: &str) -> Option<LogSignal> {
     let ctx = v.get("context");
     // 子代理判定只有会话名可用（日志行没有 hook 载荷的布尔字段）
     let is_subagent = session_id.starts_with("sess_subagent");
@@ -968,6 +1001,25 @@ const TAIL_MAX_READ: u64 = 256 * 1024;
 /// （截断的日志、非文本写入等），丢最旧的部分——宁可丢信号也不无界增长。
 const CARRY_MAX: usize = 4 * 1024 * 1024;
 
+/// 一次增量读取的产物。
+pub struct TailScan {
+    /// 新发现的回合终态信号
+    pub signals: Vec<LogSignal>,
+    /// 本次有过日志活动的会话 id（去重；含不构成信号的普通行，以及子代理行
+    /// 传播上来的父会话 id）——看门狗据此做存活心跳（刷新 `last_activity`，
+    /// 防长静默被判死误杀，见 app 侧 `state::touch_session`）
+    pub alive_sessions: Vec<String>,
+}
+
+impl TailScan {
+    fn empty() -> Self {
+        TailScan {
+            signals: Vec::new(),
+            alive_sessions: Vec::new(),
+        }
+    }
+}
+
 /// 按字节偏移增量读取 ZCode 日志的「尾巴」，跨天自动换文件。
 #[derive(Default)]
 pub struct AbortLogTail {
@@ -981,16 +1033,16 @@ pub struct AbortLogTail {
 }
 
 impl AbortLogTail {
-    /// 读一次新增内容，返回本次新发现的回合终态信号。
+    /// 读一次新增内容，返回本次新发现的回合终态信号与会话存活活动。
     ///
     /// 首次见到某个日志文件时**从文件末尾开始**：启动之前发生的中断/失败属于陈年旧事，
     /// 不该补一拨通知（调用方那边会话表里也没有它们）。
-    pub fn poll(&mut self, dir: &Path) -> Vec<LogSignal> {
+    pub fn poll(&mut self, dir: &Path) -> TailScan {
         let Some(path) = newest_log_file(dir) else {
-            return Vec::new();
+            return TailScan::empty();
         };
         let Ok(meta) = std::fs::metadata(&path) else {
-            return Vec::new();
+            return TailScan::empty();
         };
         let len = meta.len();
         let created = meta.created().ok();
@@ -1003,7 +1055,7 @@ impl AbortLogTail {
             self.created = created;
             self.offset = len;
             self.carry.clear();
-            return Vec::new();
+            return TailScan::empty();
         }
         // 同名文件被删除重建：视同「换了一份新文件」，从当前末尾开始。
         // 识别手段（§2.8b）：`created` 变了就是重建——旧实现只看 `len < offset`，
@@ -1019,7 +1071,7 @@ impl AbortLogTail {
             self.carry.clear();
         }
         if len == self.offset {
-            return Vec::new();
+            return TailScan::empty();
         }
 
         let want = (len - self.offset).min(TAIL_MAX_READ);
@@ -1027,18 +1079,18 @@ impl AbortLogTail {
         let read = {
             use std::io::{Read, Seek, SeekFrom};
             let Ok(mut f) = std::fs::File::open(&path) else {
-                return Vec::new();
+                return TailScan::empty();
             };
             if f.seek(SeekFrom::Start(self.offset)).is_err() {
-                return Vec::new();
+                return TailScan::empty();
             }
             match f.read(&mut buf) {
                 Ok(n) => n,
-                Err(_) => return Vec::new(),
+                Err(_) => return TailScan::empty(),
             }
         };
         if read == 0 {
-            return Vec::new();
+            return TailScan::empty();
         }
         self.offset += read as u64;
         buf.truncate(read);
@@ -1053,7 +1105,7 @@ impl AbortLogTail {
             self.carry.drain(..cut);
         }
 
-        let mut out = Vec::new();
+        let mut out = TailScan::empty();
         // 只处理**完整行**：最后一个换行符之后的部分留在 carry 里等下一轮
         let last_newline = self.carry.iter().rposition(|b| *b == b'\n');
         let Some(cut) = last_newline else {
@@ -1064,8 +1116,19 @@ impl AbortLogTail {
             if line.is_empty() {
                 continue;
             }
-            if let Some(sig) = parse_log_signal(&String::from_utf8_lossy(line)) {
-                out.push(sig);
+            let Some(parsed) = parse_log_line(&String::from_utf8_lossy(line)) else {
+                continue;
+            };
+            // 存活心跳：任何会话级行都说明该会话（及其父会话）还活着
+            for sid in std::iter::once(&parsed.session_id)
+                .chain(parsed.parent_session_id.as_ref())
+            {
+                if !out.alive_sessions.iter().any(|s| s == sid) {
+                    out.alive_sessions.push(sid.clone());
+                }
+            }
+            if let Some(sig) = parsed.signal {
+                out.signals.push(sig);
             }
         }
         out
@@ -1576,6 +1639,13 @@ mod tests {
     const REAL_TURN_CANCELLED_LINE: &str = r#"{"timestamp":"2026-09-18T08:37:31.751Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","spanId":"a65374e6-4cc6-4f","parentSpanId":"67e43b88-b528-4b","sessionId":"sess_dfa58fb4-0119-46da-8c09-a1dd64be80d7","turnId":"turn_4f23348c-b59d-4a30-aaf5-5d509c13ee3a","status":"cancelled","context":{"queryId":"01a0b3a8-2dec-7fd3-9083-da8c3f924c79","turnNumber":0,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn was cancelled.","code":"TURN_CANCELLED","type":"turn_cancelled","cause":{"name":"AiSdkModelAdapterError","message":"Model request was cancelled.","code":"model_request_cancelled","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3-Flash","errorPhase":"stream","exceptionKind":"generic","providerId":"bigmodel-api","providerKind":"anthropic","reason":"cancelled","requestId":"279a2a57-68f9-4584-91b3-dda2c4542ceb","retryable":false,"source":"runtime","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","transport":"sse"},"cause":{"name":"Error","message":"v4 session stopped"}}}}"#;
     const SID: &str = "sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719";
 
+    /// 普通会话行（实测形态：tool.call.started）——无终态信号，但算存活心跳
+    const PARENT_SID: &str = "sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2";
+    const SUB_SID: &str = "sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754";
+    const PLAIN_LINE: &str = r#"{"timestamp":"2026-09-28T03:08:52.637Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2","turnId":"turn_1","toolCallId":"call_1","context":{"queryId":"q1","turnNumber":1,"toolName":"Bash"}}"#;
+    /// 子代理行（实测形态）：context.parentSessionId 指向父会话
+    const SUBAGENT_LINE: &str = r#"{"timestamp":"2026-09-28T03:10:00.000Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754","turnId":"turn_1","toolCallId":"call_2","context":{"agentId":"agent_55166edb","agentType":"general-purpose","parentToolCallId":"call_1","parentSessionId":"sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2","toolName":"Bash"}}"#;
+
     fn append(path: &Path, text: &str) {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
@@ -1675,6 +1745,51 @@ mod tests {
         assert_eq!(sig.dedup_key(), None, "无 turnId 不得退化为会话级去重键");
     }
 
+    /// 会话活动解析：普通行也是存活心跳；子代理行带 `parentSessionId` 要向父会话传播
+    #[test]
+    fn log_line_extracts_session_activity_and_parent() {
+        // 普通会话行（无终态信号）：session_id 有、signal 无，但仍是存活心跳
+        let l = parse_log_line(PLAIN_LINE).expect("会话级行必须解析");
+        assert_eq!(l.session_id, PARENT_SID);
+        assert_eq!(l.parent_session_id, None);
+        assert!(l.signal.is_none(), "普通行不是终态信号");
+
+        // 子代理行（实测形态）：parentSessionId 指向父会话
+        let l = parse_log_line(SUBAGENT_LINE).expect("子代理行必须解析");
+        assert_eq!(l.session_id, SUB_SID);
+        assert_eq!(l.parent_session_id.as_deref(), Some(PARENT_SID));
+
+        // 终态行：signal 照旧挂在同一解析产物上（parse_log_signal 走同一内核）
+        let l = parse_log_line(REAL_TURN_FAILED_LINE).unwrap();
+        assert!(matches!(l.signal, Some(LogSignal::Failed { .. })));
+
+        // 无 sessionId 的进程级行（如 memory_sample）不算会话活动
+        assert!(parse_log_line(r#"{"event":"zcode_protocol.process.memory_sample","context":{}}"#).is_none());
+    }
+
+    #[test]
+    fn tail_reports_alive_sessions_including_parent() {
+        let dir = tmpdir();
+        let log = dir.join("zcode-2026-09-28.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let mut tail = AbortLogTail::default();
+        assert!(tail.poll(&dir).alive_sessions.is_empty());
+
+        // 半行不产生活跃（与信号同口径：只认完整行）
+        append(&log, &PLAIN_LINE[..40]);
+        assert!(tail.poll(&dir).alive_sessions.is_empty(), "半行不该算活动");
+
+        // 补齐后：普通行报自身会话；子代理行报自身 + 父会话，重复的父会话去重
+        append(&log, &format!("{}\n{}\n", &PLAIN_LINE[40..], SUBAGENT_LINE));
+        let scan = tail.poll(&dir);
+        assert!(scan.signals.is_empty(), "这两行都不是终态信号");
+        assert_eq!(scan.alive_sessions, vec![PARENT_SID.to_string(), SUB_SID.to_string()]);
+
+        // 同一批行不重复计活（与信号同口径：增量读取）
+        assert!(tail.poll(&dir).alive_sessions.is_empty(), "同一行不该被读第二次");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tail_skips_existing_content_then_reads_appends() {
         let dir = tmpdir();
@@ -1682,21 +1797,21 @@ mod tests {
         // 启动前就存在的中断（陈年旧事）不该被补报
         std::fs::write(&log, format!("{REAL_STOP_LINE}\n")).unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty(), "首见文件应从末尾开始，不补旧信号");
+        assert!(tail.poll(&dir).signals.is_empty(), "首见文件应从末尾开始，不补旧信号");
 
         append(&log, &format!("{REAL_CANCEL_LINE}\n"));
-        let got = tail.poll(&dir);
+        let got = tail.poll(&dir).signals;
         assert_eq!(got.len(), 1, "新增的中断记录要被读到");
         assert_eq!(got[0].session_id(), SID);
-        assert!(tail.poll(&dir).is_empty(), "同一行不该被读第二次");
+        assert!(tail.poll(&dir).signals.is_empty(), "同一行不该被读第二次");
 
         // 一次追加两条（去重由调用方做，这里两条都要返回）
         append(&log, &format!("{REAL_STOP_LINE}\n{REAL_CANCEL_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 2);
+        assert_eq!(tail.poll(&dir).signals.len(), 2);
 
         // 致命失败的 turn.failed：同样要被增量读到
         append(&log, &format!("{REAL_TURN_FAILED_LINE}\n"));
-        let got = tail.poll(&dir);
+        let got = tail.poll(&dir).signals;
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], LogSignal::Failed { .. }), "应读到失败信号");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1708,14 +1823,14 @@ mod tests {
         let log = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&log, "").unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
 
         // 半行（日志边写边刷）：不能当成完整行解析，也不能丢
         let cut = 40;
         append(&log, &REAL_CANCEL_LINE[..cut]);
-        assert!(tail.poll(&dir).is_empty(), "半行不该产生信号");
+        assert!(tail.poll(&dir).signals.is_empty(), "半行不该产生信号");
         append(&log, &format!("{}\n", &REAL_CANCEL_LINE[cut..]));
-        let got = tail.poll(&dir);
+        let got = tail.poll(&dir).signals;
         assert_eq!(got.len(), 1, "补齐后的行必须被解析出来");
         assert_eq!(got[0].session_id(), SID);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1727,18 +1842,18 @@ mod tests {
         let yesterday = dir.join("zcode-2026-09-10.jsonl");
         std::fs::write(&yesterday, format!("{REAL_STOP_LINE}\n")).unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
 
         // 跨天：新文件出现后应切过去，并从它的末尾开始
         let today = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&today, format!("{REAL_CANCEL_LINE}\n")).unwrap();
-        assert!(tail.poll(&dir).is_empty(), "换文件后同样不补旧信号");
+        assert!(tail.poll(&dir).signals.is_empty(), "换文件后同样不补旧信号");
         append(&today, &format!("{REAL_STOP_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 1);
+        assert_eq!(tail.poll(&dir).signals.len(), 1);
 
         // 旧文件继续增长也不该再被读（它已经不是最新那份）
         append(&yesterday, &format!("{REAL_CANCEL_LINE}\n"));
-        assert!(tail.poll(&dir).is_empty(), "只跟随最新日志");
+        assert!(tail.poll(&dir).signals.is_empty(), "只跟随最新日志");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1748,22 +1863,22 @@ mod tests {
         let log = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&log, format!("{REAL_STOP_LINE}\n")).unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
         append(&log, &format!("{REAL_CANCEL_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 1);
+        assert_eq!(tail.poll(&dir).signals.len(), 1);
 
         // 清理/重建导致文件变短：视同换新文件、从当前末尾开始——**不得重放历史**。
         // 历史行里的失败信号去重键互不相同（会话|回合）、30 秒窗口拦不住，
         // 重放会把正在跑的会话批量误杀（假「任务失败」通知 + 误亮失败色 + 摘表）
         std::fs::write(&log, format!("{REAL_STOP_LINE}\n{REAL_CANCEL_LINE}\n")).unwrap();
-        assert!(tail.poll(&dir).is_empty(), "重建后的旧内容属于历史，不得重放");
+        assert!(tail.poll(&dir).signals.is_empty(), "重建后的旧内容属于历史，不得重放");
 
         // 重建之后的新增照常读到（不 panic、不死循环）
         append(&log, &format!("{REAL_TURN_FAILED_LINE}\n"));
-        let got = tail.poll(&dir);
+        let got = tail.poll(&dir).signals;
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], LogSignal::Failed { .. }));
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1915,9 +2030,9 @@ mod tests {
         let log = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&log, format!("{REAL_STOP_LINE}\n")).unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
         append(&log, &format!("{REAL_CANCEL_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 1);
+        assert_eq!(tail.poll(&dir).signals.len(), 1);
         let old_offset = tail.offset;
         assert!(old_offset > 0);
 
@@ -1932,12 +2047,12 @@ mod tests {
         std::fs::write(&log, format!("{filler}{REAL_CANCEL_LINE}\n")).unwrap();
 
         assert!(
-            tail.poll(&dir).is_empty(),
+            tail.poll(&dir).signals.is_empty(),
             "重建后的文件视同新文件、从末尾开始——旧 offset 之后的内容不得被读出信号"
         );
         // 重建后新增的行照常按行读到（行边界对齐，没有半行垃圾拼进来）
         append(&log, &format!("{REAL_TURN_FAILED_LINE}\n"));
-        let got = tail.poll(&dir);
+        let got = tail.poll(&dir).signals;
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], LogSignal::Failed { .. }));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1951,13 +2066,13 @@ mod tests {
         let today = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&today, "").unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
         // 换到新的一天：新文件里已有的历史信号不得补报
         let next = dir.join("zcode-2026-09-12.jsonl");
         std::fs::write(&next, format!("{REAL_TURN_FAILED_LINE}\n{REAL_STOP_LINE}\n")).unwrap();
-        assert!(tail.poll(&dir).is_empty(), "换文件后从末尾开始，不补历史信号");
+        assert!(tail.poll(&dir).signals.is_empty(), "换文件后从末尾开始，不补历史信号");
         append(&next, &format!("{REAL_CANCEL_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 1, "换文件后的新增照常读到");
+        assert_eq!(tail.poll(&dir).signals.len(), 1, "换文件后的新增照常读到");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2152,9 +2267,9 @@ mod tests {
         let log = dir.join("zcode-2026-09-11.jsonl");
         std::fs::write(&log, "").unwrap();
         let mut tail = AbortLogTail::default();
-        assert!(tail.poll(&dir).is_empty());
+        assert!(tail.poll(&dir).signals.is_empty());
         append(&log, &format!("\u{feff}{REAL_CANCEL_LINE}\n"));
-        assert_eq!(tail.poll(&dir).len(), 1, "tail 读到的 BOM 行必须解析出信号");
+        assert_eq!(tail.poll(&dir).signals.len(), 1, "tail 读到的 BOM 行必须解析出信号");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -20,6 +20,12 @@
 //! 这里每秒增量读一次那份日志（按字节偏移，不重读历史；首次启动从末尾开始），
 //! 发现信号就**合成对应的终态事件**塞进事件管道。
 //!
+//! 顺带的第二职责是**存活心跳**：任何带会话 id 的日志行都说明该会话还活着
+//! （子代理行经 `parentSessionId` 向父会话传播），据此刷新状态表的
+//! `last_activity`（[`state::touch_session`]）——长工具 / 长子代理 / 长思考期间
+//! hook 心跳静默是常态（实测 `Agent` 工具单次可跑 27 分钟），没有这层正向信号，
+//! 「心跳静止超时判死」会把还在跑的回合误判成意外终止（红光 + 失败音）。
+//!
 //! 四道保险，避免误报与刷屏：
 //! 1. **只对「我们自己认为还在跑」的会话生效**：正常回合的 `Stop` 已经把会话清掉了，
 //!    所以日志里那些记录不会再触发一次通知；启动时读不到历史（会话表是空的）。
@@ -67,7 +73,14 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
             if !read(&state.config).agent_enabled("zcode") {
                 continue;
             }
-            for sig in tail.poll(&dir) {
+            let scan = tail.poll(&dir);
+            // 存活心跳先行：日志活动 = 会话还活着（子代理行向父会话传播，见
+            // `LogLine::parent_session_id`），刷新 last_activity 防长静默被
+            // 判死巡检误判成意外终止。只刷已有条目、不建档（陈年会话不留痕）。
+            for sid in &scan.alive_sessions {
+                crate::state::touch_session(&state, "zcode", sid);
+            }
+            for sig in scan.signals {
                 // 子代理的致命失败不合成（见模块 doc 第 3 条）；
                 // 中断照常合成：RunAborted 静默，只做会话清场
                 if matches!(&sig, LogSignal::Failed { .. }) && sig.is_subagent() {

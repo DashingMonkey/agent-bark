@@ -113,6 +113,13 @@ pub struct NormalizedEvent {
     /// `ToolFinished` 虽也带工具名，但相位由 kind 决定（一律回落思考中），不读它。
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// 父会话 id（子代理事件声明血缘）：状态机据此把存活心跳**向祖先传播**——
+    /// 子代理干活时父会话自己没有任何事件（实测 DSH `Agent` 工具单次可跑 27 分钟），
+    /// 不传播就会被「心跳静止判死」误杀成意外终止（红光 + 失败音）。
+    /// 与 ZCode 日志存活心跳的 parentSessionId 传播同一套口径（见 state::touch_ancestors）。
+    /// 只有显式声明血缘的 adapter 才填（目前仅 DSH 插件）；hook 型事件恒为 None。
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 impl NormalizedEvent {
@@ -167,6 +174,10 @@ impl NormalizedEvent {
             timestamp: now_millis(),
             is_subagent: detect_subagent(raw),
             tool_name: extract_tool_name(raw),
+            // hook 载荷没有血缘字段：hook 型 agent 的子代理各自成会话，
+            // 父会话存活由各自的 hook 心跳负责；向祖先传播只给显式声明血缘的
+            // adapter（目前仅 DSH 插件直接 POST 的事件带 parent_session_id）
+            parent_session_id: None,
         }
     }
 

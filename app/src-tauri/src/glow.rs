@@ -319,14 +319,29 @@ pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &Normalized
     // 表空的情形由下面的正常推导接管——边缘切完成/失败色时 apply 本身就会触发
     // 同色全屏特效，这里再补就是双闪。
     if desired.is_some() {
-        if let Some(burst) = burst_for_event(ev.kind, running_lost) {
+        if let Some(burst) = burst_for_event(ev.kind, running_lost, ev.is_subagent) {
             burst_only(app, state, burst);
         }
     }
-    let Some(next) = derive(desired, ev.kind, running_lost) else {
+    // 子代理的回合终态不是任务级终态：收光按 `RunAborted` 口径走（表空时直接收起，
+    // 不亮绿/红）。任务级完成色只属于根会话——否则子代理逐个收尾会逐个接管边缘
+    // （DSH 实测：主 agent 等子代理时弹绿色完成特效）。多 agent 并行的思考色不受
+    // 影响：`desired_state`（等待 > 思考）照常汇总**所有**会话，子代理心跳照样驱动。
+    let Some(next) = derive(desired, edge_kind(ev.kind, ev.is_subagent), running_lost) else {
         return;
     };
     apply(app, state, next);
+}
+
+/// 边缘收光用的事件角色（纯函数，便于测试）：子代理的完成/失败映射成
+/// `RunAborted` 语义——不亮完成色也不亮失败色，表空时直接收起。
+/// 其余事件原样返回；`RunAborted` 本身不受影响。
+fn edge_kind(kind: EventKind, is_subagent: bool) -> EventKind {
+    if is_subagent && matches!(kind, EventKind::RunCompleted | EventKind::RunFailed) {
+        EventKind::RunAborted
+    } else {
+        kind
+    }
 }
 
 /// 事件通道补放什么全屏特效（纯函数，§1.3）：`None` = 不补放。
@@ -335,7 +350,16 @@ pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &Normalized
 /// 别的会话被心跳判死（`running_lost`）、判死者是另一会话，RunAborted 也不是判死
 /// 来源。保持简单、与另外两处口径对齐（`derive` 里 RunAborted 先于判死收光、
 /// `sound_key_for` 里手动中止永远不响）：「手动中止不提醒」，音/光优先级必须一致。
-fn burst_for_event(kind: EventKind, running_lost: bool) -> Option<GlowState> {
+///
+/// 子代理（`is_subagent`）的完成/失败**同样不 burst**：这是通知与音效早有的
+/// `is_subagent` 门在特效通道的同款补齐——一个任务拆出十几个子代理，逐个收尾
+/// 会逐个放绿屏/红屏（DSH 实测「主 agent 等待时弹绿色完成特效」即此）。
+/// 例外是 `running_lost`（心跳判死）：它是一次合并后的**会话级**意外终止，
+/// 与子代理自己的终态无关，照常补放失败色。
+fn burst_for_event(kind: EventKind, running_lost: bool, is_subagent: bool) -> Option<GlowState> {
+    if is_subagent && !running_lost {
+        return None;
+    }
     match kind {
         EventKind::RunCompleted => Some(GlowState::Completed),
         EventKind::RunFailed => Some(GlowState::Failed),
@@ -1729,18 +1753,41 @@ mod tests {
     /// （running_lost=true、判死者是另一会话）——手动中止不提醒，音/光优先级必须一致
     #[test]
     fn abort_never_bursts_even_with_running_lost() {
-        assert_eq!(burst_for_event(EventKind::RunAborted, false), None);
-        assert_eq!(burst_for_event(EventKind::RunAborted, true), None, "判死者是另一会话也不 burst");
+        assert_eq!(burst_for_event(EventKind::RunAborted, false, false), None);
+        assert_eq!(burst_for_event(EventKind::RunAborted, true, false), None, "判死者是另一会话也不 burst");
         // 普通终态按事件角色补放
-        assert_eq!(burst_for_event(EventKind::RunCompleted, false), Some(GlowState::Completed));
-        assert_eq!(burst_for_event(EventKind::RunFailed, false), Some(GlowState::Failed));
+        assert_eq!(burst_for_event(EventKind::RunCompleted, false, false), Some(GlowState::Completed));
+        assert_eq!(burst_for_event(EventKind::RunFailed, false, false), Some(GlowState::Failed));
         // 任意事件捎带的心跳判死 = 意外终止 → 失败色（与音效 "failed" 同口径）
-        assert_eq!(burst_for_event(EventKind::Activity, true), Some(GlowState::Failed));
-        assert_eq!(burst_for_event(EventKind::SessionStart, true), Some(GlowState::Failed));
-        assert_eq!(burst_for_event(EventKind::ToolFinished, true), Some(GlowState::Failed));
+        assert_eq!(burst_for_event(EventKind::Activity, true, false), Some(GlowState::Failed));
+        assert_eq!(burst_for_event(EventKind::SessionStart, true, false), Some(GlowState::Failed));
+        assert_eq!(burst_for_event(EventKind::ToolFinished, true, false), Some(GlowState::Failed));
         // 中性事件、不带判死：不补放
-        assert_eq!(burst_for_event(EventKind::Activity, false), None);
-        assert_eq!(burst_for_event(EventKind::SessionStart, false), None);
+        assert_eq!(burst_for_event(EventKind::Activity, false, false), None);
+        assert_eq!(burst_for_event(EventKind::SessionStart, false, false), None);
+    }
+
+    /// 子代理终态是**任务内事件**，不是任务级终态：不补放全屏、不接管边缘
+    /// （通知与音效早有 is_subagent 门，这里是特效通道的同款补齐）。
+    /// 心跳判死（running_lost）例外——那是会话级意外终止，照常补放失败色。
+    #[test]
+    fn subagent_terminals_never_burst_or_take_over_edge() {
+        assert_eq!(burst_for_event(EventKind::RunCompleted, false, true), None, "子代理完成不绿屏");
+        assert_eq!(burst_for_event(EventKind::RunFailed, false, true), None, "子代理失败不红屏");
+        assert_eq!(burst_for_event(EventKind::Activity, true, true), Some(GlowState::Failed), "判死照常补放");
+
+        // 收光口径：子代理终态映射成 RunAborted 语义——表空时直接收起（不绿不红）
+        assert_eq!(edge_kind(EventKind::RunCompleted, true), EventKind::RunAborted);
+        assert_eq!(edge_kind(EventKind::RunFailed, true), EventKind::RunAborted);
+        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, true), false), Some(GlowState::Idle));
+        // 根会话终态不映射：完成色照常
+        assert_eq!(edge_kind(EventKind::RunCompleted, false), EventKind::RunCompleted);
+        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, false), false), Some(GlowState::Completed));
+        // 有活跃会话时边缘照常表达它们（desired 优先），子代理终态改不动
+        assert_eq!(
+            derive(Some(GlowState::Running), edge_kind(EventKind::RunCompleted, true), false),
+            Some(GlowState::Running)
+        );
     }
 
     /// §2.2 回归：同态早退不得绕过禁用复位（glow 关闭时点预览 + 真实心跳同态 →
