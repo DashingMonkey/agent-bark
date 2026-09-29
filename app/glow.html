@@ -621,11 +621,18 @@
       */
       #burst[data-effect="scan"] .burst-pulse,
       #burst[data-effect="scan"] .burst-haze,
-      #burst[data-effect="scan"] .burst-wash {
+      #burst[data-effect="scan"] .burst-wash,
+      #burst[data-effect="rain"] .burst-pulse,
+      #burst[data-effect="rain"] .burst-haze,
+      #burst[data-effect="rain"] .burst-wash {
         display: none;
       }
 
       #burst:not([data-effect="scan"]) .scan {
+        display: none;
+      }
+
+      #burst:not([data-effect="rain"]) .burst-rain {
         display: none;
       }
 
@@ -809,14 +816,16 @@
 
         扫描（scan）不需要它：尾迹坡够陡（~1.7px 一级台阶），量化细到看不见，
         颗粒只会脏了 HUD 亮线；扫描又没有包络（容器恒亮），留着会变成一块
-        不散的灰幕。显隐规则跟自己的层放一起，不再去分派清单里排一行。
+        不散的灰幕。矩阵雨同理：字形是锐利的 canvas 文字，噪点只会脏它。
+        显隐规则跟自己的层放一起，不再去分派清单里排一行。
       */
       .burst-grain {
         position: absolute;
         inset: 0;
       }
 
-      #burst[data-effect="scan"] .burst-grain {
+      #burst[data-effect="scan"] .burst-grain,
+      #burst[data-effect="rain"] .burst-grain {
         display: none;
       }
 
@@ -883,11 +892,37 @@
         }
       }
 
+      /* ==================== 全屏特效（矩阵雨） ==================== */
+
+      /*
+        移植自 doc/glitch-designs.html 的 06「矩阵数据雨」（canvas 引擎，播放
+        逻辑在 src/glow.ts 的 playRain）：片假名 + 十六进制字符雨铺满全屏，
+        白炽雨头拖状态色尾迹下坠。一次性播放：只在触发时跑 RAF，跑完
+        cancelAnimationFrame + 清屏，平时零帧开销。
+
+        与雾散相反，这组**没有容器包络**（同 scan 的理由）：开场逐列级联进场、
+        收尾逐列落底离场，全由 canvas 自己编排（见 glow.ts 的 playRain），
+        容器恒亮。
+      */
+
+      /* 画布铺满 #burst；物理像素尺寸与 dpr 变换由 playRain 在播放时设置 */
+      #burst[data-effect="rain"] .burst-rain {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      #burst[data-effect="rain"].on {
+        opacity: 1;
+      }
+
     </style>
   </head>
   <body>
     <div id="glow" data-state="idle" data-effect="breathing" data-edge="on" data-sides="all">
-      <!-- 全屏特效：每次颜色亮起补放一次（类型标记在 data-effect：fog=雾散 / scan=HUD 扫描） -->
+      <!-- 全屏特效：每次颜色亮起补放一次（类型标记在 data-effect：fog=雾散 / scan=HUD 扫描 / rain=矩阵雨） -->
       <div class="burst" id="burst" data-effect="fog">
         <i class="burst-pulse"></i>
         <i class="burst-haze"></i>
@@ -896,6 +931,8 @@
         <i class="burst-grain grain"></i>
         <!-- HUD 扫描：只有一条从上到下的亮线（移植自 doc/glow-burst-cool-designs.html 的 09） -->
         <i class="scan"></i>
+        <!-- 矩阵雨：canvas 引擎（移植自 doc/glitch-designs.html 的 06，播放逻辑在 src/glow.ts） -->
+        <canvas class="burst-rain"></canvas>
       </div>
       <!-- 灯效一：呼吸（静态暗晕垫底，颜色坡整层呼吸，只动 opacity） -->
       <div class="breathe">

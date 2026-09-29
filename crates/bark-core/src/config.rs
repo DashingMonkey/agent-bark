@@ -237,7 +237,7 @@ pub enum MonitorTarget {
 }
 
 /// 四态 × 效果类型（「通知」页每状态一行，与「声音」区同款排法）。
-/// 值域：边缘 `"none" | "breathing" | "comet"`，全屏 `"none" | "fog" | "scan"`；
+/// 值域：边缘 `"none" | "breathing" | "comet"`，全屏 `"none" | "fog" | "scan" | "rain"`；
 /// `""` = 未设置，只存在于迁移前的旧配置（[`GlowConfig::sanitize`] 按旧全局类型补齐）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -273,7 +273,7 @@ impl StateEffects {
 ///
 /// 运行时在屏幕最外圈覆盖一层透明、点击穿透的窗口，用颜色表达 agent 的实时状态
 /// （思考色=运行中、等待色=等你确认、完成色=完成、失败色=意外终止）；打开 `fullscreen` 后，
-/// 每次颜色亮起还会在整块屏幕上补一次全屏特效（「雾散」/「HUD 扫描」；
+/// 每次颜色亮起还会在整块屏幕上补一次全屏特效（「雾散」/「HUD 扫描」/「矩阵雨」；
 /// 全屏色可能与边缘色不同，见 glow.rs）。
 ///
 /// **边缘 / 全屏的类型按状态各选各的**（`edge_effects` / `burst_effects`，
@@ -311,7 +311,7 @@ pub struct GlowConfig {
     pub monitors: String,
     /// 各状态的边缘光效（"none"=该状态不亮边缘 / "breathing" / "comet"）
     pub edge_effects: StateEffects,
-    /// 各状态的全屏特效（"none"=该状态不放全屏 / "fog" / "scan"）
+    /// 各状态的全屏特效（"none"=该状态不放全屏 / "fog" / "scan" / "rain"）
     pub burst_effects: StateEffects,
 }
 
@@ -323,10 +323,12 @@ impl Default for GlowConfig {
             // 顶部条带是默认体验：整屏覆盖窗容易被判成全屏（见 edge_position 的文档）。
             // 老配置没有这个键，serde 补的也是它——升级后默认变顶部，切「四周」回旧行为
             edge_position: "top".to_string(),
-            effect: GlowEffect::Breathing.id().to_string(),
+            // 默认流光：边缘一圈常亮细线 + 高光绕圈，比呼吸更容易看出「在动 = 在干活」
+            effect: GlowEffect::Comet.id().to_string(),
             // 全屏特效默认开：它是这一版的主角，用户进「屏幕光效」页第一眼就能看到
             fullscreen: true,
-            fullscreen_effect: "fog".to_string(),
+            // 默认扫描：比雾散轻量，多次触发不糊屏
+            fullscreen_effect: "scan".to_string(),
             monitors: "primary".to_string(),
             // 每状态段必须留空（= 未迁移）：Default 同时是「配置里缺新键」的填充值，
             // 若这里写死呼吸/雾散，老配置里的 comet/scan 就永远迁移不过来
@@ -367,42 +369,45 @@ impl GlowConfig {
         }
     }
 
-    /// 边缘光效类型（未知值回落到呼吸）
+    /// 边缘光效类型（未知值回落到流光，与软件默认一致）
     pub fn effect_kind(&self) -> GlowEffect {
         match self.effect.trim().to_ascii_lowercase().as_str() {
-            "comet" => GlowEffect::Comet,
-            _ => GlowEffect::Breathing,
+            "breathing" => GlowEffect::Breathing,
+            _ => GlowEffect::Comet,
         }
     }
 
-    /// 全屏特效类型 id（未知值回落到雾散）。
+    /// 全屏特效类型 id（未知值回落到扫描，与软件默认一致）。
     ///
-    /// 目前有 "fog"（雾散）/ "scan"（HUD 扫描）两种；设置页的类型下拉、payload
-    /// 与覆盖层的 `data-effect`（#burst 元素）都按这个口径走，加类型在这里补分支。
+    /// 目前有 "fog"（雾散）/ "scan"（HUD 扫描）/ "rain"（矩阵雨）三种；设置页的
+    /// 类型下拉、payload 与覆盖层的 `data-effect`（#burst 元素）都按这个口径走，
+    /// 加类型在这里补分支。
     pub fn fullscreen_effect_kind(&self) -> &'static str {
         match self.fullscreen_effect.trim().to_ascii_lowercase().as_str() {
-            "scan" => "scan",
-            _ => "fog",
+            "fog" => "fog",
+            "rain" => "rain",
+            _ => "scan",
         }
     }
 
     /// 某状态的边缘光效。None = 「无」（该状态不亮边缘灯带）。
-    /// 读 [`sanitize`](Self::sanitize) 后的值；对未归一的空值按呼吸兜底，绝不 panic。
+    /// 读 [`sanitize`](Self::sanitize) 后的值；对未归一的空值按流光兜底，绝不 panic。
     pub fn edge_effect_for(&self, state: &str) -> Option<GlowEffect> {
         match self.edge_effects.get(state).trim().to_ascii_lowercase().as_str() {
             "none" => None,
-            "comet" => Some(GlowEffect::Comet),
-            _ => Some(GlowEffect::Breathing),
+            "breathing" => Some(GlowEffect::Breathing),
+            _ => Some(GlowEffect::Comet),
         }
     }
 
-    /// 某状态的全屏特效 id（"fog" / "scan"，前端 #burst 的 data-effect）。
-    /// None = 「无」（该状态不放全屏特效）。
+    /// 某状态的全屏特效 id（"fog" / "scan" / "rain"，前端 #burst 的 data-effect）。
+    /// None = 「无」（该状态不放全屏特效）；未知 / 空值按扫描兜底（与软件默认一致）。
     pub fn burst_effect_for(&self, state: &str) -> Option<&'static str> {
         match self.burst_effects.get(state).trim().to_ascii_lowercase().as_str() {
             "none" => None,
-            "scan" => Some("scan"),
-            _ => Some("fog"),
+            "fog" => Some("fog"),
+            "rain" => Some("rain"),
+            _ => Some("scan"),
         }
     }
 
@@ -439,6 +444,7 @@ fn canon_burst_effect(id: &str) -> Option<&'static str> {
         "none" => Some("none"),
         "fog" => Some("fog"),
         "scan" => Some("scan"),
+        "rain" => Some("rain"),
         _ => None,
     }
 }
@@ -826,9 +832,9 @@ system = false
         assert_eq!(cfg.glow.edge_position, "top");
         assert_eq!(cfg.glow.edge_sides(), "top");
         assert_eq!(cfg.glow.monitors, "primary");
-        assert_eq!(cfg.glow.effect_kind(), GlowEffect::Breathing);
+        assert_eq!(cfg.glow.effect_kind(), GlowEffect::Comet);
         assert!(cfg.glow.fullscreen, "全屏特效默认开");
-        assert_eq!(cfg.glow.fullscreen_effect_kind(), "fog");
+        assert_eq!(cfg.glow.fullscreen_effect_kind(), "scan");
         // 部分字段缺失时按默认补齐
         let cfg: BarkConfig = serde_json::from_str(r#"{"glow":{"enabled":false,"edge":false}}"#).unwrap();
         assert!(!cfg.glow.enabled);
@@ -884,26 +890,27 @@ system = false
     }
 
     #[test]
-    fn glow_effect_unknown_falls_back_to_breathing() {
+    fn glow_effect_unknown_falls_back_to_comet() {
         let e = |s: &str| GlowConfig { effect: s.to_string(), ..Default::default() }.effect_kind();
         assert_eq!(e("breathing"), GlowEffect::Breathing);
         assert_eq!(e("COMET"), GlowEffect::Comet);
-        // 手改出没实现的名字：回落呼吸，不能让覆盖层拿到未知 data-effect 后什么都不画
-        assert_eq!(e("rainbow"), GlowEffect::Breathing);
-        assert_eq!(GlowConfig { effect: "  ".into(), ..Default::default() }.sanitize().effect, "breathing");
-        assert_eq!(GlowConfig { effect: "Comet".into(), ..Default::default() }.sanitize().effect, "comet");
+        // 手改出没实现的名字：回落流光（默认），不能让覆盖层拿到未知 data-effect 后什么都不画
+        assert_eq!(e("rainbow"), GlowEffect::Comet);
+        assert_eq!(GlowConfig { effect: "  ".into(), ..Default::default() }.sanitize().effect, "comet");
+        assert_eq!(GlowConfig { effect: "Breathing".into(), ..Default::default() }.sanitize().effect, "breathing");
     }
 
     #[test]
-    fn glow_fullscreen_effect_unknown_falls_back_to_fog() {
+    fn glow_fullscreen_effect_unknown_falls_back_to_scan() {
         let f = |s: &str| GlowConfig { fullscreen_effect: s.to_string(), ..Default::default() }.fullscreen_effect_kind();
         assert_eq!(f("fog"), "fog");
         assert_eq!(f(" FOG "), "fog");
         assert_eq!(f("scan"), "scan");
         assert_eq!(f("Scan"), "scan");
-        // 手改出没实现的类型：回落雾散，不能让覆盖层拿到未知的 data-effect 后什么都不画
-        assert_eq!(f("rain"), "fog");
-        assert_eq!(GlowConfig { fullscreen_effect: "  ".into(), ..Default::default() }.sanitize().fullscreen_effect, "fog");
+        assert_eq!(f(" rain "), "rain");
+        // 手改出没实现的类型：回落扫描（默认），不能让覆盖层拿到未知的 data-effect 后什么都不画
+        assert_eq!(f("matrix"), "scan");
+        assert_eq!(GlowConfig { fullscreen_effect: "  ".into(), ..Default::default() }.sanitize().fullscreen_effect, "scan");
     }
 
     #[test]
@@ -916,11 +923,11 @@ system = false
             assert_eq!(g.edge_effects.get(s), "comet", "{s} 按旧全局迁移");
             assert_eq!(g.burst_effects.get(s), "scan", "{s} 按旧全局迁移");
         }
-        // 什么都没写的老配置：按老默认（呼吸 / 雾散）补齐
+        // 什么都没写的配置：按软件默认（流光 / 扫描）补齐
         let cfg: BarkConfig = serde_json::from_str(r#"{}"#).unwrap();
         let g = cfg.glow.sanitize();
-        assert_eq!(g.edge_effects.get("thinking"), "breathing");
-        assert_eq!(g.burst_effects.get("completed"), "fog");
+        assert_eq!(g.edge_effects.get("thinking"), "comet");
+        assert_eq!(g.burst_effects.get("completed"), "scan");
     }
 
     #[test]
@@ -930,7 +937,7 @@ system = false
                 "effect":"comet",
                 "edge_effects":{"thinking":"none","waiting":"breathing","completed":"","failed":"rainbow"},
                 "fullscreen_effect":"scan",
-                "burst_effects":{"thinking":"none","waiting":"","completed":"fog","failed":"rain"}
+                "burst_effects":{"thinking":"none","waiting":"","completed":"fog","failed":"matrix"}
             }}"#,
         )
         .unwrap();
@@ -955,10 +962,10 @@ system = false
         .sanitize();
         assert!(g.edge_effect_for("thinking").is_none(), "「无」= 不亮边缘");
         assert_eq!(g.edge_effect_for("waiting"), Some(GlowEffect::Comet));
-        assert_eq!(g.edge_effect_for("completed"), Some(GlowEffect::Breathing));
+        assert_eq!(g.edge_effect_for("completed"), Some(GlowEffect::Comet), "空 = 未设置 → 按默认流光兜底");
         assert!(g.burst_effect_for("completed").is_none(), "「无」= 不放全屏");
         assert_eq!(g.burst_effect_for("failed"), Some("scan"));
-        assert_eq!(g.burst_effect_for("thinking"), Some("fog"));
+        assert_eq!(g.burst_effect_for("thinking"), Some("scan"), "空 = 未设置 → 按默认扫描兜底");
     }
 
     #[test]

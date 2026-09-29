@@ -1451,8 +1451,8 @@ fn rect_of(m: &Monitor, top_only: bool) -> (f64, f64, f64, f64) {
 /// 不为它让窗口越过显示器底边。
 fn burst_rect_of(m: &Monitor, effect: &str) -> (f64, f64, f64, f64) {
     match effect {
-        // 雾散 / 扫描：当前同一种形态。某类型要专属区域时单独成臂
-        "fog" | "scan" => rect_top_inset(m),
+        // 雾散 / 扫描 / 矩阵雨：当前同一种形态。某类型要专属区域时单独成臂
+        "fog" | "scan" | "rain" => rect_top_inset(m),
         // 未识别 / 未来新增的类型：先按当前标准形态兜底
         _ => rect_top_inset(m),
     }
@@ -1524,12 +1524,12 @@ mod tests {
     #[test]
     fn payload_carries_sanitized_config() {
         let cfg =
-            GlowConfig { effect: "  ".into(), fullscreen_effect: "rain".into(), edge: false, ..Default::default() }
+            GlowConfig { effect: "  ".into(), fullscreen_effect: "matrix".into(), edge: false, ..Default::default() }
                 .sanitize();
         let p = payload(&cfg, GlowState::Running);
-        // 类型归一：未知值回默认，覆盖层永远拿得到认识的 id
-        assert_eq!(p.effect, "breathing");
-        assert_eq!(p.fullscreen_effect, "fog");
+        // 类型归一：未知值回默认（流光 / 扫描），覆盖层永远拿得到认识的 id
+        assert_eq!(p.effect, "comet");
+        assert_eq!(p.fullscreen_effect, "scan");
         // 边缘开关独立进 payload；全屏默认开
         assert!(!p.edge);
         assert!(p.fullscreen);
@@ -1689,11 +1689,11 @@ mod tests {
             ..Default::default()
         }
         .sanitize();
-        // 思考行边缘选「无」→ 灯带不亮；全屏按思考行走默认雾散
+        // 思考行边缘选「无」→ 灯带不亮；全屏按思考行走默认扫描
         let p = payload(&cfg, GlowState::Running);
         assert!(!p.edge);
         assert!(p.fullscreen);
-        assert_eq!(p.fullscreen_effect, "fog");
+        assert_eq!(p.fullscreen_effect, "scan");
         // 完成：边缘流光 + 全屏扫描（触发角色 = 完成）
         let p = payload(&cfg, GlowState::Completed);
         assert!(p.edge);

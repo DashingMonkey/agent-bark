@@ -183,8 +183,8 @@ function normalizeSoundEffects(cfg: BarkConfig) {
 function normalizeGlowEffects(cfg: BarkConfig) {
   const edgeKnown = new Set(EDGE_EFFECTS.map((e) => e.id));
   const burstKnown = new Set(BURST_EFFECTS.map((e) => e.id));
-  cfg.glow.edge_effects = normalizeStateEffects(cfg.glow.edge_effects, edgeKnown, "breathing");
-  cfg.glow.burst_effects = normalizeStateEffects(cfg.glow.burst_effects, burstKnown, "fog");
+  cfg.glow.edge_effects = normalizeStateEffects(cfg.glow.edge_effects, edgeKnown, "comet");
+  cfg.glow.burst_effects = normalizeStateEffects(cfg.glow.burst_effects, burstKnown, "scan");
 }
 
 function normalizeStateEffects(map: StateEffects | undefined, known: Set<string>, fallback: string): StateEffects {

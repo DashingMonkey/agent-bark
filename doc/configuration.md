@@ -48,9 +48,9 @@
     "monitors": "all",            // all=全部显示器 / 数字=第 N 块屏（UI 的「1.显示器1(1920*1080)」）
     // 边缘 / 全屏的类型按状态各选各的（GUI「屏幕光效」两列四行，与「声音」区同款）：
     //   edge_effects  ：none=不亮 / breathing=呼吸 / comet=流光
-    //   burst_effects ：none=不放 / fog=雾散 / scan=扫描
-    "edge_effects":  { "thinking": "breathing", "waiting": "breathing", "completed": "breathing", "failed": "breathing" },
-    "burst_effects": { "thinking": "fog",       "waiting": "fog",       "completed": "fog",       "failed": "fog" }
+    //   burst_effects ：none=不放 / fog=雾散 / scan=扫描 / rain=矩阵雨
+    "edge_effects":  { "thinking": "comet",     "waiting": "comet",     "completed": "comet",     "failed": "comet" },
+    "burst_effects": { "thinking": "scan",      "waiting": "scan",      "completed": "scan",      "failed": "scan" }
   },
   "widget": {
     "enabled": true,              // 悬浮窗总开关（关闭后不创建窗口；GUI「悬浮窗」页 / 右键菜单改）
@@ -97,8 +97,8 @@
 
 | 优先级 | 条件 | 角色 |
 | --- | --- | --- |
-| 1 | 任一会话 `等待确认 / 等待输入` | 🟠 **等待色**（呼吸） |
-| 2 | 任一会话 `思考中 / 执行工具` | 🔵 **思考色**（呼吸） |
+| 1 | 任一会话 `等待确认 / 等待输入` | 🟠 **等待色**（流光） |
+| 2 | 任一会话 `思考中 / 执行工具` | 🔵 **思考色**（流光） |
 | 3 | 无活跃会话，且最近事件为 `run_completed` | 🟢 **完成色**（停留后淡出） |
 | 3 | 无活跃会话，且最近事件为 `run_failed`，或运行中会话心跳静止超 10 分钟被判死 | 🔴 **失败色**（心跳双脉冲，停留后淡出） |
 | 3 | 无活跃会话，且最近事件为 `run_aborted`（用户主动中止） | ⚫ 收起（不亮） |
@@ -110,8 +110,8 @@
 
 > 配色（`#rrggbb`）与角色名的对应只写在 `app/src-tauri/src/glow.rs` 的
 > `GlowState::color` 一处，并有配套的锁配色测试；改色不需要动本文档。
-> 边缘的具体表现按**状态**各选各的（`glow.edge_effects`：「无」/「呼吸」/「流光」），
-> 全屏同理（`glow.burst_effects`：「无」/「雾散」/「扫描」），选「无」时对应通道不亮；
+> 边缘的具体表现按**状态**各选各的（`glow.edge_effects`：「无」/「流光」/「呼吸」，默认流光），
+> 全屏同理（`glow.burst_effects`：「无」/「扫描」/「雾散」/「矩阵雨」，默认扫描），选「无」时对应通道不亮；
 > 打开 `glow.fullscreen` 且触发角色那行没选「无」时，每次颜色亮起（状态真的变化、
 > 终态重发，或多会话并行时的完成 / 失败事件）会在整屏补放一次，渐显渐隐；
 > 同一状态的重复心跳不会重放。
@@ -133,7 +133,7 @@
 > 上一次的预览态当成真实状态，灯就再也灭不掉。
 
 > 只有所有会话都结束后，**边缘**才会转完成 / 失败色——A 完成了但 B 还在跑时，边缘报完成
-> 是骗人；但全屏特效不等：A 完成的瞬间就会补放一次完成色雾散。「心跳静止超时判死」覆盖的是
+> 是骗人；但全屏特效不等：A 完成的瞬间就会补放一次完成色扫描。「心跳静止超时判死」覆盖的是
 > agent 进程被直接杀掉的场景（那种情况下不会有 Stop 事件）；判死由后台每 30s 巡检触发，
 > 可以用 `BARK_STALE_AFTER_MS` 调时长（见下）。
 >

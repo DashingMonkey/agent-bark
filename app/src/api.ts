@@ -169,7 +169,7 @@ export interface GlowConfig {
   monitors: string;
   /** 各状态的边缘光效（"none"=无 / "breathing" / "comet"） */
   edge_effects: StateEffects;
-  /** 各状态的全屏特效（"none"=无 / "fog" / "scan"） */
+  /** 各状态的全屏特效（"none"=无 / "fog" / "scan" / "rain"） */
   burst_effects: StateEffects;
 }
 
@@ -230,18 +230,19 @@ export const SOUND_EFFECTS: { id: string; label: string }[] = [
   { id: "deep", label: "低叮" },
 ];
 
-/** 「屏幕光效」每状态「边缘光效 → 类型」下拉的选项（对应后端 canon_edge_effect） */
+/** 「屏幕光效」每状态「边缘光效 → 类型」下拉的选项（对应后端 canon_edge_effect；默认项紧跟「无」） */
 export const EDGE_EFFECTS: { id: string; label: string }[] = [
   { id: "none", label: "无" },
-  { id: "breathing", label: "呼吸" },
   { id: "comet", label: "流光" },
+  { id: "breathing", label: "呼吸" },
 ];
 
-/** 「屏幕光效」每状态「全屏特效 → 类型」下拉的选项（对应后端 canon_burst_effect） */
+/** 「屏幕光效」每状态「全屏特效 → 类型」下拉的选项（对应后端 canon_burst_effect；默认项紧跟「无」） */
 export const BURST_EFFECTS: { id: string; label: string }[] = [
   { id: "none", label: "无" },
-  { id: "fog", label: "雾散" },
   { id: "scan", label: "扫描" },
+  { id: "fog", label: "雾散" },
+  { id: "rain", label: "矩阵雨" },
 ];
 
 export interface BarkConfig {
