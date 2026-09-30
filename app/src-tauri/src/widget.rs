@@ -12,7 +12,7 @@
 //! `pinned` 存「固定位置」（固定后前端不响应拖动，右键菜单里切换）。
 //!
 //! 自动隐藏（`widget.auto_hide`）：隐藏/弹出是**前端可见性状态机**的事
-//! （widget.ts 的 `evaluateVisibility`，安静 2 秒后 hide、有关注行立即 show），
+//! （widget.ts 的 `evaluateVisibility`，安静去抖后 hide、有关注行立即 show），
 //! Rust 侧只做两件事：auto_hide 开着时**建窗即隐藏**（登录不闪一下卡片），
 //! 以及配置热更新时把 `bark://widget-config` 推给已存在的窗口（不重建）。
 

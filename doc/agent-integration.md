@@ -282,16 +282,40 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 **事件映射**（插件内部归一化后直接 POST `/event`，不经过 hook 子命令）：
 
-| DSH 事件 | 模式 | → 统一事件 | 正文 |
+| DSH 事件 | 模式 | → 统一事件 | 正文 / 说明 |
 | --- | --- | --- | --- |
-| `agent/turn-stopping` | serial（无 `next()`） | `run_completed` | 会话日志里最后一条 `assistant/message` 的 text 块；取不到退「回合 N 结束」 |
-| `agent/status` running | emit | `activity` | **含子代理**（带 `is_subagent` + `parent_session_id` 血缘），喂「运行中会话」与流光 |
-| `agent/status` running→idle | emit | 兜底终态 | 本回合没被 `turn-stopping` 报过才发；按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮失败色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底） |
-| `agent/error` | emit | `run_failed` | `payload.error`（DSH 声明为 `unknown`）：字符串直用、对象取 `message`、否则截断 JSON |
+| `session/event` 的 `turn/start` | emit | `activity`（**唯一建档点**） | 不带 `keepalive`，daemon 允许据此新建「运行中」条目；同时启动回合内的周期保活 |
+| `session/event` 的 `tool/call` | emit | `activity` | 带 `tool_name`，面板显示「执行工具」；**含子代理**（带 `is_subagent` + `parent_session_id` 血缘）；只在回合开着时发 |
+| `session/event` 的 `turn/end` | emit | （记原因，不直接发终态） | 记下 `reason.kind` 与回合号、停掉保活；agent 已知静止时排一次收尾 |
+| `session/event` 其余事件 | emit | `tool_finished` + `keepalive: true`（节流保活） | `user/*`、`approval/*`、提问审计除外；**只在回合开着时**发（回合外的 title / end-seed / compaction / command / model-selection… 一律不上报——它们正是「没有会话在跑却挂着思考中」的来源） |
+| `agent/status` running | emit | 只登记（**不建档**） | 唤醒但没回合（消息被清空 / 回执唤醒）、开屏预创建的空会话都会走 running，建档交给 `turn/start` |
+| `agent/status` running→idle | emit | 终态（**静止边沿**） | 经 `reportAtRest` 报一次：按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮失败色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底），按**回合号**去重 |
+| `agent/turn-stopping` | serial（无 `next()`） | 只记回合号提示 | **不再当终态**：官方原文 *"runs before an otherwise completed turn closes and can steer to keep it open"*，按它报完成会在运行还没结束时谎报并吞掉真终态（社区事故 agent-presence#83） |
+| `agent/error` | emit | 只记正文 | 请求级错误 DSH 会重试；真正的失败落在 `turn/end` 的 `reason=error`。没有 reason 却又出过错时，收尾按失败报（不谎报完成） |
 | `approval/request` | waterfall | `permission_required` | `toolName：reason`；观察完必须 `next()` |
 | `user-questions/request` | waterfall | `input_required` | 首个问题的 `header：question`；同样必须 `next()` |
-| `session/event` 的 `tool/call` | emit | `activity` | 带 `tool_name`，面板显示「执行工具」；**含子代理**（同上带血缘） |
-| `session/event` 其余事件 | emit | `tool_finished`（节流保活） | `user/*`、`approval/*`、提问审计除外；长思考/长子代理的静默窗口靠它续命 |
+| `agent/disposed` | emit | `run_aborted` | 会话被关闭时把 daemon 的条目收掉（否则要挂到 10 分钟判死才消失），随后清记忆表 |
+
+**回合状态怎么判（2026-09-30 重写，这是本节的核心）**：
+
+插件**不猜**「最近有没有事件」，而是按 DSH 官方契约分层取信号（`busyOf`）：
+
+1. **官方回合投影**（首选）：`ctx.sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq !== null`
+   ⇔ 已写 `turn/start`、还没写 `turn/end`（纯日志派生）。DSH 自己在
+   `dsh-agent-instructions` / `dsh-agent-preset-registry` / `dsh-hooks-codex` 里用的就是这个
+   判定式；插件开发规范（DSH 自带 `cordis-plugin-development` 技能的 `references/practices.md`）
+   要求「session log 是唯一真源」「每会话状态用 `sessionProjections` 从日志派生」。
+   服务读不到（老版本 DSH）时返回 `undefined`，自动降级到下一层，绝不因此静默失效；
+2. **本进程日志推理**：插件自己按 `turn/start` 开、`turn/end` 关维护的开关；
+3. **最老版本兜底**：`agent/status` running 或「见过回合级事件」（`seenActivity`）。
+
+⚠️ **为什么不能用「事件静默时长」推断**：父会话等子代理、等审批、等用户回答时**回合开着却
+可能十几分钟零事件**（官方口径：*a turn waiting for an approval or an answer included*）。
+长静默靠**周期保活心跳**（20s，带 `keepalive: true`）兜底，而不是靠判「它不动了」。
+
+⚠️ **为什么不能靠 `agent/status` 当状态源**：它是**边沿通知**（官方目录：*`idle` means no
+driver remains scheduled or active*，实现里只在状态跳变时 emit），官方规范明确写
+*"Do not poll `agent/status`"*；而且它会在「唤醒后没有回合」时也翻到 running。
 
 **子代理语义**（2026-09-28，参考社区插件 dingyi222666/dsh-session-notification 的
 heldCompletions 与 dsh-notifier 的订阅修法）：
@@ -316,17 +340,79 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 - `name` 写绝对路径即可，DSH 加载 insert 条目时会经 `pathToFileURL` 转 file:// URL，Windows 盘符路径不需要自己转；
 - **改完 patch 必须重启 dsh**（2026-09-10 在 `dsh web` + 0.1.5-rc.1 实测）：往 `$DSH_HOME/cordis.patch.yml` 追加 insert 条目后 20 秒内插件不会被挂载，即使 profile 的 `patchReload` 是 `live`（HMR 只重新加载已挂载的条目）；社区通知插件文档同样写「重启 dsh 生效」。所以 UI 提示写的是「需要重启」，别信「即时生效」；
 - 字段实测（0.1.5-rc.1）：sessionId 取 `agent.id`；**cwd 取 `agent.session.header.cwd`**（`session.cwd` 不存在——早期版本取它，导致通知正文没有项目名、只剩一句 `turn N`；`Agent` 上也没有 `cwd` 字段）；最后一条 assistant 文本取 `assistant/message` 的 `data.message.content` 里的 text 块（`Session` 没有 `events` 字段，只有 `eventAt()` / `snapshotEvents()` / `ownEvents()`，`seq` 是「下一个可写偏移」即有效下标 `0..seq-1`）；子代理用 `session.header.origin === 'subagent'` **或** `header.delegationDepth > 0` 判定（DSH 权威口径是 `delegationDepthOf(agent) = max(header.delegationDepth, agent.options.subagentDepth)`——运行时深度「只能加深不能降低」，只读 header 在冷 resume / 策略覆盖时可能偏低）；
-- 选型参照社区插件（dsh-plugin-notify / dsh-notify / dsh-notification）：只挂 `agent/turn-stopping` 会漏掉「停下来等你确认/回答」这类会话终态，所以另挂 `agent/status` + `approval/request` + `user-questions/request`；
+- 选型参照（2026-09-30 更新）：**运行边界**照社区通行做法取 `agent/status` 的 running/idle
+  边沿语义（Pasumao 以它为主信号；hotpot 明确「一次运行可能跨多个 turn，不能按 turn 通知」，
+  所以本插件把收尾挂在**静止边沿**而不是每个 `turn/end` 上；agent-presence#83 的事故就是
+  「把 `agent/turn-stopping` 当会话结束」——它每个 turn 都触发，且可以被 steer 打开）；
+  **回合是否开着**取官方 `turnBoundary` 投影；**收尾原因**取 durable 的 `turn/end` reason；
+  另有三个社区验证过的小构件照抄：Pasumao 的**空转守卫**（`turnRan`：唤醒但没真回合不报完成）、
+  Dalcui 的**按 seq/回合记账去重**（`markSettled(keys, turn)`）、hotpot 的**静止宽限窗**
+  （`REST_GRACE_MS = 1500`，两条通道帧序无保证）。**没有**照抄的是「用轮询/静默时长推断」这类做法；
+- **开屏预创建空会话**（2026-09-28 首修，2026-09-30 加固）：web 打开一个工作区就**预创建一个空会话**
+  （会话日志只有 header），但 agent 照样走 `agent/status: running`，甚至还会发零星生命周期类
+  session/event。插件现在有三层门：官方回合投影 → 本进程 `turn/start`…`turn/end` 推理 →
+  `agent/status` running / 见过回合级事件（`seenActivity`）。**建档只发生在 `turn/start`**，
+  running 边沿不再建档（唤醒无回合、开屏空会话都走 running）。仿真用例 9（空会话）与
+  用例 10（回合外的会话级事件不得再上报）锁着；
 - 两个 waterfall 事件（`approval/request`、`user-questions/request`）是**观察者**：必须把 `next()` 交还下去，否则会把审批/提问请求吞掉；两者的 `reason` / `header` 都是可选字段（键可能整个不出现），取值前要兜底，别把 `undefined` 拼进正文；
 - **等待类事件的历史 bug**（2026-09-28 修）：早期重构把通用 `post()` 删了、换成了 `postActivity`，但上面两个 waterfall 处理器还在调用 `post()`——`ReferenceError` 被 try/catch 吞掉，「等待授权 / 等待输入」**从未上报过**（症状：等待色/等待通知时有时无，即「状态显示不准确」的主要来源）。现在统一走 `postBestEffort`（失败补发一次），仿真用例 7 锁着它；
-- **开屏预创建空会话**（2026-09-28，DSH 0.1.5-rc.3 起）：web 打开一个工作区就**预创建一个空会话**（会话日志只有 header），但 agent 照样走 `agent/status: running`，甚至还会发零星生命周期类 session/event（未落盘）。插件必须有**建档门槛**：见过该会话的**回合级事件**（`turn/start` / `tool/call` / `assistant/message`）之前不发心跳、不折叠保活、`running→idle` 也不报兜底终态（`seenActivity` 表）——否则面板凭空多出一条「思考中」，它永远没有终态，挂满 10 分钟被判死巡检清掉（**红光 + 失败音**，每开一个工作区标签页埋一颗雷，实测复现）。第一版门槛取「有任何会话事件」被生命周期事件穿透（ProNet 实测），收紧为回合级后解决；三个类型名同时被 DSH 改名才会让插件整体静默，概率远低于单个。仿真用例 9 锁着；
-- `agent/turn-stopping` 是 serial 事件且 DSH 会 `await` 监听器返回的 Promise（这样终态不会因进程随即退出而丢），但 POST 必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被「只接受连接不响应」的进程占用时，否则会把回合收尾一起拖住；
-- **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，每次投递用**新的**事件 id，避免 daemon 按 id 去重把重投本身丢掉）；`markSettled` 只在**确认送达**的路径上调用；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把 idle 兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
-- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为，覆盖首投失败重投、idle 兜底补报、新回合作废迟到终态、心跳不重试；本机没有 node 时该测试自动跳过）；
+- **开屏预创建空会话**（2026-09-28 首修，2026-09-30 加固）：web 打开一个工作区就**预创建一个空会话**
+  （会话日志只有 header），但 agent 照样走 `agent/status: running`，甚至还会发零星生命周期类
+  session/event。插件现在有三层门：官方回合投影 → 本进程 `turn/start`…`turn/end` 推理 →
+  `agent/status` running / 见过回合级事件（`seenActivity`）。**建档只发生在 `turn/start`**，
+  running 边沿不再建档（唤醒无回合、开屏空会话都走 running）。仿真用例 9（空会话）、
+  用例 10（回合外的会话级事件不得再上报）、用例 12（turn-stopping 不是终态）、
+  用例 13（会话关闭补 `run_aborted`）锁着；
+- **回合状态与收尾原因一律读会话日志**（2026-09-30 二次修复）：实测同一个回合里
+  `turn/start` **送到了插件**（行建出来了），而 `turn/end` 与 `agent/status: idle`
+  **一条都没送到**——只信事件的两条收尾路径全都没触发，卡片挂死「思考中」、光带一直亮。
+  现在按官方契约（session log 是唯一真源）用 `session.seq` + `session.eventAt(i)` **回扫日志**
+  取「回合是否开着 / 最近一条 `turn/end` 的回合号与 `reason.kind`」；收尾触发点扩到四个
+  （`agent/turn-stopping`、`turn/end`、`agent/status: idle`、周期心跳那一下的对账），
+  任一到达都能收尾，按回合号去重保证只报一次。回归：`plugin_sim.mjs` case 16（只有日志、
+  没有 `turn/end` 事件）、case 17（连 status 事件也没有）、case 14（缺 idle 边沿）；
+- **收尾的两条兜底**（2026-09-30 首修，与上一条同源）：
+  1. 收尾原来只挂在 `agent/status: idle` 边沿上。实测 DSH 重启后**连续两个回合收尾都没有这个边沿**（终态一条都没报出去，daemon 里的条目挂死），所以 `turn/end` 现在无条件排一个 `REST_GRACE_MS`（1.5s）宽限窗：窗内没有新回合（`turn/start` 会取消它）就按 `turn/end` 的 reason 收尾；idle 边沿到了则立刻收并取消定时器（快路径）。排队输入连续多回合（实测间隔 1ms）因此仍然只报一次；
+  2. `hasActiveDescendants`（heldCompletions 的活跃判据）原来用插件自己的 `running` 记账，而 DSH 会在「被附着/唤醒但没有回合」时也把状态翻到 running——那种子会话（例如早就跑完、被重新附着的子代理）会把**父会话的完成永久扣住**。现在活跃判据改成**日志派生**：只有子会话 `turnOpen === true`（回合开着）才算在干活。
+  两条各有回归用例（`plugin_sim.mjs` case 14 / case 15）；
+- **幽灵行**（2026-09-30 修，用户实测「没有会话在跑，面板却一直挂着一条『思考中』」）：
+  旧实现把「任何会话事件」当「agent 还活着」，而 DSH 会在**回合外**追加会话级事件
+  （`session/title`、`session/end-seed`、`compaction/*`、`command/*`、`model/selection`…）。
+  这类保活心跳到达 daemon 时，若该会话的条目早已被终态收掉，`tool_finished` 的「无条目」
+  分支会**凭空建档**（只挡了 10 秒内的乱序回声）——这条行没有任何终态能收掉，挂满 10 分钟
+  由判死巡检清场（**红光 + 失败音**）。两处一起修：
+  1. 插件侧：心跳只在**回合开着**时发（三层门见上），回合外的会话级事件一律不上报；
+  2. daemon 侧：保活心跳带 `keepalive: true`（`NormalizedEvent::keepalive`），
+     `ToolFinished` 对该标志**只续命、绝不建档**（`state.rs` 的同名分支 + 单测
+     `keepalive_heartbeat_never_creates_a_session`）。hook 型 agent 不发这个标志（Claude 系
+     只订阅 PostToolUse，靠它建档），行为不变；
+- `agent/turn-stopping` 是 serial 事件且 DSH 会 `await` 监听器返回的 Promise（现在它只记回合号，
+  不再等终态投递），但 POST 仍必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被
+  「只接受连接不响应」的进程占用时，否则会把 DSH 的事件分发拖住；
+- **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，**重投复用同一个事件 id**——首投「daemon 已收下但响应丢了」时靠 daemon 的 id 去重兜住，绝不产生第二条通知）；`markSettled` 只在**确认送达**的路径上调用，并按**回合号**记账；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把静止兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
+- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾；本机没有 node 时该测试自动跳过）；
 - 插件型 adapter 只送 cwd，daemon 侧 `handle_event` 会按 hook 链路的同一规则补出 `project`，两条链路的通知正文（项目名 + 摘要）保持一致；
 - 排障链路：`dsh web --dump-config` 证明条目在列；DSH 侧有没有真的发出去，看 Windows 通知历史 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表（按 AUMID `com.agentbark.app` 过滤就是 agent-bark 弹过的 toast）；
 - 桥接包需在 profile 里自行安装：`dsh plugin add @deepseek-ai/dsh-hooks-claude-code`；
 - `$DSH_HOME` 迁移（或程序被移动）会让 insert 条目的 `name` 指向旧路径，UI 显示 hook 失效——重新勾选即可就地修复。
+
+---
+
+**DSH 处于 Developer Preview：升级后只核对这 6 个契约点**
+
+改版可能让下面任何一条失效。每条都写明「失效症状」，出问题时先看对应那条，**不要**先怀疑通知链路：
+
+| 契约点 | 失效症状 | 插件侧位置 |
+| --- | --- | --- |
+| `ctx.sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
+| `agent/status` 的边沿语义（`idle` = 没有驱动器还在排队或运行） | 完成通知不来、或提前来；**边沿还可能根本不出现**（2026-09-30 实测：DSH 重启后连续两个回合收尾都没有 idle）——所以收尾**不能只挂在它上面**，插件用 `turn/end` + `REST_GRACE_MS` 宽限窗兜底 | `agent/status` 监听 + `scheduleRest` |
+| `session/event` 的 `turn/start` / `turn/end`（后者带 `data.turn` 与 `data.reason.kind`） | 完全不建档（面板空白）、或按回合去重失效（重复通知） | `session/event` 监听 |
+| `ctx.on(..., { global: true })` 的 scope 分发行径 | 偶发丢 `turn/end`，状态飘 | 5 处 `{ global: true }` |
+| 两个 waterfall（`approval/request` / `user-questions/request`）必须把 `next()` 交还 | 审批/提问请求被吞 | 两个 waterfall 监听 |
+| `agent/turn-stopping` 是「本可收尾、可被 steer 打开」的闸门 | 若 DSH 改成「触发即终态」，可以改回把它当收尾点（现在只记回合号） | `agent/turn-stopping` 监听 |
+
+核对手段：`dsh --profile <名> --dump-config` 确认条目在列；**DSH 自带技能 `cordis-plugin-development`（`SKILL.md` + `references/practices.md`，Desktop 里打包在 `app.asar`）是官方插件规范**，升级后先读它；事件/服务的精确契约可用 `cordis_inspect_query`（该 profile 装了 `dsh-tool-cordis` 时才有）。
+社区插件（dsh-plugin-notify / dsh-notify / dsh-session-notification 等）只在选型时调研过一次，**结论不入库**——预览版迭代快，需要时重新调研比留旧结论可靠。
 
 ---
 

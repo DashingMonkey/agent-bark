@@ -1353,6 +1353,18 @@ fn apply_session_event_inner(
                     delta.changed = true;
                 }
                 None => {
+                    // **纯保活心跳绝不建档**（§DSH 幻影行）：插件按「回合开着就定期补心跳」
+                    // 续命时，这条心跳只证明「我上次看到的那个会话还活着」，不是「这个会话
+                    // 现在开始干活了」。表里没有条目 = 这条心跳的对象在当前进程里从未被
+                    // 观察到（daemon 重启 / 建档心跳丢失），或早已被终态收档——建档就会造出
+                    // 一条**没有任何终态能收掉**的「思考中」，挂满 10 分钟被判死巡检清场
+                    // （红光 + 失败音）。用户实测症状：没有会话在跑，面板却一直显示
+                    // 一个事件流在「思考中」。
+                    //
+                    // 注意不动 pruned 带来的 delta：判死淘汰必须照常上报（下面直接返回 delta）。
+                    if ev.keepalive {
+                        return delta;
+                    }
                     // 无条目 + 宽限窗内有终态记录 = 乱序回声：Stop 与工具 hook 是两个
                     // 独立进程、没有全局顺序保证，PostToolUse 慢几百毫秒就会「先完成、
                     // 后收尾」。放它建档会把刚收起的完成色复活成思考色，10 分钟后被
@@ -1615,6 +1627,7 @@ mod tests {
             is_subagent: false,
             tool_name: tool.map(str::to_string),
             parent_session_id: None,
+            keepalive: false,
         }
     }
 
@@ -1866,6 +1879,42 @@ mod tests {
         let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::ToolFinished, late, Some("Bash"), ""));
         assert!(d.changed && !d.suppressed_echo);
         assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::Thinking);
+    }
+
+    #[test]
+    fn keepalive_heartbeat_never_creates_a_session() {
+        // 纯保活心跳（keepalive=true）只续命、绝不建档——DSH 插件按「回合开着就定期
+        // 补心跳」续命时用的就是它。表里没有条目说明这条心跳没有可续的对象：建档会留下
+        // 一条永远没有终态的「思考中」，挂满 10 分钟被判死（红光 + 失败音）。
+        let (mut sessions, mut finished) = table();
+        let mut beat = ev(EventKind::ToolFinished, 1000, None, "");
+        beat.keepalive = true;
+        let d = apply_session_event(&mut sessions, &mut finished, &beat);
+        assert!(!d.changed, "保活心跳不得造出状态表变化");
+        assert!(sessions.is_empty(), "保活心跳不得凭空建档（幻影行的来源）");
+
+        // 已有条目时照常续命——这才是保活心跳的用途（长工具 / 长子代理的静默窗口）
+        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 2000, None, ""));
+        let mut later = ev(EventKind::ToolFinished, 30_000, None, "");
+        later.keepalive = true;
+        let d = apply_session_event(&mut sessions, &mut finished, &later);
+        assert!(d.changed);
+        assert_eq!(sessions["trae-code|s1"].last_activity, 30_000, "保活心跳只刷存活时刻");
+
+        // 终态收档之后的保活心跳同样不得复活会话（这是用户实测的那条幽灵行）
+        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 31_000, None, "done"));
+        assert!(sessions.is_empty());
+        let mut after = ev(EventKind::ToolFinished, 31_000 + IDLE_ECHO_GRACE_MS + 1, None, "");
+        after.keepalive = true;
+        let d = apply_session_event(&mut sessions, &mut finished, &after);
+        assert!(!d.changed);
+        assert!(sessions.is_empty(), "宽限窗之外的保活心跳也不得复活已终态会话");
+
+        // 不带标志的 tool_finished 仍是真实信号（hook 型 agent 靠 PostToolUse 建档）
+        let (mut sessions2, mut finished2) = table();
+        let d = apply_session_event(&mut sessions2, &mut finished2, &ev(EventKind::ToolFinished, 1000, Some("Bash"), ""));
+        assert!(d.changed && !d.suppressed_echo);
+        assert_eq!(sessions2["trae-code|s1"].phase, SessionPhase::Thinking);
     }
 
     #[test]

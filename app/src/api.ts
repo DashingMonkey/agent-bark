@@ -75,6 +75,9 @@ export interface NormalizedEvent {
   message: string;
   timestamp: number;
   is_subagent?: boolean;
+  /// 纯保活心跳（不是活动信号）：daemon 侧只续命、绝不建档。
+  /// 前端不消费（心跳本来就不入事件流），这里只为与后端结构保持一致。
+  keepalive?: boolean;
 }
 
 // 会话实时状态（后端 SessionPhase / SessionStatus 的 snake_case 序列化形态）
@@ -202,11 +205,7 @@ export interface WidgetConfig {
   y: number;
   /** 固定位置：true 时卡片不响应拖动（悬浮窗右键菜单里切换） */
   pinned: boolean;
-  /**
-   * 自动隐藏：安静（无行 / 全部行属思考类）2 秒后隐藏卡片，
-   * 出现需要关注的行（等待确认 / 等待输入 / 任务完成 / 任务失败）立即弹出；
-   * 手动中止不弹出也不阻止隐藏（与光效「手动中止不提醒」同口径）
-   */
+  /** 自动隐藏：安静即隐、有事即现（行为口径见 widget.ts 的「自动隐藏」一节） */
   auto_hide: boolean;
 }
 

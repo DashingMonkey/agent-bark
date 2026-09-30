@@ -34,19 +34,36 @@
 //! 外层不带 id 表示追加到根组；name 写绝对路径即可，DSH 加载时会经
 //! `pathToFileURL` 转成 file:// URL（Windows 盘符路径也支持）。
 //!
-//! 事件面（全部由生成的插件自己归一化后 POST，不经过 hook 子命令）：
-//! - `agent/turn-stopping`（serial）→ run_completed，正文取会话日志里最后一条
-//!   `assistant/message` 的 text 块；
-//! - `agent/status`：running → activity 心跳（只发根会话）；running→idle 且本回合
-//!   `agent/turn-stopping` 没报过 → 兜底补一条终态（外部中止 / 回合被拦等收尾路径）；
-//! - `agent/error` → run_failed；`approval/request`（waterfall，观察完必须 `next()`）
-//!   → permission_required；`user-questions/request` → input_required；
-//! - `session/event` 的 `tool/call` → activity（带 tool_name，面板显示「执行工具」），
-//!   并记下 `turn/end` 的 reason 供 idle 兜底分类。
+//! 事件面（全部由生成的插件自己归一化后 POST，不经过 hook 子命令）。
 //!
-//! 这套选型与社区通知插件一致（dsh-plugin-notify / dsh-notify / dsh-notification）：
-//! 只挂 `agent/turn-stopping` 会漏掉「停下来等你确认/回答」这类会话终态，
-//! 而 DSH 的会话状态与结束原因要分别从 `agent/status` 与 `session/event` 取。
+//! **回合状态一律从日志派生**（2026-09-30 重写，对齐 DSH 官方契约与社区做法）：
+//! - **建档**只在 `session/event` 的 `turn/start`：发一条不带 `keepalive` 的 `activity`；
+//! - **放行门**（`busyOf`）优先读官方回合投影
+//!   `ctx.sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq !== null`
+//!   （纯日志派生；DSH 自己在 dsh-agent-instructions / agent-preset-registry /
+//!   dsh-hooks-codex 里就用这个判定式），读不到时退回本进程的 `turn/start`…`turn/end`
+//!   推理，再退回 `agent/status` running / 见过回合级事件（老版本 DSH）；
+//! - **回合内**：`tool/call` → 带 tool_name 的 `activity`；其余事件 → 节流的
+//!   `tool_finished`（**带 `keepalive: true`**，daemon 只续命不建档）；回合开着且长时间
+//!   静默（长工具 / 长子代理 / 等审批 / 等回答）时另有 20s 周期保活心跳兜底判死；
+//! - **收尾**：`turn/end` 记下 `reason.kind` 与回合号，**静止边沿**（`agent/status: idle`
+//!   且没有回合开着）经 `reportAtRest` 报一次终态，正文取会话日志里最后一条
+//!   `assistant/message` 的 text 块，按**回合号**去重（`markSettled(keys, turn)`）；
+//! - `agent/turn-stopping` **不再当终态**：官方原文 *"runs before an otherwise completed
+//!   turn closes and can steer to keep it open"*——按它报完成会在运行还没结束时谎报，
+//!   并把随后真正的终态吞掉（社区已修事故 agent-presence#83：会话被过早标 finished、
+//!   后续心跳被状态机忽略）；
+//! - `agent/error` 只记正文（请求级错误 DSH 会重试，真正的失败落在 `turn/end` 的
+//!   `reason=error`；没有 reason 却又出过错时按失败收尾，不谎报完成）；
+//! - `approval/request`（waterfall，观察完必须 `next()`）→ `permission_required`；
+//!   `user-questions/request` → `input_required`；
+//! - `agent/disposed` → 补一条 `run_aborted` 把 daemon 的条目收掉（否则被关闭的会话
+//!   要挂到 10 分钟判死才消失）。
+//!
+//! 这套选型 = DSH 官方插件规范（`cordis-plugin-development` 技能的 practices.md：
+//! 「session log 是唯一真源」「不要 poll `agent/status`」「每会话状态用 sessionProjections
+//! 从日志派生」）+ 社区通知插件的通行做法（Pasumao 的空转守卫、Dalcui 的按 seq 记账、
+//! hotpot 的「读原因 + 等静止」、dingyi 的 heldCompletions/血缘）。
 //!
 //! 已知局限（DSH Developer Preview 所致）：
 //! - 事件 payload 与 session 日志结构未稳定：插件侧对字段名做多重兜底，取不到摘要
@@ -522,15 +539,42 @@ const SUMMARY_MAX = 300;
 /** 正在运行的会话（status running 记入、idle 取出、disposed 清理）。 */
 const running = new Set();
 /**
- * 本回合的终态**已确认送达**的会话。一个回合结束会有两个信号（turn-stopping 与随后的
- * status idle），按 running→idle 周期去重、只报一次；不用时间窗口，避免把紧接着
- * 的下一个短回合的完成通知一起吞掉。
+ * 宿主 ctx（`apply` 时记下）：用它**每次现读**官方回合边界服务，
+ * 服务晚挂载（profile 里换 bundle / 热重载）也能用上。
  *
- * 关键：它记的是「送达」而不是「发过」。终态 POST 失败/超时/非 2xx 时**不置位**，
- * 这样随后的 status idle 兜底还会再报一次——否则一次瞬时失败就让 daemon 的
- * 「运行中」条目挂到 10 分钟判死（用户实测：回合早已结束，流光仍是思考蓝）。
+ * 权威的「此刻有没有回合开着」信号是 `ctx.sessionProjections.stateOf(session,
+ * "turnBoundary").openTurnStartSeq !== null`：`turnBoundary` 由 dsh-agent-loop 注册，
+ * 语义就是「已写 `turn/start`、还没写 `turn/end`」（纯日志派生）。DSH 自己在
+ * `dsh-agent-instructions` / `agent-preset-registry` / `dsh-hooks-codex` 里用的就是这个
+ * 判定式；插件开发规范 practices.md 也要求「状态从日志派生」、「不要 poll `agent/status`」。
+ *
+ * 为什么不能只靠事件推断：父会话等子代理、等审批、等用户回答时**长时间零事件但回合开着**
+ * （官方口径：a turn waiting for an approval or an answer included），
+ * 而回合被 steer 之后 `agent/turn-stopping` 还会再触发——两边都会骗过「最近有没有事件」。
  */
-const settledSessions = new Set();
+let ctxRef = null;
+
+/**
+ * 兜底信号一：本进程按**日志事件**推出来的回合开关（`turn/start` 开、`turn/end` 关）。
+ * 服务缺失（老版本 DSH 没有 sessionProjections）时比「见过回合级事件」精确一档：
+ * 它会在 `turn/end` 之后立刻关掉，不会把回合外的会话级事件当成「还在跑」。
+ */
+const turnOpen = new Map();
+/**
+ * 本回合/本次运行**真的跑过回合**（`turn/start` 置位，上报后清）。空转守卫：
+ * DSH 的唤醒可能没有回合（消息被清空 / 只是回执唤醒），那种 running→idle 不该报「任务完成」。
+ */
+const turnRan = new Map();
+/**
+ * 本回合的终态**已确认送达**的记账：会话键 → 回合标记（turn 号，取不到时用 "cycle"）。
+ * 一个回合结束会有两个信号（回合收尾闸门与随后的 idle），按同一回合去重、只报一次；
+ * **按回合**而不是按「running→idle 周期」：`agent/turn-stopping` 只是「本可收尾」的闸门，
+ * 它可以被 steer 打开（官方文档：can steer to keep it open），按周期去重会把真终态吞掉
+ * （社区已修事故 agent-presence#83：会话被过早标 finished，后续心跳被状态机忽略）。
+ */
+const settledSessions = new Map();
+/** 会话键 → 最近一次 `turn/end` 的 turn 号（上报时作为回合标记）。 */
+const lastTurnNo = new Map();
 /** 正在重投的终态通知：sessionId → { type, body, attempt, timer }。 */
 const pendingTerminal = new Map();
 
@@ -662,14 +706,258 @@ function noteLineage(keys, parent) {
   for (const k of keys) childrenOf.get(parent).add(k);
 }
 
-/** 会话是否还「活着」：在跑（status running）或有终态在途/被扣住。 */
+/**
+ * 会话是否还「活着」：**回合开着**（日志派生）或有终态在途/被扣住。
+ *
+ * ⚠️ 这里**不能**用 `running`（`agent/status` 记账）判活跃：DSH 会在「附着/唤醒但没有
+ * 回合」时也把状态翻到 running（开屏预创建的空会话、被重新附着的续跑子代理……），
+ * 那种子会话会把**父会话的完成永久扣住**（`heldTerminal` 等不到 `hasActiveDescendants`
+ * 变假）——用户实测症状：回合早就结束，卡片一直「思考中」，光带一直亮（2026-09-30）。
+ * 回合开着才是真的在干活：`turn/start` … `turn/end`（拿得到官方投影时以它为准）。
+ */
 function isActiveSession(key) {
-  return running.has(key) || pendingTerminal.has(key) || heldTerminal.has(key);
+  if (turnOpen.get(key) === true) return true;
+  return pendingTerminal.has(key) || heldTerminal.has(key);
 }
 
 /** 会话是否见过真实会话事件（心跳放行门槛，见 seenActivity 的说明）。 */
 function hasActivity(keys) {
   return keys.some((k) => seenActivity.has(k));
+}
+
+// ---------------------------------------------------------------------------
+// 回合状态：官方投影优先、日志推理兜底（绝不靠「最近有没有事件」猜）
+// ---------------------------------------------------------------------------
+
+/** 官方回合边界投影（`ctx.sessionProjections.stateOf(session, "turnBoundary")`）。 */
+function boundaryOf(session) {
+  const svc = ctxRef && ctxRef.sessionProjections;
+  if (!svc || typeof svc.stateOf !== "function" || !session) return undefined;
+  try {
+    return svc.stateOf(session, "turnBoundary");
+  } catch {
+    return undefined; // 结构随版本变动：读不到就退回日志推理，观察本身绝不失败
+  }
+}
+
+/** 回合是否开着：true/false = 投影给出的权威答案；undefined = 拿不到投影（老版本 DSH）。 */
+function turnOpenOf(session) {
+  const b = boundaryOf(session);
+  if (b === undefined) return undefined;
+  return b.openTurnStartSeq !== null && b.openTurnStartSeq !== undefined;
+}
+
+/** 本进程按日志推出来的回合开关（`turn/start` 开、`turn/end` 关）。 */
+function trackTurnOf(keys) {
+  for (const k of keys) {
+    const v = turnOpen.get(k);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+/**
+ * **直接读会话日志**取回合状态与最后一次收尾（官方契约：session log 是唯一真源）。
+ *
+ * 为什么不能只靠事件：实测 2026-09-30（DSH Desktop 预览版）——同一回合里 `turn/start`
+ * 送到了插件（行建出来了），`turn/end` 与 `agent/status: idle` **一条都没送**，
+ * 于是「静止边沿」和「turn/end + 宽限窗」两条收尾路径全都没触发，卡片挂死「思考中」、
+ * 光带一直亮。日志里明明有 `turn/end.283`（reason=completed），读一下就知道回合关了。
+ *
+ * 返回 `{ open, end }`：`open` = 回合是否还开着（undefined = 日志里没有回合级事件），
+ * `end` = 最近一条 `turn/end` 的 `{ turn, reason }`。只回扫最近 `limit` 条，
+ * 兼顾性能与「会话很长」的场景。
+ */
+function logScan(session, limit) {
+  const out = { open: undefined, end: undefined };
+  try {
+    const seq = typeof session.seq === "number" ? session.seq : 0;
+    if (seq <= 0) return out;
+    const floor = Math.max(0, seq - (limit || 600));
+    let startIdx = -1;
+    let endIdx = -1;
+    for (let i = seq - 1; i >= floor; i--) {
+      const ev = session.eventAt(i);
+      if (!ev) continue;
+      const type = ev.type;
+      if (type !== "turn/start" && type !== "turn/end") continue;
+      const d = ev.data || {};
+      const turn = typeof d.turn === "number" ? d.turn : undefined;
+      if (type === "turn/end") {
+        if (endIdx < 0) {
+          endIdx = i;
+          out.end = { turn, reason: asText((d.reason || {}).kind) };
+        }
+      } else if (startIdx < 0) {
+        startIdx = i;
+      }
+      if (startIdx >= 0 && endIdx >= 0) break;
+    }
+    if (startIdx >= 0 || endIdx >= 0) out.open = startIdx > endIdx; // 后写的那个说了算
+  } catch {}
+  return out;
+}
+
+/**
+ * 「此刻忙不忙」——所有心跳（activity / 保活 / 工具）的统一放行门。
+ *
+ * 优先级：**官方回合投影** > 本进程日志推理 > 最老版本的 running / 见过回合级事件。
+ * **绝不**用「最近有没有事件」推断：父会话等子代理、等审批、等用户回答时回合开着却
+ * 可能十几分钟零事件（官方口径：a turn waiting for an approval or an answer included），
+ * 而回合外的会话级事件（title / end-seed / compaction / command…）又会假装「有活动」。
+ */
+function busyOf(session, keys) {
+  const open = turnOpenOf(session);
+  if (open !== undefined) return open;
+  // 投影拿不到（老版本 / 服务没挂）就**读日志**：比本进程的事件记账硬——事件可能没送到
+  const scan = logScan(session);
+  if (scan.open !== undefined) return scan.open;
+  const tracked = trackTurnOf(keys);
+  if (tracked !== undefined) return tracked;
+  return keys.some((k) => running.has(k)) || hasActivity(keys);
+}
+
+/** 静默期保活心跳的节奏：回合开着就定期补，别让长工具 / 长子代理被 daemon 判死。 */
+const HEARTBEAT_INTERVAL_MS = 20000;
+/**
+ * 静止边沿的宽限窗：`turn/end` 与 `agent/status: idle` 是两条通道，帧序没有保证
+ * （社区实测 idle 可能先到），先等一小会儿再收尾，免得把「结果还没落盘」的运行
+ * 误报成完成。
+ */
+const REST_GRACE_MS = 1500;
+
+/** 会话键 → 周期心跳定时器 / 待收尾定时器（见 startHeartbeat / scheduleRest）。 */
+const heartbeats = new Map();
+const restTimers = new Map();
+/** 会话键 → 最近一次 `agent/error` 的正文（请求级错误会被 DSH 重试，不作为终态）。 */
+const lastError = new Map();
+
+/**
+ * 回合开着时的周期保活心跳。
+ *
+ * 只在**官方回合投影可用**时启用：投影说「回合还开着」才续命，拿不到投影时保持旧行为
+ * （不做周期补发）——宁可不补，也不能在其实没在跑的会话上续命。
+ *
+ * 存在理由：父会话等子代理 / 等审批 / 等回答可以静默十几分钟，其间没有任何会话事件；
+ * daemon 侧「心跳静止 10 分钟判死」会把这条行误判成意外终止（红光 + 失败音）。
+ * 心跳带 `keepalive: true`：daemon 侧只续命、绝不建档（那条行必须已经由 turn/start 建好）。
+ */
+function startHeartbeat(keys, session) {
+  // 只有官方回合投影在场时才开周期心跳（老版本 DSH 拿不到投影就没有这道保险，
+  // 行为与修复前一致）；**收尾**不依赖它——收尾走「读日志」的 reportAtRest。
+  if (!ctxRef || !ctxRef.sessionProjections || !session || !keys.length) return;
+  const anchor = keys[0];
+  if (heartbeats.has(anchor)) return;
+  // cwd / 子代理 / 血缘在启动时取一次：心跳期间这些字段不会变
+  const cwd = cwdOf(undefined, session);
+  const isSub = isSubagentOf(undefined, session);
+  const parent = parentStringOf(undefined, session);
+  const tick = () => {
+    heartbeats.delete(anchor);
+    // 每一跳都是一次**对账**：状态取自会话日志（事件可能没送到），投影只作兜底。
+    const scan = logScan(session);
+    const open = scan.open === undefined ? turnOpenOf(session) === true : scan.open;
+    if (open === true) {
+      postLiveness({ sessionId: anchor, cwd, isSubagent: isSub, parentSessionId: parent, keepalive: true, force: true });
+      heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+      return;
+    }
+    // 回合已经关了：顺手收尾（按回合号去重）。没报成功且会话还在跑 → 下一跳再对一次。
+    if (scan.end !== undefined) reportAtRest(undefined, session, keys);
+    if (scan.end !== undefined && !isSettledOf(keys, scan.end.turn) && keys.some((k) => running.has(k))) {
+      heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+    }
+  };
+  heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+}
+
+function stopHeartbeat(keys) {
+  for (const k of keys) {
+    const t = heartbeats.get(k);
+    if (t !== undefined) {
+      clearTimeout(t);
+      heartbeats.delete(k);
+    }
+  }
+}
+
+/** 排一次「静止收尾」（宽限窗内若先等到 turn/end，由 turn/end 分支提前收尾）。 */
+function scheduleRest(agent, session, keys) {
+  const anchor = keys[0];
+  if (restTimers.has(anchor)) return;
+  restTimers.set(anchor, setTimeout(() => {
+    restTimers.delete(anchor);
+    reportAtRest(agent, session, keys);
+  }, REST_GRACE_MS));
+}
+
+function cancelRest(keys) {
+  for (const k of keys) {
+    const t = restTimers.get(k);
+    if (t !== undefined) {
+      clearTimeout(t);
+      restTimers.delete(k);
+    }
+  }
+}
+
+/**
+ * 静止收尾：**回合已关**（日志里的 `turn/end` 落盘、且宽限窗内没有开新回合）时，
+ * 把这一次工作报一次。
+ *
+ * 触发点有两个，互为兜底（2026-09-30 补第二个）：
+ * 1. `agent/status: idle` 边沿（快路径，正常顺序下它先到）；
+ * 2. `turn/end` + `REST_GRACE_MS` 宽限窗（**实测 idle 边沿可能不来**：DSH 重启后连续
+ *    两个回合收尾都没有 idle，只靠边沿会让终态一条都报不出去、卡片挂死在「思考中」）。
+ *
+ * 与旧实现的三点差别（对齐 DSH 官方契约与社区通行做法）：
+ * - **不再用 `agent/turn-stopping` 当终态**：它只是「本可收尾」的闸门，官方原文
+ *   *"runs before an otherwise completed turn closes and can steer to keep it open"*；
+ *   按它报完成会在运行还没结束时谎报，并且把真终态吞掉（社区事故 agent-presence#83：
+ *   会话被过早标 finished、后续心跳被状态机忽略）；
+ * - 收尾原因取 **durable 的 `turn/end`**（`reason.kind`），按**回合号**去重；
+ * - **空转守卫**：自上次上报以来没有 `turn/start` 的唤醒（消息被清空 / 只是回执唤醒）不报。
+ */
+function reportAtRest(agent, session, keys) {
+  // 回合状态、回合号与收尾原因**一律从会话日志读**（官方契约：日志是唯一真源）。
+  // 只信事件的话，`turn/end` 一旦没送到插件，这里就永远不会收尾（2026-09-30 实测）。
+  const scan = logScan(session);
+  if (scan.end === undefined) return; // 日志里没有 turn/end：无从报起（空会话 / 空转唤醒）
+  if (scan.open === true) return; // 回合还开着（等子代理 / 等审批）：等它关
+  const sessionId = sessionIdOf(agent, session);
+  const turn = scan.end.turn !== undefined ? scan.end.turn : lastTurnNoFor(keys);
+  const reason = scan.end.reason || reasonOf(keys);
+  const errored = keys.map((k) => lastError.get(k)).find((v) => typeof v === "string" && v !== "");
+  for (const k of keys) {
+    turnRan.delete(k);
+    lastError.delete(k);
+  }
+  if (reason === "aborted" || reason === "interrupted") {
+    // 用户主动中止：既不是完成（不亮完成色、不谎报跑完）也不是失败（不亮失败色、不弹「任务失败」）
+    void settle("run_aborted", agent, session, { sessionId, message: "回合已中止", turn });
+    return;
+  }
+  if (reason === "error" || reason === "blocked" || (!reason && errored)) {
+    void settle("run_failed", agent, session, {
+      sessionId,
+      message: reason === "blocked" ? "回合被拦截" : errored || "回合出错",
+      turn,
+    });
+    return;
+  }
+  // max-tokens：至少一个 step 撞到输出 token 上限，回合结束了但任务是被截断的，
+  // 不能报「任务完成」（否则用户以为结果完整）。其余（completed 及未来新增类型）按完成。
+  if (reason === "max-tokens") {
+    const text = lastAssistantText(session);
+    // 标记放**前缀**：daemon 侧正文只截前 200 字，放后缀会被截掉
+    void settle("run_completed", agent, session, {
+      sessionId,
+      message: text ? `〔达到输出上限〕${text}` : "回合达到输出上限结束",
+      turn,
+    });
+    return;
+  }
+  void settle("run_completed", agent, session, { sessionId, message: lastAssistantText(session), turn });
 }
 
 /**
@@ -696,12 +984,32 @@ function hasActiveDescendants(keys) {
   return false;
 }
 
-function isSettledOf(keys) {
-  return keys.some((k) => settledSessions.has(k));
+function isSettledOf(keys, turn) {
+  const marker = turnMarker(turn);
+  return keys.some((k) => settledSessions.get(k) === marker);
 }
 
-function markSettled(keys) {
-  for (const k of keys) settledSessions.add(k);
+function markSettled(keys, turn) {
+  const marker = turnMarker(turn);
+  for (const k of keys) settledSessions.set(k, marker);
+}
+
+/**
+ * 回合标记：有 turn 号就用 `turn:<n>`，取不到时退化成一个周期标记 `"cycle"`。
+ * 按回合号记账才能做到「同一回合只报一次、下一回合照常报」，同时不被
+ * `agent/turn-stopping` 的 steer 语义（本可收尾但被留开）骗到。
+ */
+function turnMarker(turn) {
+  return typeof turn === "number" && Number.isFinite(turn) ? `turn:${turn}` : "cycle";
+}
+
+/** 会话键上最近一次 `turn/end` 记录的回合号（任一键命中就用它）。 */
+function lastTurnNoFor(keys) {
+  for (const k of keys) {
+    const t = lastTurnNo.get(k);
+    if (typeof t === "number") return t;
+  }
+  return undefined;
 }
 
 /**
@@ -824,6 +1132,9 @@ function eventBody(f) {
   // 子代理干活时父会话才不会被「心跳静止判死」误杀
   const parent = asText(o.parentSessionId);
   if (parent) body.parent_session_id = parent;
+  // 纯保活心跳：daemon 侧只续命、**绝不建档**（见 bark-core NormalizedEvent::keepalive）。
+  // 少了这个标志，一条「回合外的迟到事件」折成的保活就能凭空造出没有终态的「思考中」行。
+  if (o.keepalive === true) body.keepalive = true;
   return body;
 }
 
@@ -858,17 +1169,18 @@ function retryDelay(attempt) {
   return Math.min(TERMINAL_RETRY_MAX_MS, TERMINAL_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }
 
-/** 终态投递成功：置「本回合已终态」——随后的 status idle 兜底据此去重。 */
+/** 终态投递成功：置「本回合已终态」——随后的静止边沿兜底据此去重。 */
 function finishTerminal(sessionId) {
   const job = pendingTerminal.get(sessionId);
   const keys = job ? job.keys : [sessionId];
+  const turn = job ? job.turn : undefined;
   for (const k of keys) {
     pendingTerminal.delete(k);
     // 终态送达 = 本回合结束：running 同步摘掉。否则「后代还活着」的判定会一直
     // 真到 status idle 才变假——heldCompletions 的放行被拖后一拍（实测仿真回归）
     running.delete(k);
   }
-  markSettled(keys);
+  markSettled(keys, turn);
   // 本会话（可能是别人的后代）不再活跃：检查有没有被扣住的祖先完成该放行了
   releaseHeld();
 }
@@ -906,9 +1218,12 @@ async function settle(type, agent, session, fields) {
   const sessionId = asText(f.sessionId) || sessionIdOf(agent, session);
   // 双键（§2.12）：settled / pending 的查、记都覆盖 agent.id 与 session.id
   const keys = idKeys(agent, session, sessionId);
-  if (!keys.length || isSettledOf(keys) || keys.some((k) => pendingTerminal.has(k) || heldTerminal.has(k))) return;
+  // 本回合的标记：优先调用方给的 turn 号（turn-stopping / turn/end 都带），
+  // 其次用本会话最近一次 turn/end 记下的回合号，最后才退化成一个周期标记
+  const turn = typeof f.turn === "number" ? f.turn : lastTurnNoFor(keys);
+  if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k) || heldTerminal.has(k))) return;
   // 先算完 cwd / 子代理标记再入队：取字段抛异常时（结构随版本变动）
-  // 不该把本回合标记成已上报——那样随后的 idle 兜底也会被跳过，一条通知都不剩。
+  // 不该把本回合标记成已上报——那样随后的兜底也会被跳过，一条通知都不剩。
   const body = eventBody({
     type,
     sessionId,
@@ -921,18 +1236,18 @@ async function settle(type, agent, session, fields) {
   // 后代会话还在跑 = 「子代理波次之间」的假完成——扣住不发，等 fan-out 全结束
   // 由 releaseHeld() 补投。失败 / 中止不扣：错误是当下就要知道的事。
   if (type === "run_completed" && hasActiveDescendants(keys)) {
-    const held = { body, keys };
+    const held = { body, keys, turn };
     for (const k of keys) heldTerminal.set(k, held);
     return;
   }
-  await enqueueTerminal(body, keys);
+  await enqueueTerminal(body, keys, turn);
 }
 
 /** 正常终态入队投递（settle 与 releaseHeld 共用；重投路径见 retryTerminal）。 */
-async function enqueueTerminal(body, keys) {
+async function enqueueTerminal(body, keys, turn) {
   const sessionId = body.session_id;
-  if (!keys.length || isSettledOf(keys) || keys.some((k) => pendingTerminal.has(k))) return;
-  const job = { body, attempt: 0, timer: null, keys };
+  if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k))) return;
+  const job = { body, attempt: 0, timer: null, keys, turn };
   for (const k of keys) pendingTerminal.set(k, job);
   if (await deliver(body)) {
     finishTerminal(sessionId);
@@ -955,7 +1270,7 @@ function releaseHeld() {
   for (const held of new Set(heldTerminal.values())) {
     if (hasActiveDescendants(held.keys)) continue;
     for (const k of held.keys) heldTerminal.delete(k);
-    void enqueueTerminal(held.body, held.keys);
+    void enqueueTerminal(held.body, held.keys, held.turn);
   }
 }
 
@@ -963,12 +1278,13 @@ function releaseHeld() {
  * 新回合开始：作废上一回合的终态状态。
  *
  * 两件事：
- * 1. 清掉「本回合已报过终态」——去重按回合（不是按时间窗），同一会话紧接着的
- *    下一个短回合必须能照常报完成；
+ * 1. 放行「本回合已报过终态」的**周期兜底标记**（只有拿不到回合号的老版本 DSH 才会用到；
+ *    按 `turn:N` 记账时新回合天然是新的标记，不必清理——同一会话紧接着的下一个短回合
+ *    必须能照常报完成）；
  * 2. 取消还挂着的重投——它属于上一个回合，此时重投只会把刚开始的新回合从
  *    daemon 状态表里误删。
  *
- * **不能**在这里顺手置「已终态」来堵住 idle 兜底：那条兜底正是本回合终态丢失时
+ * **不能**在这里顺手置「已终态」来堵住静止兜底：那条兜底正是本回合终态丢失时
  * 的补救路径，堵住它就等于把「POST 失败 → 永久挂运行中」这个 bug 原样搬回来
  * （本文件的 Node 回归测试 case 5 就是照这条教训写的）。
  *
@@ -977,7 +1293,9 @@ function releaseHeld() {
  * 闭环，比收到一条把新回合说成已完成的假通知要好。
  */
 function beginTurn(keys) {
-  for (const k of keys) settledSessions.delete(k);
+  // 按回合标记记账时，新回合天然是新的标记（turn:N），不必清理；只有「没有回合号」
+  // 的周期兜底标记需要在这里放行，否则老版本 DSH（没有 turn 号）的下一回合会被吞。
+  for (const k of keys) if (settledSessions.get(k) === "cycle") settledSessions.delete(k);
   // 上一回合被扣住的完成一并作废：此时放行只会把刚开始的新回合误报成已完成
   // （与下面取消待投终态同口径，见本函数的文档注释）
   const held = keys.map((k) => heldTerminal.get(k)).find(Boolean);
@@ -1019,9 +1337,12 @@ function postActivity(fields) {
 
 /**
  * 节流的保活心跳（tool_finished 语义：daemon 侧只刷 last_activity、相位回落
- * 思考中，不通知、不入历史、不响音效）：session/event 的其余事件（
- * assistant/message、step/*、未知新增类型）都算「还活着」，节流后借此给
- * 长思考 / 长子代理的静默窗口续命。
+ * 思考中，不通知、不入历史、不响音效）：`session/event` 的其余事件
+ * （assistant/message、step/*、tool/result、未知新增类型）在**回合开着**时
+ * 算「还活着」，节流后借此给长思考 / 长子代理的静默窗口续命。
+ *
+ * `keepalive: true`：明确告诉 daemon「我只是续命，别拿我建档」。只有**已经由
+ * turn/start 建好行**的会话才该收到它——见 bark-core 的同名字段说明。
  *
  * 两类事件**不发**：`user/*`（用户打字 ≠ agent 活跃）、`approval/*`
  * （审计事件会与 waterfall 的 permission_required 抢相位，把刚亮起的等待色
@@ -1031,16 +1352,23 @@ function postLiveness(fields) {
   const f = fields && typeof fields === "object" ? fields : {};
   const sessionId = asText(f.sessionId);
   if (!sessionId) return;
-  const now = Date.now();
-  const last = lastLivenessAt.get(sessionId) || 0;
-  if (now - last < LIVENESS_MIN_MS) return;
-  lastLivenessAt.set(sessionId, now);
+  // 语义：保活心跳一律 keepalive=true——daemon 侧只续命、绝不建档。
+  // 建档只由回合级 activity（turn/start / tool/call）负责，幽灵行因此在协议层就不可能。
+  const keepalive = f.keepalive !== false;
+  // 节奏：周期心跳自带节奏（force），事件驱动的保活走 15s 节流窗
+  if (f.force !== true) {
+    const now = Date.now();
+    const last = lastLivenessAt.get(sessionId) || 0;
+    if (now - last < LIVENESS_MIN_MS) return;
+    lastLivenessAt.set(sessionId, now);
+  }
   postBestEffort(eventBody({
     type: "tool_finished",
     sessionId,
     cwd: asText(f.cwd),
     isSubagent: f.isSubagent === true,
     parentSessionId: asText(f.parentSessionId),
+    keepalive,
   }));
 }
 
@@ -1062,20 +1390,36 @@ export function apply(ctx) {
   // 踩过，issue 有记）。⚠️ 该选项是 Cordis 的监听器选项，DSH 升级若改分发模型，
   // 表现会退回「偶发丢事件」——届时先查这里。
 
-  // 1) 回合自然结束（serial 事件）：返回 Promise 让 DSH 等**首投**走完——收尾前就把
-  //    「这一回合报过终态没有」定下来（首投失败会进重投队列，不阻塞收尾）。
+  // 0) 取官方回合边界服务（每次读，服务晚挂载也能用上）。读不到 = 老版本 DSH，
+  //    退回日志推理 / running 兜底，功能不降级、也不抛错。
+  ctxRef = ctx;
+
+  // 1) 回合收尾闸门（serial 事件）：**不作为终态**。
+  //    官方原文（dsh-agent/README）："`agent/turn-stopping` runs before an otherwise
+  //    completed turn closes and **can steer to keep it open**"——它每个 turn 都会触发，
+  //    而且可以被 steer 打开（官方 Claude hooks 桥接就把它的阻塞结果转成 steer()）。
+  //    按它报「任务完成」会在这次运行还没结束时谎报，并让随后真正的终态被去重吞掉
+  //    （社区已修事故 agent-presence#83：会话被过早标 finished、后续心跳被状态机忽略）。
+  //    这里只记下回合号做**提示**（拿得到 turn 号就按回合去重，拿不到则退回周期标记），
+  //    并顺手排一次「静止收尾」的宽限窗——`turn/end` 紧跟着就会落盘，宽限窗到点时
+  //    读日志就能拿到 reason（这是 2026-09-30 之后的主快路径：`turn/end` 事件本身
+  //    可能根本不送到插件，但**日志一定有**）。收尾统一见 reportAtRest。
   ctx.on("agent/turn-stopping", (payload) => observe(() => {
     const agent = payload && payload.agent;
     const session = agent && agent.session;
     const turn = payload && payload.turn;
-    return settle("run_completed", agent, session, {
-      message: lastAssistantText(session) || (typeof turn === "number" ? `回合 ${turn} 结束` : ""),
-    });
+    if (typeof turn !== "number") return undefined;
+    const keys = idKeys(agent, session, sessionIdOf(agent, session));
+    for (const k of keys) if (!lastTurnNo.has(k)) lastTurnNo.set(k, turn);
+    scheduleRest(agent, session, keys);
+    return undefined;
   }), { global: true });
 
-  // 2) 运行状态：running → 心跳（**含子代理**：驱动会话面板/流光，并经血缘向
-  //    祖先传播存活——子代理干活时父会话零心跳，不发会被判死误杀）；
-  //    running→idle 且本回合没被 turn-stopping 报过 → 兜底补一条终态（外部中止 / 被拦等）。
+  // 2) 运行状态（边沿通知，官方契约：`idle` = 没有驱动器还在排队或运行）：
+  //    running 只作兜底信号与「作废上一回合待投终态」的时机；**不在这里建档**——
+  //    DSH 的 running 边沿还包含「唤醒后没有回合」的空转（消息被清空 / 只是任务回执
+  //    唤醒），开屏预创建的空会话同样会走 running。建档由回合级事件 `turn/start` 负责。
+  //    running→idle = **静止边沿**：这一次运行收尾，交给 reportAtRest 报一次。
   ctx.on("agent/status", (payload) => observe(() => {
     const agent = payload && payload.agent;
     const session = agent && agent.session;
@@ -1086,20 +1430,10 @@ export function apply(ctx) {
     if (!keys.length) return;
     if (payload.status === "running") {
       for (const k of keys) running.add(k);
-      // 新回合开始：允许本回合再报一次终态，并作废上一回合还挂着的待投终态
+      // 新回合开始：作废上一回合还挂着的待投终态（但绝不置「本回合已上报」）
       beginTurn(keys);
-      // 建档门槛（见 seenActivity）：DSH rc.3+ 开屏预创建的空会话也走 running，
-      // 没有任何 session/event 就不该建档——否则「思考中」幻影挂 10 分钟后
-      // 被判死（红光 + 失败音）。真实回合的 turn/start 比这条心跳晚几十毫秒，
-      // 建档时机几乎不变。
-      if (hasActivity(keys)) {
-        postActivity({
-          sessionId,
-          cwd: cwdOf(agent, session),
-          isSubagent: isSubagentOf(agent, session),
-          parentSessionId: parentStringOf(agent, session),
-        });
-      }
+      // 这里**不**排对账定时器：收尾的对账点有三个（turn-stopping / turn/end / idle），
+      // 周期心跳还会在读日志时兜一次；在回合开头多排一个必然空转（回合正开着）。
       return;
     }
     if (payload.status !== "idle") return;
@@ -1107,47 +1441,40 @@ export function apply(ctx) {
     for (const k of keys) {
       if (running.delete(k)) wasRunning = true;
     }
-    // 本会话转不活跃：检查被扣住的祖先完成该不该放行（heldCompletions 的释放点）
+    // 注意：这里**不**停对账定时器。idle 边沿可能比 turn/end 先到（或干脆不来），
+    // 让对账再跑一跳，它自己会在「回合关着且已报过」时停掉（见 startHeartbeat）。
+    if (!wasRunning) {
+      // 本会话本来就不活跃：仍要检查被扣住的祖先完成能不能放行（heldCompletions 的释放点）
+      releaseHeld();
+      return;
+    }
+    // 收尾挂在**静止边沿**而不是每个 turn 上：一次运行可能跨多个 turn
+    // （goal run / 排队的输入共享一个 running 区间），按 turn 通知会刷屏并提前播报完成。
+    // 顺序讲究：先把自己的终态报出去，再放行被扣住的祖先完成——否则「子代理结束」与
+    // 「父完成」会倒序，daemon 侧先看到父完成、后看到子代理收尾。
+    if (trackTurnOf(keys) === false) {
+      // `turn/end` 已经落盘（正常顺序）：立刻收尾
+      cancelRest(keys);
+      reportAtRest(agent, session, keys);
+    } else {
+      // 还没等到 `turn/end`：先挂一个宽限窗（两条通道帧序没有保证），
+      // 期间若 turn/end 到了会提前收尾，见第 6 段
+      scheduleRest(agent, session, keys);
+    }
     releaseHeld();
-    // 兜底终态同样过建档门槛：空会话的 running→idle（开屏唤醒即眠）不该报一条
-    // 假完成——真实回合必有回合级事件置位，不受影响
-    if (!wasRunning || !hasActivity(keys) || isSettledOf(keys)) return;
-    const reason = reasonOf(keys);
-    if (reason === "aborted" || reason === "interrupted") {
-      // 用户主动中止：既不是完成（不亮完成色、不谎报跑完）也不是失败（不亮失败色、不弹「任务失败」）
-      void settle("run_aborted", agent, session, { sessionId, message: "回合已中止" });
-      return;
-    }
-    if (reason === "error" || reason === "blocked") {
-      void settle("run_failed", agent, session, {
-        sessionId,
-        message: reason === "blocked" ? "回合被拦截" : "回合出错",
-      });
-      return;
-    }
-    // max-tokens：至少一个 step 撞到输出 token 上限，回合结束了但任务是被截断的，
-    // 不能报「任务完成」（否则用户以为结果完整）。其余（completed 及未来新增类型）按完成。
-    if (reason === "max-tokens") {
-      const text = lastAssistantText(session);
-      // 标记放**前缀**：daemon 侧正文只截前 200 字，放后缀会被截掉
-      void settle("run_completed", agent, session, {
-        sessionId,
-        message: text ? `〔达到输出上限〕${text}` : "回合达到输出上限结束",
-      });
-      return;
-    }
-    void settle("run_completed", agent, session, { sessionId, message: lastAssistantText(session) });
   }), { global: true });
 
-  // 3) 回合/步骤出错（emit）：报失败（走终态投递，失败会重投），
-  //    并让随后的 idle 不再报一条「完成」。
+  // 3) 请求/步骤出错（emit）：**只记正文，不立即报失败**。
+  //    DSH 的请求级错误会自动重试（`llm/retry*` 就是这条路），当场弹「任务失败」是噪音；
+  //    真正的失败会落成 `turn/end` 的 reason=`error`（durable 的收尾信号）。
+  //    记下来的正文供静止收尾使用：没有 reason 却又出过错时按失败报，绝不谎报完成。
   ctx.on("agent/error", (payload) => observe(() => {
     const agent = payload && payload.agent;
     const session = agent && agent.session;
-    void settle("run_failed", agent, session, {
-      sessionId: sessionIdOf(agent, session),
-      message: errorText(payload && payload.error),
-    });
+    const keys = idKeys(agent, session, sessionIdOf(agent, session));
+    const text = errorText(payload && payload.error);
+    for (const k of keys) lastError.set(k, text);
+    return undefined;
   }), { global: true });
 
   // 4) 等待用户授权（waterfall：观察完必须 next()，否则会把请求吞掉）。
@@ -1196,33 +1523,64 @@ export function apply(ctx) {
     return next();
   });
 
-  // 6) 会话日志（session/event(session, event)，emit）：tool/call 发心跳（带 tool_name，
-  //    面板显示「执行工具」；**含子代理**——它的活动经 parent_session_id 向祖先传播
-  //    存活），其余事件节流后当保活心跳（长思考/长子代理续命），并记下 turn/end 的
-  //    reason 供 idle 兜底分类。
+  // 6) 会话日志（session/event(session, event)，emit）——**唯一的建档与心跳来源**。
+  //
+  //    回合边界只认日志事件（`turn/start` / `turn/end`），与官方 `turnBoundary` 投影同口径：
+  //    - `turn/start`：**建档**（发一条不带 keepalive 的 activity：新建行 + 点亮思考色）、
+  //      标记回合开着、启动静默期保活心跳；
+  //    - `tool/call`：带 tool_name 的 activity（面板显示「执行工具」；**含子代理**——它的
+  //      活动经 parent_session_id 向祖先传播存活），只在回合开着时发；
+  //    - `turn/end`：记下 reason 与回合号、关掉保活心跳，agent 已知静止时排一次收尾；
+  //    - 其余事件：**只有回合开着时**才折叠成节流保活（keepalive，只续命不建档）。
+  //      回合外到达的会话级事件（title / end-seed / compaction / command / model/selection…）
+  //      一律不再上报——它们正是「没有会话在跑、面板却挂着一条思考中」的来源。
   ctx.on("session/event", (session, event) => {
     try {
       const type = event && event.type;
       const sessionId = sessionIdOf(undefined, session);
-      // 双键登记（§2.12）：这里只有 session.id，而 idle 兜底可能按 agent.id 查；
+      // 双键登记（§2.12）：这里只有 session.id，而静止边沿可能按 agent.id 查；
       // idKeys 顺手记血缘（hasActiveDescendants 的父子树靠它重建）
       const keys = idKeys(undefined, session, sessionId);
       if (!keys.length) return;
-      // 建档门槛（见 seenActivity）：只有回合级事件才算「真的在干活」。开屏预创建
-      // 的空会话也可能发零星生命周期事件，「任何事件都算」挡不住（ProNet 实测）
+      // 兜底门槛（老版本 DSH 拿不到回合投影时用）：只有回合级事件才算「真的在干活」。
+      // 开屏预创建的空会话也可能发零星生命周期事件，「任何事件都算」挡不住（ProNet 实测）
       if (type === "turn/start" || type === "tool/call" || type === "assistant/message") {
         for (const k of keys) seenActivity.set(k, true);
-      }
-      if (type === "turn/end") {
-        const reason = event.data && event.data.reason;
-        const kind = asText(reason && reason.kind);
-        for (const k of keys) lastReason.set(k, kind);
-        return;
       }
       const isSub = isSubagentOf(undefined, session);
       const parent = parentStringOf(undefined, session);
       const cwd = cwdOf(undefined, session);
+
+      if (type === "turn/start") {
+        for (const k of keys) {
+          turnOpen.set(k, true);
+          turnRan.set(k, true);
+        }
+        // 宽限窗内又开了新回合（排队的输入 / 立刻追问）= 同一次运行继续，取消待收尾
+        cancelRest(keys);
+        // **唯一建档点**：不带 keepalive 的 activity 才允许 daemon 新建条目
+        postActivity({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent });
+        startHeartbeat(keys, session);
+        return;
+      }
+
+      if (type === "turn/end") {
+        const reason = event.data && event.data.reason;
+        const turn = event.data && event.data.turn;
+        for (const k of keys) {
+          lastReason.set(k, asText(reason && reason.kind));
+          turnOpen.set(k, false);
+          if (typeof turn === "number") lastTurnNo.set(k, turn);
+        }
+        // 收尾**不能只挂在 turn/end 事件上**：2026-09-30 实测这个事件可能根本送不到插件
+        // （日志里有 turn/end、插件没收到），所以这里只当「早一点收尾」的快路径；
+        // 真正的兜底是 startHeartbeat 的对账（读日志）+ idle 边沿两条。
+        scheduleRest(undefined, session, keys);
+        return;
+      }
+
       if (type === "tool/call") {
+        if (!busyOf(session, keys)) return;
         postActivity({
           sessionId,
           cwd,
@@ -1235,39 +1593,30 @@ export function apply(ctx) {
       // 用户操作 / 审批审计 / 提问审计不算「agent 活跃」：前者会把静默当活跃，
       // 后两者会把刚亮起的等待色打回思考色（见 postLiveness 的说明）
       if (typeof type === "string" && /(user\/|approval\/|question|plan-review)/.test(type)) return;
-      // 其余事件（step/*、未知新增类型）按「还活着」处理——但只对**已过建档门槛**
-      // 的会话：生命周期噪音不该给空会话续命建档。未知类型宁可当活跃
-      // （向后兼容新词汇，社区 turn-tracker 同口径），⚠️ DSH 升级新增事件类型时
-      // 这里无需跟着改
-      if (!hasActivity(keys)) return;
+      // 其余事件（step/*、tool/result、未知新增类型）只在回合开着时续命。未知类型宁可当活跃
+      // （向后兼容新词汇，社区 turn-tracker 同口径），⚠️ DSH 升级新增事件类型时这里无需跟着改
+      if (!busyOf(session, keys)) return;
       postLiveness({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent });
     } catch {
       // 日志结构随版本变动，观察者绝不打断会话
     }
   }, { global: true });
 
-  // 7) 会话销毁：清掉各张记忆表，避免长驻 dsh 进程里无界增长。
-  //    正在重投/被扣住的终态一并取消——会话都没了，再投只会往 daemon 塞一条无主事件。
+  // 7) 会话销毁：**先补一条「已中止」把 daemon 的条目收掉**，再清记忆表
+  //    （长驻 dsh 进程里这几张表必须有界）。
+  //    少了这条收尾，被关闭的会话会一直挂在 daemon 的「运行中」表里，直到 10 分钟判死
+  //    ——用户实测症状之一：关掉会话后卡片还留着一条「思考中」。
   ctx.on("agent/disposed", (payload) => observe(() => {
     const agent = payload && payload.agent;
-    const sessionId = sessionIdOf(agent, agent && agent.session);
-    const keys = idKeys(agent, agent && agent.session, sessionId);
+    const session = agent && agent.session;
+    const sessionId = sessionIdOf(agent, session);
+    const keys = idKeys(agent, session, sessionId);
     if (!keys.length) return;
-    // 记忆表都按双键清（§2.12）：只清一个键会留下孤儿记忆
-    for (const k of keys) {
-      running.delete(k);
-      settledSessions.delete(k);
-      lastReason.delete(k);
-      lastLivenessAt.delete(k);
-      seenActivity.delete(k);
-      // 血缘边双向清（正向 parentOf/familyOf + 反向 childrenOf），并把子树从
-      // 父亲侧断开：会话都没了，它名下的后代树不再参与递归判定
-      const parent = parentOf.get(k);
-      if (parent && childrenOf.has(parent)) childrenOf.get(parent).delete(k);
-      parentOf.delete(k);
-      familyOf.delete(k);
-      childrenOf.delete(k);
-    }
+    const turn = lastTurnNoFor(keys);
+    const wasActive = keys.some((k) => running.has(k)) || keys.some((k) => turnRan.get(k) === true);
+    stopHeartbeat(keys);
+    cancelRest(keys);
+    // 上一回合的待投 / 被扣终态作废：会话都没了，再投只会往 daemon 塞一条无主事件
     const held = keys.map((k) => heldTerminal.get(k)).find(Boolean);
     if (held) {
       for (const k of held.keys) heldTerminal.delete(k);
@@ -1276,6 +1625,29 @@ export function apply(ctx) {
     if (job) {
       if (job.timer !== null) clearTimeout(job.timer);
       for (const k of job.keys) pendingTerminal.delete(k);
+    }
+    // 记忆表都按双键清（§2.12）：只清一个键会留下孤儿记忆
+    for (const k of keys) {
+      running.delete(k);
+      settledSessions.delete(k);
+      lastReason.delete(k);
+      lastTurnNo.delete(k);
+      lastLivenessAt.delete(k);
+      seenActivity.delete(k);
+      turnOpen.delete(k);
+      turnRan.delete(k);
+      lastError.delete(k);
+      // 血缘边双向清（正向 parentOf/familyOf + 反向 childrenOf），并把子树从
+      // 父亲侧断开：会话都没了，它名下的后代树不再参与递归判定
+      const parent = parentOf.get(k);
+      if (parent && childrenOf.has(parent)) childrenOf.get(parent).delete(k);
+      parentOf.delete(k);
+      familyOf.delete(k);
+      childrenOf.delete(k);
+    }
+    // 收尾放在清理之后：settle 自己会登记 pendingTerminal / 已上报记账，别被上面清掉
+    if (wasActive) {
+      void settle("run_aborted", agent, session, { sessionId, message: "会话已关闭", turn });
     }
     // 活跃度变了：被扣住的祖先完成可能该放行了
     releaseHeld();
@@ -1391,8 +1763,29 @@ mod tests {
             2,
             "两个 waterfall 监听都要 next()"
         );
-        // 终态去重：turn-stopping 与 status idle 前后脚到，按 running→idle 周期只报一次
-        assert!(js.contains("settledSessions") && js.contains("isSettledOf("));
+        // 终态去重：**按回合号**记账（settledSessions 现在记的是回合标记）——
+        // `agent/turn-stopping` 只是「本可收尾」的闸门、可以被 steer 打开，
+        // 按 running→idle 周期去重会把真终态吞掉（社区事故 agent-presence#83 同因）。
+        assert!(
+            js.contains("settledSessions") && js.contains("isSettledOf(") && js.contains("function turnMarker("),
+            "终态去重必须按回合标记（不是按 running→idle 周期）"
+        );
+        // 收尾挂在静止边沿 + durable 的 turn/end 上，turn-stopping 只作提示、绝不发终态
+        assert!(
+            js.contains("function reportAtRest(") && js.contains("openTurnStartSeq !== null"),
+            "收尾必须由官方回合投影（turnBoundary.openTurnStartSeq）把关"
+        );
+        let stopping_body = js
+            .split("ctx.on(\"agent/turn-stopping\"")
+            .nth(1)
+            .expect("缺少 turn-stopping 监听")
+            .split("ctx.on(")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !stopping_body.contains("settle("),
+            "turn-stopping 不得再当终态（官方：can steer to keep it open）: {stopping_body}"
+        );
     }
 
     /// 终态投递可靠性的结构约束。
@@ -1428,8 +1821,8 @@ mod tests {
             .expect("缺少 finishTerminal");
         let finish_body = finish.split("\n}").next().unwrap_or("");
         assert!(
-            finish_body.contains("markSettled(keys)"),
-            "markSettled 只能在送达路径上（双键登记）: {finish_body}"
+            finish_body.contains("markSettled(keys, turn)"),
+            "markSettled 只能在送达路径上（双键 + 回合标记）: {finish_body}"
         );
         let settle_body = js
             .split("async function settle(")
@@ -1507,16 +1900,43 @@ mod tests {
         );
         // 5) 建档门槛：空会话（DSH rc.3+ 开屏预创建、零事件）不发心跳——
         //    否则「思考中」幻影挂 10 分钟后被判死（红光 + 失败音）。
-        //    门槛必须是「回合级事件」而非「任何事件」：开屏空会话也会发零星
-        //    生命周期事件（ProNet 实测，宽口径挡不住）
+        //    门槛分三层：官方回合投影（turnBoundary）→ 本进程日志推理（turn/start…turn/end）
+        //    → 最老版本的 running / 见过回合级事件。**绝不**用「最近有没有事件」推断。
         assert!(
             js.contains("const seenActivity = new Map()")
                 && js.contains("function hasActivity(keys)")
                 && js.contains(
                     "type === \"turn/start\" || type === \"tool/call\" || type === \"assistant/message\""
                 )
-                && js.contains("if (hasActivity(keys))"),
-            "心跳必须有回合级建档门槛: {js}"
+                && js.contains("function busyOf(session, keys)")
+                && js.contains("return keys.some((k) => running.has(k)) || hasActivity(keys);"),
+            "心跳必须有分层建档/放行门槛: {js}"
+        );
+        assert!(
+            js.contains("ctxRef.sessionProjections") && js.contains("stateOf(session, \"turnBoundary\")"),
+            "必须优先读官方回合投影（拿不到才退回日志推理）: {js}"
+        );
+        // 唯一建档点：turn/start 的不带 keepalive 的 activity；
+        // 保活心跳一律 keepalive=true（daemon 侧只续命、绝不建档）
+        let start_body = js
+            .split("if (type === \"turn/start\")")
+            .nth(1)
+            .expect("缺少 turn/start 分支")
+            .split("if (type === \"turn/end\")")
+            .next()
+            .unwrap_or("");
+        assert!(
+            start_body.contains("postActivity(") && start_body.contains("startHeartbeat("),
+            "turn/start 必须是唯一的建档点并启动静默保活: {start_body}"
+        );
+        assert!(
+            js.contains("body.keepalive = true") && js.contains("function startHeartbeat(keys, session)"),
+            "保活心跳必须带 keepalive 标志（daemon 据此不建档）: {js}"
+        );
+        // 空转守卫：唤醒但没真回合（消息被清空 / 只是回执唤醒）不报完成
+        assert!(
+            js.contains("const turnRan = new Map()") && js.contains("turnRan.get(k) === true"),
+            "静默收尾必须有空转守卫: {js}"
         );
         let status_body = js
             .split("ctx.on(\"agent/status\"")
@@ -1526,8 +1946,12 @@ mod tests {
             .next()
             .unwrap_or("");
         assert!(
-            status_body.contains("hasActivity(keys)"),
-            "门槛要挡在 status 心跳上: {status_body}"
+            !status_body.contains("postActivity("),
+            "running 边沿不得建档（空唤醒 / 开屏空会话都会走 running）: {status_body}"
+        );
+        assert!(
+            status_body.contains("reportAtRest(") || status_body.contains("scheduleRest("),
+            "静止边沿必须收尾: {status_body}"
         );
     }
 
@@ -2048,12 +2472,15 @@ mod tests {
     fn generated_plugin_dual_key_session_memory() {
         let js = plugin_js(1234, "tok");
         assert!(js.contains("function idKeys(agent, session, primary)"), "{js}");
-        // lastReason：双键登记 + 两键查询
-        assert!(js.contains("for (const k of keys) lastReason.set(k, kind);"), "lastReason 双键登记");
+        // lastReason：双键登记 + 两键查询（登记发生在 keys 循环里）
+        assert!(
+            js.contains("lastReason.set(k, asText(reason && reason.kind));"),
+            "lastReason 双键登记"
+        );
         assert!(js.contains("function reasonOf(keys)"), "lastReason 两键都查");
-        // settled / pending / running 同款
-        assert!(js.contains("function markSettled(keys)"), "settledSessions 双键登记");
-        assert!(js.contains("isSettledOf(keys)"), "settledSessions 两键都查");
+        // settled（按回合标记）/ pending / running 同款
+        assert!(js.contains("function markSettled(keys, turn)"), "settledSessions 双键登记");
+        assert!(js.contains("function isSettledOf(keys, turn)"), "settledSessions 两键都查");
         assert!(js.contains("for (const k of keys) pendingTerminal.set(k, job);"), "pendingTerminal 双键登记");
         assert!(js.contains("for (const k of keys) running.add(k);"), "running 双键登记");
         // 注释里必须写明为什么（键分裂会让中止/出错回合被报成「任务完成」）

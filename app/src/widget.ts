@@ -13,14 +13,9 @@
 // 关闭时还原。坐标口径：配置里的 x/y 是卡片左上角（逻辑像素），
 // Rust 建窗与这里的位置上报共用这一口径（见 widget.rs 模块注释）。
 //
-// 自动隐藏（widget.auto_hide）：可见性状态机也在这里——安静（无行 /
-// 全部行属思考类）持续 2 秒 → 淡出后 win.hide()；出现需要关注的行
-// （等待确认 / 等待输入 / 任务完成 / 任务失败）→ 立即 win.show() 淡入；
-// **新会话行**（= 新的事件流）出现时也弹出「一下」（照常 2 秒后随安静隐藏），
-// 给「刚发的任务被接手了」一个回执。手动中止（run_aborted）的「已中止」
-// 驻留行不算新会话、不弹（与光效「手动中止不提醒」同口径）；
-// 悬停 / 拖动 / 右键菜单打开期间挂起隐藏。auto_hide 开着时
-// Rust 建窗即隐藏（登录不闪卡片），首批数据到达后才决定要不要弹出。
+// 自动隐藏（widget.auto_hide）：可见性状态机也在这里，完整规则与口径见
+// 下方「自动隐藏」一节。auto_hide 开着时 Rust 建窗即隐藏（登录不闪卡片），
+// 首批数据到达后才决定要不要弹出。
 
 import { listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
@@ -55,7 +50,7 @@ const TERMINAL_HOLD_MS = 6000;
 /** 拖动停止多久后再读窗口位置落盘（等 OS 拖拽循环安静下来） */
 const SAVE_DELAY_MS = 220;
 /** 转入安静后多久隐藏（需求给定的固定值，不做配置项） */
-const HIDE_DELAY_MS = 2000;
+const HIDE_DELAY_MS = 5000;
 /** 淡入 / 淡出时长（CSS 过渡同值，见 widget.html） */
 const FADE_MS = 160;
 
@@ -215,14 +210,15 @@ async function syncWindowSize() {
 
 // ---- 自动隐藏（安静即隐、有事即现）----
 //
-// 规则（口径见文件头）：
+// 规则（隐藏时长唯一出处是 HIDE_DELAY_MS，注释不重复具体秒数）：
 // - 有事（任一行 attention）→ 立即淡入弹出，并取消待隐藏计时；
-// - 新会话行（= 新的事件流）出现 → 弹出「一下」：照常计 2 秒安静隐藏，
-//   只当「任务被接手」的回执，不与有事档的驻留抢戏；
-// - 安静（无行 / 全部行不 attention）→ 2 秒去抖后淡出隐藏，期间回到有事则取消；
-//   安静期间的行数抖动（思考中 ↔ 执行工具）不重排计时，别把隐藏无限推迟；
+// - 新会话行（= 新的事件流）出现 → 弹出「一下」：不做特殊驻留、照常随
+//   安静去抖隐藏，只当「任务被接手」的回执，不与有事档的驻留抢戏；
+// - 安静（无行 / 全部行不 attention）→ 去抖 HIDE_DELAY_MS 后淡出隐藏，
+//   期间回到有事则取消；安静期间的行数抖动（思考中 ↔ 执行工具）不重排
+//   计时，别把隐藏无限推迟；
 // - 悬停 / 拖动 / 右键菜单打开期间挂起隐藏（正在读卡、拖动、点菜单时窗口不能跑），
-//   解除后重新计 2 秒；
+//   解除后重新起算；
 // - 关闭自动隐藏 → 取消一切计时并立即恢复常驻（含当时正隐藏 / 淡出的情况）。
 //
 // 隐藏 = win.hide()（不占任务栏、彻底不见），弹出 = win.show()；窗口是
@@ -245,7 +241,7 @@ let hovering = false;
 let lastMoveAt = 0;
 /** hide / show 完成回调的代号：翻转可见性就递增，在途的旧回调作废 */
 let visGen = 0;
-/** 安静去抖（2 秒）定时器 */
+/** 安静去抖定时器 */
 let hideTimer = 0;
 /** 淡出过渡（结束才真正 hide）定时器 */
 let fadeTimer = 0;
@@ -275,7 +271,7 @@ function evaluateVisibility(rows: Row[] = currentRows()) {
     showCard();
     return;
   }
-  // 新流的「一下」= 照常 2 秒后随安静隐藏；已可见时不抢已在走的计时
+  // 新流的「一下」= 照常随安静去抖隐藏；已可见时不抢已在走的计时
   if (newStream && (hidden || fadingOut())) {
     showCard();
     scheduleHide();
@@ -292,7 +288,7 @@ function evaluateVisibility(rows: Row[] = currentRows()) {
   scheduleHide();
 }
 
-/** 排一次「安静 2 秒后隐藏」（已排过就沿用旧计时，见规则第三条） */
+/** 排一次「安静后隐藏」（已排过就沿用旧计时，见规则第三条） */
 function scheduleHide() {
   if (hideTimer) return;
   hideTimer = window.setTimeout(() => {
@@ -458,7 +454,7 @@ document.addEventListener("mouseup", () => {
   // 兜底路径（主路径是 startDragging 的 .finally，见上面 mousedown 处理器）：
   // 等 OS 拖拽循环安静下来再读最终位置（松手瞬间 outerPosition 可能还没落定）
   schedulePositionSave();
-  evaluateVisibility(); // 拖动结束：安静的话从现在起计 2 秒隐藏
+  evaluateVisibility(); // 拖动结束，解除挂起
 });
 
 // 双击悬浮窗的动作并入上面的 mousedown（e.detail >= 2）——见那里的原因说明。
@@ -575,7 +571,7 @@ async function closeMenuImpl() {
     /* 窗口可能已被销毁（右键 → 关闭悬浮窗） */
   }
   menuMoving = false;
-  evaluateVisibility(); // 菜单收起后才允许隐藏（打开期间挂着），重新计 2 秒
+  evaluateVisibility(); // 菜单收起，解除挂起
 }
 
 document.addEventListener("contextmenu", (e) => {
@@ -597,7 +593,7 @@ document.addEventListener("mouseenter", () => {
   if (fadingOut()) showCard();
 });
 // 光标离开窗口也收起：窗口外点击我们收不到，菜单会一直悬在别的应用上面。
-// 同时解除悬停挂起：安静的话从离开起重新计 2 秒隐藏（悬停期间不计时）
+// 同时解除悬停挂起（悬停期间不计时）
 document.addEventListener("mouseleave", () => {
   hovering = false;
   if (!dragging) void closeMenu().catch((err) => console.warn("收起悬浮窗菜单失败：", err));

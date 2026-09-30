@@ -172,6 +172,7 @@ mod tests {
             is_subagent: false,
             tool_name: None,
             parent_session_id: None,
+            keepalive: false,
         }
     }
 

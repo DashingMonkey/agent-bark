@@ -120,6 +120,19 @@ pub struct NormalizedEvent {
     /// 只有显式声明血缘的 adapter 才填（目前仅 DSH 插件）；hook 型事件恒为 None。
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// **纯保活心跳**（不是活动信号）：只允许刷新已有条目的存活时刻，**绝不建档**。
+    ///
+    /// 引入它的原因（DSH 实测，2026-09-30）：插件按「回合开着就定期补心跳」续命时，
+    /// 会与「回合早已结束、但某条迟到的会话级事件仍被当成活跃」共用同一个 `tool_finished`
+    /// 类型。后者在表里没有条目、又过了 10 秒回声窗时会**凭空建出一条「思考中」**——
+    /// 这条行没有任何终态能收掉，挂满 10 分钟由判死巡检清场（红光 + 失败音），
+    /// 用户看到的就是「没有会话却一直显示一个事件流在思考中」。
+    ///
+    /// 语义边界：hook 型 agent（Claude Code 系只订阅 PostToolUse，靠它建档）**不带**该标志，
+    /// 行为不变；只有「明确知道自己只是在续命」的插件（目前仅 DSH 的周期心跳与
+    /// 回合内保活）才置 true。
+    #[serde(default)]
+    pub keepalive: bool,
 }
 
 impl NormalizedEvent {
@@ -178,6 +191,9 @@ impl NormalizedEvent {
             // 父会话存活由各自的 hook 心跳负责；向祖先传播只给显式声明血缘的
             // adapter（目前仅 DSH 插件直接 POST 的事件带 parent_session_id）
             parent_session_id: None,
+            // hook 型事件都是「真信号」（PostToolUse 是 Claude 系唯一的心跳，靠它建档）：
+            // 纯保活标志只由插件型 adapter 在自己的周期心跳上显式置位
+            keepalive: false,
         }
     }
 

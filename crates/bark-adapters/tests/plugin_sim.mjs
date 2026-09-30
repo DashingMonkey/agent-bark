@@ -87,18 +87,41 @@ async function flush(times = 6) {
   await new Promise((resolve) => realSetTimeout(resolve, 0));
 }
 
+/**
+ * 触发**恰好一个**匹配的定时器。
+ *
+ * 周期保活心跳是「自续排」定时器：`advance()` 的忙等语义会把同一个 20s 延迟连烧
+ * 64 轮（守卫直接判失败），反而看不出「回合关了之后有没有停」。这里只推一次，
+ * 让插件自己决定要不要再排下一跳。
+ */
+async function fireTimer(predicate) {
+  const due = timers.filter(predicate);
+  if (due.length === 0) return false;
+  const t = due[0];
+  timers.splice(timers.indexOf(t), 1);
+  t.fn();
+  await flush();
+  return true;
+}
+
 // --- DSH 侧的最小桩 ---------------------------------------------------------
 
 /** 假 DSH：收集插件注册的监听器，并提供 dispatch 辅助。 */
-function makeCtx() {
+function makeCtx(options = {}) {
   const listeners = new Map();
-  return {
+  const ctx = {
     /** 与 cordis 的 ctx.on(name, listener) 同形 */
     on(name, listener) {
       if (!listeners.has(name)) listeners.set(name, []);
       listeners.get(name).push(listener);
     },
     async dispatch(name, ...args) {
+      // session/event 会被顺手写进桩会话的「日志」（seq + eventAt）：插件现在按官方契约
+      // 从会话日志推导回合状态，桩会话必须像真会话一样能回扫到 turn/start、turn/end。
+      if (name === 'session/event') {
+        const [session, event] = args;
+        if (session && Array.isArray(session.__events) && event) session.__events.push(event);
+      }
       for (const listener of listeners.get(name) ?? []) await listener(...args);
       await flush();
     },
@@ -116,11 +139,57 @@ function makeCtx() {
     },
     listenerCount: (name) => (listeners.get(name) ?? []).length,
   };
+  // 官方回合边界服务（`ctx.sessionProjections`）：不传 = 老版本 DSH，插件走兜底推理
+  if (options.projections) ctx.sessionProjections = options.projections;
+  return ctx;
+}
+
+/**
+ * 假 `sessionProjections`：模拟官方 `turnBoundary` 投影
+ * （`turn/start` 置 `openTurnStartSeq`、`turn/end` 置回 null）。
+ */
+function makeProjections() {
+  const state = new Map();
+  const read = (session) => {
+    let s = state.get(session);
+    if (s === undefined) {
+      s = { openTurnStartSeq: null, lastStepStartSeq: null, lastStepBoundary: null, lastTurn: 0 };
+      state.set(session, s);
+    }
+    return s;
+  };
+  return {
+    stateOf(session, key) {
+      if (key !== 'turnBoundary' || !session) return undefined;
+      return read(session);
+    },
+    open(session, seq = 1) {
+      const s = read(session);
+      s.openTurnStartSeq = seq;
+      s.lastTurn += 1;
+    },
+    close(session) {
+      read(session).openTurnStartSeq = null;
+    },
+  };
 }
 
 /** 假 Agent：session.header 是 cwd / 子代理判定 / 血缘（parentSession）的唯一来源 */
 function makeAgent(id, cwd = 'D:\\proj\\demo', headerExtra = {}) {
-  const session = { id, header: { cwd, ...headerExtra }, seq: 3, eventAt: () => null };
+  // 桩会话带一份「日志」：seq = 已写条数（下一个可写下标），eventAt(i) 按真 DSH 语义取第 i 条。
+  // 插件按官方契约从日志推导回合状态（不依赖事件一定送到），所以这里必须真的记下来。
+  const events = [];
+  const session = {
+    id,
+    header: { cwd, ...headerExtra },
+    __events: events,
+    get seq() {
+      return events.length;
+    },
+    eventAt(i) {
+      return Number.isInteger(i) && i >= 0 && i < events.length ? events[i] : null;
+    },
+  };
   return { id, session };
 }
 
@@ -170,10 +239,13 @@ console.log('case 1: 终态首投失败（503）必须重投并送达');
   plugin.apply(ctx);
   const agent = makeAgent('sess-1');
 
-  // 回合开始（无工具名的心跳代表新回合开始）
+  // 一个回合：turn/start 建档 → turn/end 落盘 → 静止边沿收尾
+  // （收尾不再挂在 agent/turn-stopping 上：官方说它「can steer to keep it open」）
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   behavior = 'fail'; // daemon 事件通道打满
-  await ctx.dispatch('agent/turn-stopping', { agent, turn: 1, signal: {} });
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
   const first = sent.filter((e) => e.type === 'run_completed');
   check(first.length === 1 && first[0].rejected, '首投确实发出且被 503 拒绝（503 不算送达）');
   check(terminals('run_completed').length === 0, '被拒的首投不算送达');
@@ -210,8 +282,11 @@ console.log('case 2: 首投成功时终态只报一次');
   plugin.apply(ctx);
   const agent = makeAgent('sess-2');
 
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent, status: 'running' });
+  // 回合收尾闸门照常触发（现在只作回合号提示，不再当场发终态）
   await ctx.dispatch('agent/turn-stopping', { agent, turn: 1, signal: {} });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   await ctx.dispatch('agent/status', { agent, status: 'idle' });
   await advance();
 
@@ -237,11 +312,12 @@ console.log('case 3: 首投失败时 status idle 兜底不得被「已终态」�
   await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent, status: 'running' });
   behavior = 'throw'; // daemon 没起来：连接被拒
-  await ctx.dispatch('agent/turn-stopping', { agent, turn: 1, signal: {} });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await advance(); // 宽限窗到点 → 首投 + 重投全部被拒 → 放弃（但账要清干净）
   check(terminals('run_completed').length === 0, '连接被拒时终态没有到达 daemon');
 
   // 兜底信号：终态没送达，随后的 status idle 必须再报一次
-  // （旧实现这里被「投递前就置位的已终态」挡住 → 这条终态永久丢失）
+  // （旧实现这里被「投递前就置位的已终态」/「没清干净的待投账」挡住 → 这条终态永久丢失）
   behavior = null;
   await ctx.dispatch('agent/status', { agent, status: 'idle' });
   await advance();
@@ -267,20 +343,23 @@ console.log('case 4: 心跳失败不重试（丢了下一跳会补）');
   plugin.apply(ctx);
   const agent = makeAgent('sess-4');
 
-  // 先有过一次会话事件（建档门槛）：之后的心跳才放行
+  // 回合开着才有心跳：turn/start 先建档（这条不带 keepalive，允许建行）
   await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await flush();
+  const before = activities().length;
+  check(before === 1, `turn/start 建档一条 activity（实际 ${before} 条）`);
+
   behavior = 'fail';
-  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { name: 'Bash' } });
   await flush();
-  check(activities().length === 1, `心跳首投发出（实际 ${activities().length} 次）`);
+  check(activities().length === before + 1, `工具心跳首投发出（实际新增 ${activities().length - before} 次）`);
   check(terminals('run_failed').length === 0 && terminals('run_completed').length === 0, '心跳不产生终态事件');
 
   // 心跳只允许一次即时补投，且**不进终态重投队列**（1s 起的退避一轮都不该有）
   await advance(400);
-  check(activities().length === 1, `400ms 内不补投（实际 ${activities().length} 次）`);
+  check(activities().length === before + 1, `400ms 内不补投（实际 ${activities().length - before} 次）`);
   await advance();
-  check(activities().length === 2, `心跳最多补一次就放弃（实际 ${activities().length} 次）`);
+  check(activities().length === before + 2, `心跳最多补一次就放弃（实际 ${activities().length - before} 次）`);
   dump('case4');
 }
 
@@ -295,9 +374,12 @@ console.log('case 5: 新回合开始要取消上一回合还挂着的重投');
   plugin.apply(ctx);
   const agent = makeAgent('sess-5');
 
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   behavior = 'fail';
-  await ctx.dispatch('agent/turn-stopping', { agent, turn: 1, signal: {} });
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
+  await flush();
   behavior = null;
   // 重投还没跑（1s 退避未到点），用户立刻又发了一轮 → 新回合开始，旧终态作废。
   // 按**语义**断言退避定时器的存在/取消（§4.18：不断言无关定时器的总数——
@@ -312,7 +394,8 @@ console.log('case 5: 新回合开始要取消上一回合还挂着的重投');
   );
 
   // 新回合自己必须照常报得出去（取消旧终态不能把新回合的终态一起去重掉）
-  await ctx.dispatch('agent/turn-stopping', { agent, turn: 2, signal: {} });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } });
   await ctx.dispatch('agent/status', { agent, status: 'idle' });
   await advance();
   check(
@@ -341,10 +424,13 @@ console.log('case 6: 后代活跃时「完成」必须扣住，全部结束后�
   const parent = makeAgent('sess-p');
   const child = makeAgent('sess-c', 'D:\\proj\\demo', { origin: 'subagent', parentSession: 'sess-p' });
 
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent: parent, status: 'running' });
+  await ctx.dispatch('session/event', child.session, { type: 'turn/start', data: {} });
   await ctx.dispatch('agent/status', { agent: child, status: 'running' });
   // 父回合先结束，但子代理还在跑：「任务完成」是提前的，必须扣住
-  await ctx.dispatch('agent/turn-stopping', { agent: parent, turn: 1, signal: {} });
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await ctx.dispatch('agent/status', { agent: parent, status: 'idle' });
   await advance();
   check(
     terminals('run_completed').length === 0,
@@ -352,7 +438,8 @@ console.log('case 6: 后代活跃时「完成」必须扣住，全部结束后�
   );
 
   // 子代理结束：先发它自己的终态，随即放行父完成
-  await ctx.dispatch('agent/turn-stopping', { agent: child, turn: 1, signal: {} });
+  await ctx.dispatch('session/event', child.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await ctx.dispatch('agent/status', { agent: child, status: 'idle' });
   await advance();
   const dones = terminals('run_completed');
   check(dones.length === 2, '子代理终态 + 放行的父终态都送达');
@@ -471,8 +558,8 @@ console.log('case 9: 预创建的空会话不建档——生命周期事件不�
   await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
   await flush();
   check(
-    sent.filter((e) => e.type === 'tool_finished').length === 1,
-    'turn/start 折叠成保活心跳（会话此刻才建档）',
+    activities().length === 1,
+    `turn/start 才建档（一条 activity，实际 ${activities().length} 条）`,
   );
 
   // 回合收尾（模拟 turn-stopping 丢失）：idle 兜底对**已过门槛**的会话必须放行
@@ -481,6 +568,244 @@ console.log('case 9: 预创建的空会话不建档——生命周期事件不�
   await advance();
   check(terminals('run_completed').length === 1, '真实回合的完成照常送达（兜底不误伤真实回合）');
   dump('case9');
+}
+
+// --- 用例 10：回合外到达的会话级事件不得再上报（幻影行的来源） ---------------
+
+console.log('case 10: 官方回合投影可用时，回合外的会话级事件一律不上报');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-phantom');
+
+  // 一个真跑过的回合：turn/start → turn/end → 静止
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  proj.close(agent.session);
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
+  await advance();
+  const settled = sent.length;
+  check(terminals('run_completed').length === 1, '这一回合照常收尾一次');
+
+  // 回合外到达的会话级事件（title / end-seed / command / model-selection / compaction…）：
+  // 旧实现把「任何事件」当「agent 还活着」，于是在 daemon 里凭空建出一条没有终态的
+  // 「思考中」——挂满 10 分钟被判死（红光 + 失败音）。这就是用户看到的那条幻影。
+  for (const type of ['session/title', 'session/end-seed', 'command/done', 'model/selection', 'compaction/end', 'assistant/message']) {
+    await ctx.dispatch('session/event', agent.session, { type, data: {} });
+    await flush();
+  }
+  check(
+    sent.length === settled,
+    `回合外的会话级事件不得再上报（多出 ${sent.length - settled} 条 = 幽灵行的来源）`,
+  );
+  check(terminals('run_completed').length === 1, '也不得再补一条终态');
+  dump('case10');
+}
+
+// --- 用例 11：回合开着时的静默窗口要定期补保活（keepalive，不建档） ----------
+
+console.log('case 11: 回合开着时的静默窗口定期补保活心跳（keepalive）');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-silent');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await flush();
+  const built = activities();
+  check(built.length === 1, `turn/start 建档一条 activity（实际 ${built.length} 条）`);
+  check(built.length === 1 && built[0].keepalive !== true, '建档心跳不带 keepalive（允许 daemon 新建条目）');
+
+  // 长工具 / 长子代理的静默窗口：一条会话事件都没有，靠周期心跳续命
+  const beat = (t) => t.ms >= 20000;
+  check(await fireTimer(beat), '回合开着时排上了周期保活定时器');
+  let beats = sent.filter((e) => e.type === 'tool_finished');
+  check(beats.length === 1 && beats[0].keepalive === true, '静默窗口补的保活带 keepalive（daemon 只续命不建档）');
+  check(await fireTimer(beat), '回合还开着就继续补下一跳');
+  beats = sent.filter((e) => e.type === 'tool_finished');
+  check(beats.length === 2, `周期心跳持续补（实际 ${beats.length} 条）`);
+
+  // 回合收尾：心跳停、静止边沿按 turn/end 的 reason 收尾一次
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  proj.close(agent.session);
+  const beatsAtClose = sent.filter((e) => e.type === 'tool_finished').length;
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
+  await advance(60000);
+  check(
+    sent.filter((e) => e.type === 'tool_finished').length === beatsAtClose,
+    '回合关了就不再补保活（否则会在已收档的会话上续命）',
+  );
+  check(terminals('run_completed').length === 1, '静止边沿按 turn/end 收尾一次');
+  dump('case11');
+}
+
+// --- 用例 12：turn-stopping 被 steer 打开时不得谎报完成，也不得吞掉真终态 ----
+
+console.log('case 12: turn-stopping 只是「本可收尾」的闸门，不是终态');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-steer');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  // 官方语义：turn-stopping「runs before an otherwise completed turn closes and
+  // can steer to keep it open」——运行还在继续，此刻报完成就是谎报
+  await ctx.dispatch('agent/turn-stopping', { agent, turn: 1, signal: {} });
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { name: 'Bash' } });
+  await flush();
+  check(terminals('run_completed').length === 0, 'turn-stopping 不得当场报完成（运行还在继续）');
+
+  // 真收尾：turn/end + 静止边沿 → 恰好一条（不能被 turn-stopping 那次去重吞掉）
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  proj.close(agent.session);
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
+  await advance();
+  check(terminals('run_completed').length === 1, '真终态照常送达（旧实现会在这里被吞掉）');
+  dump('case12');
+}
+
+// --- 用例 13：会话被关闭要补一条「已中止」，把 daemon 的条目收掉 ------------
+
+console.log('case 13: 会话销毁时补一条 run_aborted（否则条目挂到 10 分钟判死）');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-close');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatch('agent/disposed', { agent });
+  await advance();
+  const aborts = sent.filter((e) => e.type === 'run_aborted' && !e.rejected);
+  check(
+    aborts.length === 1 && aborts[0].session_id === 'sess-close',
+    `会话关闭补一条 run_aborted（实际 ${aborts.length} 条）`,
+  );
+  check(timers.length === 0, `收尾后不留定时器（实际 ${timers.length} 个）`);
+  dump('case13');
+}
+
+// --- 用例 14：idle 边沿缺失时，turn/end + 宽限窗仍要收尾 --------------------
+
+console.log('case 14: agent/status idle 边沿缺失时，turn/end + 宽限窗仍要收尾');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-noidle');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: {} });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  // 回合正常收尾，但**故意不发** agent/status idle（实测 2026-09-30：DSH 重启后
+  // 连续两个回合都没有 idle 边沿，只靠边沿收尾会让终态一条都报不出去）
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  proj.close(agent.session);
+  await advance();
+  check(
+    terminals('run_completed').length === 1,
+    `idle 边沿缺失时仍要收尾（实际 ${terminals('run_completed').length} 条）`,
+  );
+  await advance();
+  check(terminals('run_completed').length === 1, `只报一次（实际 ${terminals('run_completed').length} 条）`);
+  dump('case14');
+}
+
+// --- 用例 15：被附着但没开回合的子代理不得永久扣住父完成 --------------------
+
+console.log('case 15: 被附着但没开回合的子代理不得永久扣住父完成');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const ctx = makeCtx();
+  plugin.apply(ctx);
+  const parent = makeAgent('sess-p2');
+  const child = makeAgent('sess-c2', 'D:\\proj\\demo', { origin: 'subagent', parentSession: 'sess-p2' });
+
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/start', data: {} });
+  await ctx.dispatch('agent/status', { agent: parent, status: 'running' });
+  // 子代理被「附着」（status running）但**没有开回合**：它不是「在干活」，
+  // 不能因为它把父会话的完成永久扣住（`running` 会在附着/唤醒时翻起，与回合无关）
+  await ctx.dispatch('agent/status', { agent: child, status: 'running' });
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await ctx.dispatch('agent/status', { agent: parent, status: 'idle' });
+  await advance();
+  check(
+    terminals('run_completed').length === 1,
+    `父完成照常送达（不被空转子代理扣住，实际 ${terminals('run_completed').length} 条）`,
+  );
+  dump('case15');
+}
+
+// --- 用例 16：turn/end 事件没送到插件时，靠日志对账仍要收尾 ------------------
+
+console.log('case 16: turn/end 事件没送到插件时，靠日志对账仍要收尾');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const proj = makeProjections();
+  const ctx = makeCtx({ projections: proj });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-noev');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  proj.open(agent.session, 1);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  // 回合收尾**只落进了日志**：插件既没收到 turn/end，也没收到 agent/status idle
+  // （2026-09-30 实测就是这个状态：卡片挂死思考中、光带一直亮）
+  agent.session.__events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  proj.close(agent.session);
+  await advance();
+  check(terminals('run_completed').length === 1, `靠日志对账收尾（实际 ${terminals('run_completed').length} 条）`);
+  await advance();
+  check(terminals('run_completed').length === 1, `只报一次（实际 ${terminals('run_completed').length} 条）`);
+  dump('case16');
+}
+
+// --- 用例 17：agent/status 一条都不来时也要能收尾 ---------------------------
+
+console.log('case 17: agent/status 一条都不来时（只有回合级事件）也要能收尾');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const ctx = makeCtx();
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-nostatus');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await advance();
+  check(terminals('run_completed').length === 1, `不靠 status 也能收尾（实际 ${terminals('run_completed').length} 条）`);
+  dump('case17');
 }
 
 // --- 汇总 -------------------------------------------------------------------
