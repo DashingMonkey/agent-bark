@@ -51,10 +51,20 @@ pub struct SessionStatus {
     pub started_at: i64,
     /// 最近一次心跳（unix ms）
     pub last_activity: i64,
-    /// 父会话 key（子代理事件声明血缘，见 `NormalizedEvent::parent_session_id`）。
-    /// 供 [`touch_ancestors`] 递归向上传播存活心跳；前端不消费，不入快照。
-    #[serde(skip)]
+    /// 父会话 id（`None` = 主会话）。前端据此把子代理行挂到父行下面
+    /// 并显示血缘小字；`Some` 同时等价于「这是子代理」——只有被派生的会话才带
+    /// 血缘边（见 `new_session`），与事件侧的 `is_subagent` 同一份来源。
+    ///
+    /// **给完整 id，不给截断值**：前端要拿它和自己的 `session_id` 精确比对才能认父子，
+    /// 也要靠它判断「父行还在不在本批快照里」（不在就不能缩进，见 `sessionRows`）。
+    /// 截成尾 6 位会在多会话并存时失去这两条能力——同一个 agent 开着两个工作区时，
+    /// 两边的子代理行长得一模一样。展示用的短标识由前端自己截（`parentTail`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// 父会话的**内部 key**（`agent|session_id`，供 [`touch_ancestors_at`] 沿链递归传播
+    /// 存活心跳）。不出快照——前端要的是能直接与 `session_id` 比对的 [`Self::parent`]。
+    #[serde(skip)]
+    pub parent_key: Option<String>,
 }
 
 /// 心跳静止超过该时长的会话视为僵死（agent 被杀时不会有 Stop 事件），
@@ -1042,7 +1052,7 @@ fn touch_session_at(
 
 /// 子代理活动向**祖先**递归传播存活心跳（纯逻辑，便于测试）。
 ///
-/// 血缘边来自事件的 `parent_session_id`（建档时存进 [`SessionStatus::parent`]）：
+/// 血缘边来自事件的 `parent_session_id`（建档时存进 [`SessionStatus::parent_key`]）：
 /// 子代理干活时父会话自己没有任何事件（实测 DSH `Agent` 工具单次可跑 27 分钟、
 /// 父会话静默 21 分钟），父条目会被「心跳静止判死」误杀成意外终止（红光 + 失败音）。
 /// 与 ZCode 日志存活的 parentSessionId 传播同一套口径。
@@ -1061,7 +1071,7 @@ fn touch_ancestors_at(
             return;
         };
         entry.last_activity = now_ms;
-        let Some(next) = entry.parent.clone() else {
+        let Some(next) = entry.parent_key.clone() else {
             return;
         };
         parent_key = next;
@@ -1252,6 +1262,12 @@ fn apply_session_event_inner(
                         delta.changed = true;
                     }
                     s.last_activity = ev.timestamp;
+                    // 血缘回填：DSH 的授权请求 / 提问同样带新鲜血缘，而「建档时空血缘、
+                    // 之后只等到授权」的子代理没有别的回填机会（keepalive 不建档、Activity
+                    // 心跳的 parent 是插件启动时缓存的那份）——不补它就一直当主会话显示
+                    if backfill_lineage(s, ev) {
+                        delta.urgent = true;
+                    }
                 }
                 None => {
                     // 无条目：先看是不是回合刚结束的空闲回声
@@ -1274,6 +1290,11 @@ fn apply_session_event_inner(
                 if s.cwd.is_empty() && !ev.cwd.is_empty() {
                     s.cwd = ev.cwd.clone();
                     s.project = ev.project.clone();
+                }
+                // 血缘兜底回填（见 backfill_lineage）：补上就算结构变化，快照立即推
+                if backfill_lineage(s, ev) {
+                    delta.changed = true;
+                    delta.urgent = true;
                 }
                 match &ev.tool_name {
                     Some(tool) => {
@@ -1328,6 +1349,11 @@ fn apply_session_event_inner(
                 Some(s) => {
                     s.phase = SessionPhase::Thinking;
                     s.last_activity = ev.timestamp;
+                    // 血缘回填：工具失败同样是「这个会话还在跑」的信号，顺手把缺的血缘补上
+                    // （与 Activity / ToolFinished 同一口径，DSH 的失败事件带新鲜血缘）
+                    if backfill_lineage(s, ev) {
+                        delta.urgent = true;
+                    }
                     delta.changed = true;
                 }
                 None => {
@@ -1350,6 +1376,10 @@ fn apply_session_event_inner(
                 Some(s) => {
                     s.phase = SessionPhase::Thinking;
                     s.last_activity = ev.timestamp;
+                    // 血缘回填：DSH 的保活心跳走的正是 ToolFinished（见 backfill_lineage）
+                    if backfill_lineage(s, ev) {
+                        delta.urgent = true;
+                    }
                     delta.changed = true;
                 }
                 None => {
@@ -1419,7 +1449,26 @@ fn echo_within_grace(finished_t: i64, ev_ts: i64) -> bool {
     ev_ts >= finished_t && ev_ts.saturating_sub(finished_t) < IDLE_ECHO_GRACE_MS
 }
 
+/// 解析事件声明的父会话 id，非法值（空串 / 指向自身）一律当「没有血缘」。
+///
+/// 建档与回填共用这一条判据：`parent_session_id` 是从请求体原样反序列化的（插件照抄
+/// 会话头的 `parentSession`），自指或伪造都能透传。真出现 `parent == session_id` 时，
+/// 前端 `sessionRows` 会把这条判成子代理、却又找不到父行，于是先合成一个 ghost 父行、
+/// 再用 `visited` 键把它自己吃掉——界面上只剩一条没有徽标、没有 prompt 的假父行，
+/// 且它被判为子代理，通知 / 音效 / 全屏特效一并被门挡掉。
+/// 这里直接拒绝，让它退回「主会话」这个诚实的降级（宁可少一层缩进，不要一条假行）。
+fn valid_parent_id<'a>(ev: &'a NormalizedEvent) -> Option<&'a str> {
+    let p = ev.parent_session_id.as_deref().filter(|p| !p.is_empty())?;
+    if p == ev.session_id {
+        tracing::warn!(agent = %ev.agent, session = %ev.session_id, "parent_session_id 指向自身，已忽略");
+        return None;
+    }
+    Some(p)
+}
+
 fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
+    // 血缘：事件声明了非空 parent_session_id 才算派生会话（见 SessionStatus::parent）
+    let parent = valid_parent_id(ev);
     // 新建条目时 tool_name 存在 → 首个心跳就是 PreToolUse：tool_calls 记 1
     SessionStatus {
         agent: ev.agent.clone(),
@@ -1433,12 +1482,33 @@ fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
         tool_calls: if ev.tool_name.is_some() { 1 } else { 0 },
         started_at: ev.timestamp,
         last_activity: ev.timestamp,
-        parent: ev
-            .parent_session_id
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(|p| session_key(&ev.agent, p)),
+        // 对外的血缘边是**父会话 id 本身**（不带 agent 前缀），供前端与 session_id 精确比对
+        parent: parent.map(str::to_string),
+        parent_key: parent.map(|p| session_key(&ev.agent, p)),
     }
+}
+
+/// 回填缺失的血缘边（`parent` / `parent_key`），返回是否真的补上了。
+///
+/// 为什么必须回填：`parent` 原先**只在建档时写一次**，而建档那条事件可能拿不到血缘——
+/// DSH 插件的心跳在启动时读一次 `session.header.parentSession` 就缓存住
+/// （`startHeartbeat`），会话头异步加载时会读到空，之后所有 keepalive 心跳都带着空血缘，
+/// 而 keepalive **不建档**（防幻影行），于是这条子代理终生被当成主会话：在卡片上跟真正的
+/// 会话并排显示，用户读到的就是「子代理跑到别的会话下面去了」。cwd 早有同款回填，
+/// 血缘比 cwd 更要紧（它还决定父子挂树）。
+///
+/// 只在「当前没有父」时写：血缘一旦确立不会变，不覆盖已有值（也避免被伪造事件改写既有归属）。
+fn backfill_lineage(s: &mut SessionStatus, ev: &NormalizedEvent) -> bool {
+    if s.parent.is_some() {
+        return false;
+    }
+    // 非法血缘（空串 / 自指）由 valid_parent_id 统一挡掉，判据与建档同源
+    let Some(p) = valid_parent_id(ev) else {
+        return false;
+    };
+    s.parent = Some(p.to_string());
+    s.parent_key = Some(session_key(&ev.agent, p));
+    true
 }
 
 /// 陈旧补投判定：事件时间戳比现在还老过判死阈值。离线兜底落盘的事件
@@ -2102,8 +2172,176 @@ mod tests {
         touch_ancestors_at(&mut sessions, session_key("trae-code", "ghost"), now);
         assert!(!sessions.contains_key(&session_key("trae-code", "ghost")));
         // 环状血缘（外部输入不可信）不死循环：深度上限兜底
-        sessions.get_mut(&session_key("trae-code", "s1")).unwrap().parent = Some(session_key("trae-code", "s2"));
+        sessions.get_mut(&session_key("trae-code", "s1")).unwrap().parent_key = Some(session_key("trae-code", "s2"));
         touch_ancestors_at(&mut sessions, session_key("trae-code", "s2"), now);
+    }
+
+    /// 血缘下发口径：快照里 `parent` = **父会话 id 本体**（前端拿它与 `session_id`
+    /// 精确比对、并判断父行是否还在快照里），内部用的 `agent|id` key（`parent_key`）
+    /// **不得**出现在序列化结果里。
+    #[test]
+    fn snapshot_exposes_full_parent_id_and_hides_lineage_key() {
+        let (mut sessions, mut finished) = table();
+        let parent_id = "sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2";
+        let mut root = ev(EventKind::Activity, 1000, None, "");
+        root.session_id = parent_id.into();
+        apply_session_event(&mut sessions, &mut finished, &root);
+        let mut child = ev(EventKind::Activity, 1100, None, "");
+        child.session_id = "sess_child_1".into();
+        child.parent_session_id = Some(parent_id.into());
+        apply_session_event(&mut sessions, &mut finished, &child);
+
+        let snap = sessions_snapshot(&sessions, 1100);
+        let child = snap.iter().find(|s| s.session_id == "sess_child_1").expect("子代理条目");
+        // 完整 id 而不是尾 6 位：前端能拿它精确等于父行的 session_id（截断就只能猜，
+        // 多工作区并存时两边的子代理行会长得一模一样）
+        assert_eq!(child.parent.as_deref(), Some(parent_id), "父会话 id 原样下发");
+        assert!(
+            snap.iter().any(|s| Some(s.session_id.as_str()) == child.parent.as_deref()),
+            "下发的 parent 必须能与快照里某条 session_id 精确对上"
+        );
+        assert_eq!(
+            child.parent_key.as_deref(),
+            Some(format!("trae-code|{parent_id}").as_str()),
+            "内部血缘边仍是完整 key（touch_ancestors_at 要用）"
+        );
+        let json = serde_json::to_string(child).unwrap();
+        assert!(json.contains(&format!("\"parent\":\"{parent_id}\"")), "快照必须带 parent: {json}");
+        assert!(!json.contains("parent_key"), "内部血缘边不得出快照: {json}");
+
+        // 主会话不带 parent 字段（skip_serializing_if）：前端据此把「无父」与「父未知」分开
+        let root = snap.iter().find(|s| s.session_id == parent_id).expect("主会话条目");
+        assert_eq!(root.parent, None);
+        assert!(!serde_json::to_string(root).unwrap().contains("parent"), "主会话不该有这个字段");
+    }
+
+    /// 血缘回填：建档事件拿不到 `parent_session_id` 时（DSH 会话头异步加载，
+    /// 插件心跳缓存了空血缘），后续带血缘的心跳必须补上——否则这条子代理终生被当成
+    /// 主会话，在卡片上与真正的会话并排显示（用户看到的「子代理跑到别的会话下面」）。
+    /// 两条心跳路径都要覆盖：带工具名的 Activity 与 DSH 保活用的 ToolFinished。
+    #[test]
+    fn lineage_is_backfilled_by_later_heartbeats() {
+        let parent_id = "sess_parent_001";
+        let (mut sessions, mut finished) = table();
+        let key = session_key("dsh", "sess_child_001");
+
+        // 建档时没血缘（模拟插件读到空 parentSession）
+        let mut first = ev(EventKind::Activity, 1000, Some("Bash"), "");
+        first.agent = "dsh".into();
+        first.session_id = "sess_child_001".into();
+        first.parent_session_id = None;
+        apply_session_event(&mut sessions, &mut finished, &first);
+        assert_eq!(sessions[&key].parent, None, "建档时确实没有血缘");
+
+        // 之后的心跳带上血缘 → 回填，并且必须标成 urgent（结构变化，快照立即推）
+        let mut second = ev(EventKind::Activity, 2000, Some("Bash"), "");
+        second.agent = "dsh".into();
+        second.session_id = "sess_child_001".into();
+        second.parent_session_id = Some(parent_id.into());
+        let d = apply_session_event(&mut sessions, &mut finished, &second);
+        assert!(d.changed && d.urgent, "回填血缘 = 结构变化，必须立即推快照");
+        assert_eq!(sessions[&key].parent.as_deref(), Some(parent_id), "parent 回填成父会话 id 本体");
+        assert_eq!(
+            sessions[&key].parent_key.as_deref(),
+            Some(format!("dsh|{parent_id}").as_str()),
+            "parent_key 同步回填（touch_ancestors_at 要用）"
+        );
+
+        // 已有血缘不被覆盖（血缘不会变，也别让伪造事件改写既有归属）
+        let mut third = ev(EventKind::Activity, 3000, Some("Bash"), "");
+        third.agent = "dsh".into();
+        third.session_id = "sess_child_001".into();
+        third.parent_session_id = Some("sess_attacker".into());
+        apply_session_event(&mut sessions, &mut finished, &third);
+        assert_eq!(sessions[&key].parent.as_deref(), Some(parent_id), "不覆盖已有血缘");
+
+        // ToolFinished（DSH keepalive 用的就是它）同样要能回填
+        let (mut sessions2, mut finished2) = table();
+        // 第一条建档**必须**非 keepalive：keepalive 按设计绝不建档（防幻影行）
+        let mut k1 = ev(EventKind::ToolFinished, 1000, None, "");
+        k1.agent = "dsh".into();
+        k1.session_id = "sess_child_002".into();
+        k1.parent_session_id = None;
+        k1.keepalive = false;
+        apply_session_event(&mut sessions2, &mut finished2, &k1);
+        assert!(sessions2.contains_key(&session_key("dsh", "sess_child_002")), "首条非 keepalive 已建档");
+        let mut k2 = ev(EventKind::ToolFinished, 2000, None, "");
+        k2.agent = "dsh".into();
+        k2.session_id = "sess_child_002".into();
+        k2.parent_session_id = Some(parent_id.into());
+        k2.keepalive = true;
+        let d2 = apply_session_event(&mut sessions2, &mut finished2, &k2);
+        assert!(d2.urgent, "ToolFinished 回填也要立即推");
+        assert_eq!(
+            sessions2[&session_key("dsh", "sess_child_002")].parent.as_deref(),
+            Some(parent_id),
+            "保活心跳也能补上血缘"
+        );
+    }
+
+    /// 自指血缘（`parent_session_id == session_id`）在建档路径也要挡掉。
+    ///
+    /// 不挡的后果不是「少一层缩进」而是整条会话从界面上消失：前端 `sessionRows` 把它判成
+    /// 子代理 → 找不到父行 → 合成一个同 key（`agent|session_id`）的占位父行 → 真行被
+    /// `visited` 吃掉。剩下的假行没有徽标、没有 prompt，还被判为子代理，通知 / 音效 /
+    /// 全屏特效一并被门挡掉。
+    #[test]
+    fn self_referential_parent_is_rejected_on_insert_too() {
+        let (mut sessions, mut finished) = table();
+        let mut selfref = ev(EventKind::Activity, 1000, None, "");
+        selfref.agent = "dsh".into();
+        selfref.session_id = "sess_self_001".into();
+        selfref.parent_session_id = Some("sess_self_001".into());
+        apply_session_event(&mut sessions, &mut finished, &selfref);
+
+        let s = &sessions[&session_key("dsh", "sess_self_001")];
+        assert_eq!(s.parent, None, "自指血缘不得写进 parent（否则前端只剩一条假行）");
+        assert_eq!(s.parent_key, None, "parent_key 同步不写");
+
+        // 空串同样按「没有血缘」处理
+        let (mut sessions2, mut finished2) = table();
+        let mut empty = ev(EventKind::Activity, 1000, None, "");
+        empty.agent = "dsh".into();
+        empty.session_id = "sess_empty_001".into();
+        empty.parent_session_id = Some(String::new());
+        apply_session_event(&mut sessions2, &mut finished2, &empty);
+        assert_eq!(sessions2[&session_key("dsh", "sess_empty_001")].parent, None);
+    }
+
+    /// 回填路径要覆盖**所有**带新鲜血缘的既有行分支，不只是 Activity / ToolFinished：
+    /// DSH 的授权请求、提问、工具失败都带 `parent_session_id`，而「建档时空血缘、之后只等到
+    /// 授权或提问」的子代理没有别的回填机会（keepalive 不建档、周期心跳的 parent 是插件
+    /// 启动时缓存的那份）——漏一条就一直当主会话显示。
+    #[test]
+    fn lineage_is_backfilled_by_waiting_and_failure_events() {
+        let parent_id = "sess_parent_002";
+        for (kind, phase_msg) in [
+            (EventKind::PermissionRequired, "授权请求"),
+            (EventKind::InputRequired, "提问"),
+            (EventKind::ToolFailed, "工具失败"),
+        ] {
+            let (mut sessions, mut finished) = table();
+            let key = session_key("dsh", "sess_child_003");
+            let mut first = ev(EventKind::ToolFinished, 1000, None, "");
+            first.agent = "dsh".into();
+            first.session_id = "sess_child_003".into();
+            first.parent_session_id = None;
+            first.keepalive = false;
+            apply_session_event(&mut sessions, &mut finished, &first);
+            assert_eq!(sessions[&key].parent, None, "{phase_msg}: 建档时确实没有血缘");
+
+            let mut second = ev(kind, 2000, Some("Bash"), "");
+            second.agent = "dsh".into();
+            second.session_id = "sess_child_003".into();
+            second.parent_session_id = Some(parent_id.into());
+            let d = apply_session_event(&mut sessions, &mut finished, &second);
+            assert!(d.urgent, "{phase_msg}: 回填血缘 = 结构变化，必须立即推快照");
+            assert_eq!(
+                sessions[&key].parent.as_deref(),
+                Some(parent_id),
+                "{phase_msg}: 也要回填血缘"
+            );
+        }
     }
 
     #[test]
@@ -2323,6 +2561,7 @@ mod tests {
             started_at: last,
             last_activity: last,
             parent: None,
+            parent_key: None,
         };
         let mut sessions = HashMap::new();
         sessions.insert("zcode|dead".into(), mk("dead", now - STALE_AFTER_MS));

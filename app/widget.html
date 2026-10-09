@@ -79,17 +79,54 @@
         height: 26px;
         padding: 0 2px;
       }
+      /*
+        子代理行：行首「↳」表达层级，名字压到 80% 亮度 + **小一号**（11px vs 12px），
+        把视线让给父会话。左内边距由 widget.ts 内联给出（首级与父行的名字对齐）。
+
+        为什么悬浮窗只用 ↳、**不加「子代理」徽标**：这一行已经被
+        「图标 15px + 名字 + 状态」占满，再塞一个 chip（~34px）会让长名
+        （DeepSeek Harness / Claude Code）被 ellipsis 吃掉——而「是哪个 agent」
+        是这张卡片的第一信息。层级用记号表达不占宽度。
+      */
+      .row-item.sub .name {
+        font-size: 11px;
+        font-weight: 550;
+        color: color-mix(in srgb, #e8e8ea 80%, transparent);
+      }
+      :root[data-theme="light"] .row-item.sub .name {
+        color: color-mix(in srgb, #232327 80%, transparent);
+      }
+      /* ↳ 记号：负右边距吃掉行 gap，几乎不占宽度（卡片只有 240px 宽） */
+      .tree {
+        flex-shrink: 0;
+        margin-right: -3px;
+        font-size: 11px;
+        line-height: 1;
+        color: #9a9aa2;
+      }
+      /* 层级缩进由 widget.ts 内联给出（深度是数据、不是样式），这里只定每级步长 */
+      /*
+        孤儿行（父会话已结束 / 被摘档，快照里没有父行）：**顶格**显示 + 换成 ⇤ 记号。
+        缩进会让人以为它属于上一行的子树——实测踩过：两个工作区各开一个 DSH 会话时，
+        A 会话的子代理显示在 B 会话的子代理行下面，看起来就是「挂到了另一个会话」。
+        记号保持中性灰（父回合正常结束不是错误，不该用告警色吓人）。
+      */
+      .row-item.orphan .tree { font-size: 10px; }
       .agent-icon { display: inline-flex; flex-shrink: 0; }
       .agent-icon svg { width: 15px; height: 15px; display: block; }
       .name {
-        flex: 1;
+        /* 主标签可以是项目名（有则用，见 widget.ts 的 rowLabel）：两种标签都可能较长，
+           所以允许收缩 + 省略号——宁可截一点，也不要撑破 240px 的卡片 */
+        flex: 0 1 auto;
         min-width: 0;
-        font-size: 12px;
-        font-weight: 600;
-        color: #e8e8ea;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        font-size: 12px;
+        font-weight: 600;
+        color: #e8e8ea;
+        /* 把 state 推到行尾：名字列整体靠左，不随内容长度抖动 */
+        margin-right: auto;
       }
       .state {
         display: inline-flex;
@@ -118,6 +155,51 @@
       :root[data-theme="light"] .state.completed .dot { background: #1a7f37; }
       :root[data-theme="light"] .state.failed { color: #cf222e; }
       :root[data-theme="light"] .state.failed .dot { background: #cf222e; }
+
+      /*
+        行悬停提示（工作区名）：独立 DOM，不是卡片的子元素——窗口恰好是卡片大小，
+        画在卡片内的提示会被窗口边界裁掉。样式对齐主面板的 .tooltip
+        （style.css），但配色用卡片这套（widget.html 不引 style.css）。
+      */
+      #row-tip {
+        position: fixed;
+        z-index: 20;
+        max-width: 228px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        background: rgba(29, 29, 32, 0.97);
+        border: 1px solid rgba(51, 51, 56, 0.95);
+        color: #e8e8ea;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 100ms ease;
+      }
+      #row-tip.show { opacity: 1; }
+      :root[data-theme="light"] #row-tip {
+        background: rgba(255, 255, 255, 0.97);
+        border-color: rgba(213, 213, 220, 0.95);
+        color: #232327;
+      }
+
+      /*
+        占位父行：快照里已经没有这个会话（回合结束 / 被判死淘汰），但它的子代理还在跑。
+        合成一行给它兜住子代理，避免子代理平铺到列表末尾、贴在别的会话子树后面被误读成
+        「挂到了那个会话下面」。没有图标、名字更暗、状态固定「已结束」。
+      */
+      .row-item.placeholder .name {
+        font-weight: 500;
+        color: #9a9aa2;
+      }
+      .row-item.placeholder .state { color: #9a9aa2; }
+      .row-item.placeholder .state .dot { background: #6b6b74; }
+      :root[data-theme="light"] .row-item.placeholder .name { color: #666670; }
+      :root[data-theme="light"] .row-item.placeholder .state { color: #666670; }
+      :root[data-theme="light"] .row-item.placeholder .state .dot { background: #9a9aa2; }
 
       .idle {
         color: #9a9aa2;

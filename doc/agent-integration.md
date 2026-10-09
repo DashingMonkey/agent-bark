@@ -324,9 +324,14 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
   血缘边递归查后代，等价社区的 `hasRunningDescendants`）时，`run_completed` 扣住不发，
   等整个 fan-out 结束再补投；**失败/中止不扣**（错误是当下就要知道的事）。
   不这么做的话，主 agent 派生子代理后回合间歇的「完成」会提前弹绿色完成特效；
-- **子代理活动驱动流光但不打扰人**：子代理心跳照发（`is_subagent` 门在 daemon 侧只挡
-  通知/音效/全屏特效），并经 `parent_session_id` 向祖先递归传播存活（daemon 侧
-  `touch_ancestors`）——否则子代理跑 20 分钟、父会话零心跳会被判死误亮失败色；
+- **子代理活动驱动流光、也在界面上可见，但不打扰人**：子代理心跳照发（`is_subagent` 门在 daemon
+  侧只挡通知/音效/全屏特效/悬浮窗弹出），并经 `parent_session_id` 向祖先递归传播存活（daemon 侧
+  `touch_ancestors_at`）——否则子代理跑 20 分钟、父会话零心跳会被判死误亮失败色。
+  同一条 `parent_session_id` 血缘边还**下发到前端**（`SessionStatus.parent` = 父会话 id 本体，
+  展示时才截尾 6 位），悬浮窗与事件流据此渲染 `↳` 层级 + 「子代理」标记（悬浮窗的标签是
+  `X 子代理`，口径见 doc/configuration.md 的「子代理怎么显示」）；
+  血缘不是一次写死的：建档那条事件可能读不到 `parentSession`（会话头异步加载），所以 daemon 在
+  任何带血缘的在位事件上回填（`state.rs` 的 `backfill_lineage`），并拒绝自指血缘；
 - **监听器一律 `ctx.on(..., { global: true })`**（waterfall 两个除外）：DSH 经 scope
   carrier 分发 scoped 事件，不带该选项会静默丢事件（社区 dsh-notifier 实测症状：
   `turn/start` 到了、`turn/end` 永远不到，状态飘移）；
@@ -386,11 +391,15 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
      `ToolFinished` 对该标志**只续命、绝不建档**（`state.rs` 的同名分支 + 单测
      `keepalive_heartbeat_never_creates_a_session`）。hook 型 agent 不发这个标志（Claude 系
      只订阅 PostToolUse，靠它建档），行为不变；
+- **「等待输入/等待确认」答完却不解除**（2026-10-09 修，用户实测：DSH 弹出 `ask_user_question`，选完（并在输入框里补了句话）之后事件流一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变成「完成」）。两个事实叠在一起才成灾：
+  1. **回答落在同一个回合里**——真实会话日志（本机 `session.v4.jsonl.zstd` 实测）是 `ask_user_question` → `tool/result` → 继续 `step/*`，**没有** `turn/end`、`turn` 号不变。于是没有任何「新回合」信号：插件不会发建档 `activity`（`postLiveness` 里 `user/*` 的跳过是**有意设计**：用户打字 ≠ agent 活跃），daemon 那条 `WaitingInput` 只能靠**周期保活心跳**回落「思考中」（`state.rs` 的 `ToolFinished` 分支）；
+  2. **那条心跳从来没跑起来**——`startHeartbeat` 的闸门写成 `if (!ctxRef || !ctxRef.sessionProjections || …) return;`，而属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上被 Cordis 4.x 直接拒绝（抛 `cannot get property "sessionProjections" without inject`，实测 0.2.0-rc.2；官方读法是 `ctx.get("sessionProjections")`，DSH 自己的 `dsh-user-questions` 就这么读）。这个**恒抛**还连带两处伤害：异常掀翻 `turn/start` 分支（心跳定时器根本没排上），并落进 `session/event` 处理器的 `catch {}` 把**整条事件处理**吞掉（该事件不再产生任何上报与记忆）。
+  修法两条：读服务一律走 `projectionsOf()`（`ctx.get` 优先、属性访问只作旧宿主兜底、读不到返回 `null` 而不抛），**且心跳闸门只认「回合是否开着」**——判定本来就是「日志优先、投影兜底」（`logScan`），不允许拿服务可用性当门槛。回归：`plugin_sim.mjs` case 18（同一回合内答完提问后，心跳必须把等待相位解除）与 case 19（服务读不到时监听器照常工作）；桩 `ctx` 也改成与真实 Cordis 同形（属性访问抛、只认 `ctx.get`），否则这类「本机装得上、到真宿主恒抛」的写法测不出来；
 - `agent/turn-stopping` 是 serial 事件且 DSH 会 `await` 监听器返回的 Promise（现在它只记回合号，
   不再等终态投递），但 POST 仍必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被
   「只接受连接不响应」的进程占用时，否则会把 DSH 的事件分发拖住；
 - **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，**重投复用同一个事件 id**——首投「daemon 已收下但响应丢了」时靠 daemon 的 id 去重兜住，绝不产生第二条通知）；`markSettled` 只在**确认送达**的路径上调用，并按**回合号**记账；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把静止兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
-- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾；本机没有 node 时该测试自动跳过）；
+- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾，用例 18/19 覆盖「答完提问后等待相位必须解除」与「服务读不到时不得崩」；本机没有 node 时该测试自动跳过）；
 - 插件型 adapter 只送 cwd，daemon 侧 `handle_event` 会按 hook 链路的同一规则补出 `project`，两条链路的通知正文（项目名 + 摘要）保持一致；
 - 排障链路：`dsh web --dump-config` 证明条目在列；DSH 侧有没有真的发出去，看 Windows 通知历史 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表（按 AUMID `com.agentbark.app` 过滤就是 agent-bark 弹过的 toast）；
 - 桥接包需在 profile 里自行安装：`dsh plugin add @deepseek-ai/dsh-hooks-claude-code`；
@@ -398,13 +407,14 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 
 ---
 
-**DSH 处于 Developer Preview：升级后只核对这 6 个契约点**
+**DSH 处于 Developer Preview：升级后只核对这 7 个契约点**
 
 改版可能让下面任何一条失效。每条都写明「失效症状」，出问题时先看对应那条，**不要**先怀疑通知链路：
 
 | 契约点 | 失效症状 | 插件侧位置 |
 | --- | --- | --- |
-| `ctx.sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
+| **读服务必须走 `ctx.get("sessionProjections")`**（属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上直接抛 `cannot get property … without inject`，Cordis 4.x） | 「等待输入/等待确认」**答完不解除**（一直橙到终态才变完成）；长回合被 daemon 判死误亮红光；派生/长工具静默期没有续命 | `projectionsOf`（唯一读点）/ `startHeartbeat` 的闸门 |
+| `sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
 | `agent/status` 的边沿语义（`idle` = 没有驱动器还在排队或运行） | 完成通知不来、或提前来；**边沿还可能根本不出现**（2026-09-30 实测：DSH 重启后连续两个回合收尾都没有 idle）——所以收尾**不能只挂在它上面**，插件用 `turn/end` + `REST_GRACE_MS` 宽限窗兜底 | `agent/status` 监听 + `scheduleRest` |
 | `session/event` 的 `turn/start` / `turn/end`（后者带 `data.turn` 与 `data.reason.kind`） | 完全不建档（面板空白）、或按回合去重失效（重复通知） | `session/event` 监听 |
 | `ctx.on(..., { global: true })` 的 scope 分发行径 | 偶发丢 `turn/end`，状态飘 | 5 处 `{ global: true }` |

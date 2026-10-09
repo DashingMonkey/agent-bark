@@ -236,6 +236,10 @@ body:not(.no-hover) .sidebar .nav-item.active:hover { background: var(--brand-2)
 .badge.waiting { color: var(--state-waiting); background: color-mix(in srgb, var(--state-waiting) 15%, transparent); }
 .badge.completed { color: var(--state-completed); background: color-mix(in srgb, var(--state-completed) 15%, transparent); }
 .badge.failed { color: var(--state-failed); background: color-mix(in srgb, var(--state-failed) 15%, transparent); }
+/* 「子代理」徽标：色相走品牌色。四态色（--state-*）表达的是「它在干什么」，
+   而子代理是「它属于谁」——用中性灰（默认 .badge）会与工具失败撞色、
+   用四态色会污染状态语义，品牌色是唯一还空着的一档（现只用于「开启」类徽标与焦点环） */
+.badge.subagent { color: var(--brand); background: color-mix(in srgb, var(--brand) 18%, transparent); }
 
 /* 按钮参考 VS Code：悬停/按压用明确的底色变化（不靠 opacity 糊一层），
    键盘 Tab 有品牌色焦点环 */
@@ -739,6 +743,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .event-item:last-child { border-bottom: none; }
 .event-time { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
 .event-msg { font-size: 13px; margin-top: 3px; white-space: pre-wrap; word-break: break-all; user-select: text; }
+
+/* ---- 子代理行（事件流 / 运行中会话区共用，类名由 api.ts 的 sessionRowClass 产出）----
+   记号是行首的「↳」（.sub-tree），层级靠 .sub-indent-N 的 padding-left 表达。
+   弱化只用**文字颜色**，不用整行 opacity：11~13px 的小字本来就接近对比度下限，
+   再乘 0.72 会掉到 WCAG AA 以下；color-mix 只压到 ~80% 亮度，读数不受影响。 */
+.event-item.is-sub .agent-name { color: var(--muted); }
+.event-item.is-sub .event-msg { color: var(--muted); }
+.sub-tree { color: var(--muted); font-size: 11px; flex: 0 0 auto; margin-right: -4px; }
+.sub-indent-1 { padding-left: 16px; }
+.sub-indent-2 { padding-left: 32px; }
+/* 血缘小字「← …8ec9f」：等宽，和会话 id 的展示口径一致，便于与父行对上 */
+.kin { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; white-space: nowrap; }
 
 .empty { text-align: center; color: var(--muted); padding: 48px 0; }
 

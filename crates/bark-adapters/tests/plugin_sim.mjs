@@ -54,7 +54,18 @@ globalThis.clearTimeout = (id) => {
 };
 
 /**
- * 推进虚拟时间到 `limit` 毫秒（默认 Inf = 把所有退避都烧完）。
+ * 周期保活心跳的间隔，与插件里的 `HEARTBEAT_INTERVAL_MS` 一致。
+ *
+ * 它是**自续排**定时器（回合开着就一直排下一跳），所以 `advance()` 不能把它算进去：
+ * 虚拟时间推进永远烧不完它，64 轮守卫会被判失败（而那恰恰是正确行为）。
+ * 心跳有自己的断言通道：`fireTimer((t) => t.ms === HEARTBEAT_MS)` 只推一跳，
+ * 由插件自己决定要不要续排（见用例 11 / 18）。
+ */
+const HEARTBEAT_MS = 20000;
+const isHeartbeat = (t) => t.ms === HEARTBEAT_MS;
+
+/**
+ * 推进虚拟时间到 `limit` 毫秒（默认 Inf = 把所有退避都烧完），**跳过周期心跳**。
  *
  * 必须按延迟顺序逐个触发并尊重上限：心跳失败后有一次 500ms 的**即时补投**，
  * 而终态重投是 1s 起的退避——「推进 400ms」和「推进到重投结束」要能分开断言，
@@ -66,7 +77,7 @@ globalThis.clearTimeout = (id) => {
  */
 async function advance(limit = Number.POSITIVE_INFINITY) {
   for (let guard = 0; guard < 64; guard += 1) {
-    const due = timers.filter((t) => t.ms <= limit);
+    const due = timers.filter((t) => t.ms <= limit && !isHeartbeat(t));
     if (due.length === 0) return;
     const delay = Math.min(...due.map((t) => t.ms));
     for (const t of due.filter((x) => x.ms === delay)) {
@@ -77,7 +88,7 @@ async function advance(limit = Number.POSITIVE_INFINITY) {
   }
   check(
     false,
-    `advance() 推进 64 轮后仍有 ${timers.length} 个定时器挂着（可能存在自续排的定时器）`,
+    `advance() 推进 64 轮后仍有 ${timers.filter((t) => !isHeartbeat(t)).length} 个非心跳定时器挂着（可能存在自续排的定时器）`,
   );
 }
 
@@ -106,14 +117,29 @@ async function fireTimer(predicate) {
 
 // --- DSH 侧的最小桩 ---------------------------------------------------------
 
-/** 假 DSH：收集插件注册的监听器，并提供 dispatch 辅助。 */
+/** 假 DSH：收集插件注册的监听器，并提供 dispatch 辅助。
+ *
+ * 服务读取形态**必须与真实 Cordis 一致**（2026-10-09 实测 DSH 0.2.0-rc.2 / Cordis 4.0.4）：
+ * 没声明 `inject` 的插件做 `ctx.sessionProjections` 属性访问会**抛**
+ * `cannot get property "sessionProjections" without inject`；官方读法是
+ * `ctx.get('sessionProjections')`（Cordis 文档原文 "without the inject requirement"，
+ * DSH 自己的 `dsh-user-questions` 也这么读）。桩若把服务直接挂在 `ctx` 上当普通属性，
+ * 「插件用属性访问读服务」这种会在真实宿主上恒抛的写法就测不出来——真实事故正是如此：
+ * `startHeartbeat` 的闸门读属性抛异常，整条保活/对账心跳被掐死，用户答完问题后
+ * 「等待输入」再也回落不了（本文件用例 18/19 锁着）。 */
 function makeCtx(options = {}) {
   const listeners = new Map();
+  const services = new Map();
+  if (options.projections) services.set('sessionProjections', options.projections);
   const ctx = {
     /** 与 cordis 的 ctx.on(name, listener) 同形 */
     on(name, listener) {
       if (!listeners.has(name)) listeners.set(name, []);
       listeners.get(name).push(listener);
+    },
+    /** cordis 的服务读取（无 inject 要求）：没有则 undefined，不抛 */
+    get(name) {
+      return services.get(name);
     },
     async dispatch(name, ...args) {
       // session/event 会被顺手写进桩会话的「日志」（seq + eventAt）：插件现在按官方契约
@@ -139,8 +165,14 @@ function makeCtx(options = {}) {
     },
     listenerCount: (name) => (listeners.get(name) ?? []).length,
   };
-  // 官方回合边界服务（`ctx.sessionProjections`）：不传 = 老版本 DSH，插件走兜底推理
-  if (options.projections) ctx.sessionProjections = options.projections;
+  // 真实 Cordis 的服务名只在反射层：属性访问对无 inject 的插件抛异常，`ctx.get()` 才读得到
+  for (const name of services.keys()) {
+    Object.defineProperty(ctx, name, {
+      get() {
+        throw new Error(`cannot get property "${name}" without inject`);
+      },
+    });
+  }
   return ctx;
 }
 
@@ -207,9 +239,11 @@ function check(ok, label) {
 
 const terminals = (type) => sent.filter((e) => e.type === type && !e.rejected);
 const activities = () => sent.filter((e) => e.type === 'activity');
-/** 终态退避重投定时器（语义判定，不数无关定时器的总数，§4.18）：延迟 ≥ 1s */
+/** 终态退避重投定时器（语义判定，不数无关定时器的总数，§4.18）：延迟 ≥ 1s **且不是周期心跳**。
+ *  心跳的 20s 与退避的 1s 同在「≥1s」区间里，必须显式排除，否则「重投被取消」这类断言
+ *  会被一条本来就在跑的保活心跳冒充成功（2026-10-09：心跳恢复常开后踩到）。 */
 const RETRY_BACKOFF_MIN_MS = 1000;
-const backoffTimers = () => timers.filter((t) => t.ms >= RETRY_BACKOFF_MIN_MS);
+const backoffTimers = () => timers.filter((t) => t.ms >= RETRY_BACKOFF_MIN_MS && !isHeartbeat(t));
 /** 调试开关：SIM_DEBUG=1 时打印每个用例末尾的到达事件，便于定位桩本身的问题 */
 const debug = process.env.SIM_DEBUG === '1';
 function dump(label) {
@@ -783,6 +817,9 @@ console.log('case 16: turn/end 事件没送到插件时，靠日志对账仍要�
   // （2026-09-30 实测就是这个状态：卡片挂死思考中、光带一直亮）
   agent.session.__events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   proj.close(agent.session);
+  // 对账由**周期心跳那一跳**完成（日志里回合已关 → reportAtRest 收尾）；
+  // 心跳是自续排定时器，`advance()` 不推它（见 HEARTBEAT_MS 说明），这里显式推一跳。
+  check(await fireTimer(isHeartbeat), '保活心跳那一跳被推进（日志对账的触发点）');
   await advance();
   check(terminals('run_completed').length === 1, `靠日志对账收尾（实际 ${terminals('run_completed').length} 条）`);
   await advance();
@@ -806,6 +843,92 @@ console.log('case 17: agent/status 一条都不来时（只有回合级事件）
   await advance();
   check(terminals('run_completed').length === 1, `不靠 status 也能收尾（实际 ${terminals('run_completed').length} 条）`);
   dump('case17');
+}
+
+// --- 用例 18：答完提问（仍在同一回合内）必须靠保活心跳把等待相位解除 -------------
+//
+// 2026-10-09 用户实测：DSH 弹出 ask_user_question、他选完（还在输入框里补了句话）之后，
+// 事件流一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变成「完成」。
+// 原因是真实会话日志里这次回答**落在同一个回合内**（`ask_user_question` → `tool/result`
+// → 继续 step/*，没有 `turn/end`）——于是没有任何「新回合」信号，daemon 的 WaitingInput
+// 只能靠插件那条「回合开着就定期补」的保活心跳（tool_finished + keepalive）回落「思考中」。
+// 而旧实现的 startHeartbeat 用 `ctxRef.sessionProjections` 属性访问做闸门，在真实 Cordis
+// 上**恒抛**（无 inject），闸门把整条心跳链掐死 → 等待相位再也回落不了。
+//
+// 本用例同时锁住三件事：
+//   1. 服务只经 `ctx.get()` 可读、属性访问抛异常时，插件**不得**抛穿监听器（事件照常上报）；
+//   2. 回合开着时周期心跳真的排上了（20s 一跳）；
+//   3. 那一跳发的是 keepalive 心跳（daemon 侧据此把等待相位打回思考中，且只续命不建档）。
+
+console.log('case 18: 答完提问后（同一回合内）保活心跳必须把「等待输入」解除');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const ctx = makeCtx({ projections: makeProjections() });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-ask');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  const beat = timers.filter((t) => t.ms === 20000).length;
+  check(beat >= 1, `回合开着时排上了周期保活心跳（实际 ${beat} 个 20s 定时器）`);
+
+  // 提问：插件发 input_required（daemon 侧进入「等待输入」）
+  const asked = await ctx.dispatchWaterfall('user-questions/request', {
+    agent,
+    questions: [{ header: '确认', question: '继续吗' }],
+  });
+  await flush();
+  check(asked.called, '提问请求交还下去');
+  check(
+    sent.some((e) => e.type === 'input_required'),
+    'input_required 上报（daemon 侧据此亮等待色）',
+  );
+
+  // 用户回答：工具返回、回合继续（没有新的 turn/start，也没有 turn/end）
+  sent.length = 0;
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
+
+  // 保活心跳那一跳：必须真的发出 keepalive 心跳，否则等待相位只能等终态才落幕
+  const fired = await fireTimer((t) => t.ms === 20000);
+  check(fired, '保活心跳那一跳被推进（存在 20s 定时器）');
+  const beats = sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true);
+  check(
+    beats.length >= 1,
+    `心跳发出 keepalive 保活（daemon 侧 ToolFinished 分支把等待相位回落思考中；实际 ${beats.length} 条）`,
+  );
+  check(
+    beats.length >= 1 && beats[0].session_id === 'sess-ask',
+    '心跳带本会话 id（不得因服务读取异常而换成空 id）',
+  );
+  dump('case18');
+}
+
+// --- 用例 19：读不到投影服务时不得崩掉监听器（老版本 DSH / 未提供该服务）---------
+
+console.log('case 19: 服务读不到（老版本 DSH）时监听器照常工作，收尾走日志对账');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  // 无 projections：`ctx.get('sessionProjections')` 返回 undefined，
+  // 退化成「日志推理」——turn/start…turn/end 本来就能判，功能不得降级
+  const ctx = makeCtx();
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-noproj');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { name: 'Bash' } });
+  const acts = activities();
+  check(acts.length === 2, `无投影时建档心跳与工具心跳照常上报（实际 ${acts.length} 条）`);
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await advance();
+  check(
+    terminals('run_completed').length === 1,
+    `无投影时也收得了尾（实际 ${terminals('run_completed').length} 条）`,
+  );
+  dump('case19');
 }
 
 // --- 汇总 -------------------------------------------------------------------

@@ -729,9 +729,45 @@ function hasActivity(keys) {
 // 回合状态：官方投影优先、日志推理兜底（绝不靠「最近有没有事件」猜）
 // ---------------------------------------------------------------------------
 
-/** 官方回合边界投影（`ctx.sessionProjections.stateOf(session, "turnBoundary")`）。 */
+/**
+ * 取官方会话投影服务（`sessionProjections.stateOf(session, "turnBoundary")`）。
+ *
+ * ⚠️ **必须走 `ctx.get(name)`，不能写 `ctx.sessionProjections`**（2026-10-09 实测
+ * DSH 0.2.0-rc.2 / Cordis 4.0.4）：Cordis 的上下文代理对**没有声明 `inject` 的插件**
+ * 直接抛 `cannot get property "sessionProjections" without inject`。本插件是纯观察者、
+ * 不声明 inject（不能为了读一个可选信号，去改宿主的依赖装配），所以属性访问在
+ * 这里**恒抛**——而抛点只要落在监听器里，整个 `session/event` 处理器就被外层
+ * `catch {}` 吞掉（该事件不再产生任何上报与记忆），落在 `turn/start` 分支上则把
+ * `startHeartbeat` 直接掀翻 → **周期保活心跳与「读日志对账」从不启动**。
+ * 用户实测症状：答完 `ask_user_question`（回答落在同一回合内，没有新的 `turn/start`）
+ * 之后「等待输入」一直不解除，直到 `run_completed` 才被终态摘掉。
+ * `ctx.get()` 是 Cordis 自己的「without the inject requirement」读法（文档原文），
+ * 服务缺席时返回 `undefined`、不抛；DSH 官方包读同一个服务用的就是它
+ * （`dsh-user-questions`：`this.ctx.get('sessionProjections')?.stateOf(...)`）。
+ *
+ * 返回 `null` = 服务确实拿不到（老版本 DSH / 尚未挂载）；读服务本身抛出的异常也
+ * 在这里收敛成 `null`——观察者绝不因为「读一个可选信号失败」而改变行为。
+ */
+function projectionsOf() {
+  if (!ctxRef) return null;
+  try {
+    if (typeof ctxRef.get === "function") {
+      const viaGet = ctxRef.get("sessionProjections");
+      if (viaGet) return viaGet;
+    }
+  } catch {
+    // 服务未提供 / 上下文形态随版本变动：继续尝试属性读法
+  }
+  try {
+    return ctxRef.sessionProjections || null;
+  } catch {
+    return null; // 没有 inject 的插件在 Cordis 4.x 上会走到这里（见本函数文档）
+  }
+}
+
+/** 官方回合边界投影（`sessionProjections.stateOf(session, "turnBoundary")`）。 */
 function boundaryOf(session) {
-  const svc = ctxRef && ctxRef.sessionProjections;
+  const svc = projectionsOf();
   if (!svc || typeof svc.stateOf !== "function" || !session) return undefined;
   try {
     return svc.stateOf(session, "turnBoundary");
@@ -835,17 +871,20 @@ const lastError = new Map();
 /**
  * 回合开着时的周期保活心跳。
  *
- * 只在**官方回合投影可用**时启用：投影说「回合还开着」才续命，拿不到投影时保持旧行为
- * （不做周期补发）——宁可不补，也不能在其实没在跑的会话上续命。
- *
  * 存在理由：父会话等子代理 / 等审批 / 等回答可以静默十几分钟，其间没有任何会话事件；
- * daemon 侧「心跳静止 10 分钟判死」会把这条行误判成意外终止（红光 + 失败音）。
+ * daemon 侧「心跳静止 10 分钟判死」会把这条行误判成意外终止（红光 + 失败音），
+ * 而「等待输入/等待确认」相位也要靠它回落「思考中」（daemon 侧 ToolFinished 分支）。
  * 心跳带 `keepalive: true`：daemon 侧只续命、绝不建档（那条行必须已经由 turn/start 建好）。
+ *
+ * ⚠️ **闸门只认「回合是否开着」，不认「投影服务能不能读」**（2026-10-09 修）：
+ * 旧实现写成 `if (!ctxRef || !ctxRef.sessionProjections || …) return;`，而属性访问在
+ * 未声明 inject 的插件上**恒抛**（见 projectionsOf 的文档）——结果是这道闸门把整条
+ * 心跳链（周期保活 + 读日志对账）整个掐死，且异常还会冒到 `turn/start` 调用点。
+ * 判定本来就是「日志优先、投影兜底」（见 tick 里的 logScan）：投影拿不到时日志照样
+ * 能判，所以这里**不允许**拿服务可用性当门槛。
  */
 function startHeartbeat(keys, session) {
-  // 只有官方回合投影在场时才开周期心跳（老版本 DSH 拿不到投影就没有这道保险，
-  // 行为与修复前一致）；**收尾**不依赖它——收尾走「读日志」的 reportAtRest。
-  if (!ctxRef || !ctxRef.sessionProjections || !session || !keys.length) return;
+  if (!session || !keys.length) return;
   const anchor = keys[0];
   if (heartbeats.has(anchor)) return;
   // cwd / 子代理 / 血缘在启动时取一次：心跳期间这些字段不会变
@@ -1665,13 +1704,47 @@ mod tests {
     use serde_json::json;
 
     fn ctx() -> RegisterCtx {
-        RegisterCtx { exe_path: String::new(), port: 1234, token: "tok".into() }
+        RegisterCtx {
+            exe_path: String::new(),
+            port: 1234,
+            token: "tok".into(),
+        }
     }
 
     fn tmp_home() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agent-bark-dsh-{}", uuid::Uuid::new_v4().simple()));
+        let d =
+            std::env::temp_dir().join(format!("agent-bark-dsh-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 把当前模板生成物刷到本机 DSH 的插件路径（供「改完模板立刻验证」用）。
+    ///
+    /// **默认不跑**：只有显式设置 `BARK_DSH_REFRESH=1` 时才动盘，且只写 DSH 那一份
+    /// `$DSH_HOME/agent-bark/plugin.js`（与 UI 勾选接入写的是同一个文件），
+    /// 端口/token 从已落盘的 agent-bark 配置里原样取——不碰任何其它文件。
+    #[test]
+    fn refresh_deployed_plugin_when_asked() {
+        if std::env::var("BARK_DSH_REFRESH").as_deref() != Ok("1") {
+            return;
+        }
+        let home = std::env::var("DSH_HOME").unwrap_or_else(|_| {
+            let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
+            format!("{profile}\\.dsh")
+        });
+        let cfg_path = std::env::var("APPDATA")
+            .map(|a| PathBuf::from(a).join("agent-bark").join("config.json"))
+            .expect("APPDATA");
+        let raw = std::fs::read_to_string(&cfg_path).expect("读 agent-bark config.json");
+        let cfg: serde_json::Value = serde_json::from_str(&raw).expect("解析 config.json");
+        let port = cfg["server"]["port"].as_u64().expect("config.server.port") as u16;
+        let token = cfg["server"]["token"]
+            .as_str()
+            .expect("config.server.token");
+        let dest = PathBuf::from(&home).join("agent-bark").join("plugin.js");
+        let js = plugin_js(port, token);
+        std::fs::write(&dest, &js).expect("写 plugin.js");
+        eprintln!("refreshed {} ({} bytes)", dest.display(), js.len());
     }
 
     #[test]
@@ -1747,12 +1820,21 @@ mod tests {
             "aborted/interrupted 要归一成 run_aborted"
         );
         // 真实的 TurnEndReason 集合必须在注释里留档（含只出现在修复路径的 interrupted）
-        for kind in ["completed", "aborted", "blocked", "max-tokens", "interrupted"] {
+        for kind in [
+            "completed",
+            "aborted",
+            "blocked",
+            "max-tokens",
+            "interrupted",
+        ] {
             assert!(js.contains(kind), "缺少 TurnEndReason {kind}");
         }
         // TurnEndReason 没有 "finished" 这个 kind（判据带引号：`tool_finished`
         // 这个事件类型名合法地含有 finished 子串，不能误伤）
-        assert!(!js.contains("\"finished\""), "TurnEndReason 里没有 finished");
+        assert!(
+            !js.contains("\"finished\""),
+            "TurnEndReason 里没有 finished"
+        );
         // POST 超时：serial 监听里 await 的 fetch 不能无限期挂住 DSH 的回合收尾
         assert!(js.contains("AbortSignal.timeout(POST_TIMEOUT_MS)"));
         // error 是 unknown：普通对象不能退化成 "[object Object]"
@@ -1767,7 +1849,9 @@ mod tests {
         // `agent/turn-stopping` 只是「本可收尾」的闸门、可以被 steer 打开，
         // 按 running→idle 周期去重会把真终态吞掉（社区事故 agent-presence#83 同因）。
         assert!(
-            js.contains("settledSessions") && js.contains("isSettledOf(") && js.contains("function turnMarker("),
+            js.contains("settledSessions")
+                && js.contains("isSettledOf(")
+                && js.contains("function turnMarker("),
             "终态去重必须按回合标记（不是按 running→idle 周期）"
         );
         // 收尾挂在静止边沿 + durable 的 turn/end 上，turn-stopping 只作提示、绝不发终态
@@ -1828,7 +1912,10 @@ mod tests {
             .split("async function settle(")
             .nth(1)
             .expect("缺少 settle");
-        let settle_head = settle_body.split("pendingTerminal.set").next().unwrap_or("");
+        let settle_head = settle_body
+            .split("pendingTerminal.set")
+            .next()
+            .unwrap_or("");
         assert!(
             !settle_head.contains("markSettled"),
             "settle 不得在投递前就标记已终态: {settle_head}"
@@ -1865,7 +1952,10 @@ mod tests {
         let js = plugin_js(1234, "tok");
 
         // 1) post() 未定义的 bug 不得回归：等待类事件走 postBestEffort
-        assert!(!js.contains("void post("), "post() 已删除，调用点必须换成 postBestEffort: {js}");
+        assert!(
+            !js.contains("void post("),
+            "post() 已删除，调用点必须换成 postBestEffort: {js}"
+        );
         assert!(
             js.contains("function postBestEffort(")
                 && js.contains("\"permission_required\"")
@@ -1912,9 +2002,33 @@ mod tests {
                 && js.contains("return keys.some((k) => running.has(k)) || hasActivity(keys);"),
             "心跳必须有分层建档/放行门槛: {js}"
         );
+        // ⚠️ 2026-10-09 事故回归：读官方投影**必须经 `ctx.get("sessionProjections")`**。
+        //    属性访问 `ctx.sessionProjections` 在真实 Cordis 4.x 上对未声明 inject 的插件
+        //    直接抛 `cannot get property ... without inject`（实测 DSH 0.2.0-rc.2），
+        //    而抛点会掀翻 `startHeartbeat` 的闸门、并让整个 session/event 处理器被吞掉
+        //    → 周期保活与读日志对账从不启动，用户答完提问后「等待输入」再也回落不了
+        //    （`plugin_sim.mjs` 用例 18/19 锁着）。
         assert!(
-            js.contains("ctxRef.sessionProjections") && js.contains("stateOf(session, \"turnBoundary\")"),
-            "必须优先读官方回合投影（拿不到才退回日志推理）: {js}"
+            js.contains("ctxRef.get(\"sessionProjections\")")
+                && js.contains("stateOf(session, \"turnBoundary\")")
+                && js.contains("function projectionsOf()"),
+            "必须经 ctx.get() 读官方回合投影（属性访问在无 inject 的插件上恒抛）: {js}"
+        );
+        // 「闸门不得拿服务可用性当门槛」：旧写法 `if (!ctxRef || !ctxRef.sessionProjections || …)`
+        // 正是事故本体——属性访问恒抛，这一行把整条保活/对账心跳掐死。
+        // 只看 `startHeartbeat` 的**函数体**：`projectionsOf` 的文档注释里必须留着事故原文
+        // （写的是同一段代码），整份文本的子串搜索会把注释本身判成违规。
+        let start_heartbeat_body = js
+            .split("function startHeartbeat(keys, session)")
+            .nth(1)
+            .expect("缺少 startHeartbeat")
+            .split("\nfunction ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !start_heartbeat_body.contains("sessionProjections")
+                && start_heartbeat_body.contains("const anchor = keys[0];"),
+            "保活心跳的闸门只认「回合是否开着」，不得拿服务可用性当门槛: {start_heartbeat_body}"
         );
         // 唯一建档点：turn/start 的不带 keepalive 的 activity；
         // 保活心跳一律 keepalive=true（daemon 侧只续命、绝不建档）
@@ -1930,7 +2044,8 @@ mod tests {
             "turn/start 必须是唯一的建档点并启动静默保活: {start_body}"
         );
         assert!(
-            js.contains("body.keepalive = true") && js.contains("function startHeartbeat(keys, session)"),
+            js.contains("body.keepalive = true")
+                && js.contains("function startHeartbeat(keys, session)"),
             "保活心跳必须带 keepalive 标志（daemon 据此不建档）: {js}"
         );
         // 空转守卫：唤醒但没真回合（消息被清空 / 只是回执唤醒）不报完成
@@ -1965,14 +2080,23 @@ mod tests {
     /// Node 缺失时跳过：这个包本身不依赖 Node，缺了它只少一层保险，不该让 CI 红。
     #[test]
     fn generated_plugin_terminal_delivery_survives_daemon_failures() {
-        let dir = std::env::temp_dir().join(format!("agent-bark-plugin-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "agent-bark-plugin-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let plugin = dir.join("plugin.js");
         std::fs::write(&plugin, plugin_js(1, "tok")).unwrap();
-        let sim = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("plugin_sim.mjs");
+        let sim = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("plugin_sim.mjs");
         assert!(sim.exists(), "缺少插件事务级测试脚本: {}", sim.display());
 
-        let output = match std::process::Command::new("node").arg(&sim).arg(&plugin).output() {
+        let output = match std::process::Command::new("node")
+            .arg(&sim)
+            .arg(&plugin)
+            .output()
+        {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("跳过：找不到 node（{e}），无法运行插件投递行为测试");
@@ -2024,7 +2148,11 @@ mod tests {
 
         std::fs::write(&plugin, "// 旧版本生成的插件\n").unwrap();
         DshAdapter::register_at(&home, &ctx()).unwrap();
-        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), current, "内容不一致必须重写");
+        assert_eq!(
+            std::fs::read_to_string(&plugin).unwrap(),
+            current,
+            "内容不一致必须重写"
+        );
 
         // 再跑一次：登记与内容都稳定，不产生重复条目
         DshAdapter::register_at(&home, &ctx()).unwrap();
@@ -2052,9 +2180,15 @@ mod tests {
         DshAdapter::register_at(&home, &ctx()).unwrap();
         let (entries, _) = DshAdapter::read_patch_raw(&patch).unwrap();
         assert_eq!(entries.len(), 3, "只删 1 条重复哨兵: {entries:?}");
-        assert!(entries[0].is_null() && entries[2].is_null(), "用户 null 原样保留: {entries:?}");
+        assert!(
+            entries[0].is_null() && entries[2].is_null(),
+            "用户 null 原样保留: {entries:?}"
+        );
         assert_eq!(
-            entries.iter().filter(|e| DshAdapter::is_our_entry(e)).count(),
+            entries
+                .iter()
+                .filter(|e| DshAdapter::is_our_entry(e))
+                .count(),
             1,
             "重复的我们的条目收敛为一条: {entries:?}"
         );
@@ -2080,7 +2214,10 @@ mod tests {
         let entries = DshAdapter::read_patch(&DshAdapter::patch_file(&home)).unwrap();
         assert_eq!(entries.len(), 1, "不得重复追加条目");
 
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::Ok));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::Ok
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2089,7 +2226,11 @@ mod tests {
         let home = tmp_home();
         // 用户已有自己的 patch 条目（含注释会丢，但条目本身必须保留）
         let patch = DshAdapter::patch_file(&home);
-        std::fs::write(&patch, "- id: user-plugin\n  name: '@scope/dsh-user-plugin'\n").unwrap();
+        std::fs::write(
+            &patch,
+            "- id: user-plugin\n  name: '@scope/dsh-user-plugin'\n",
+        )
+        .unwrap();
 
         DshAdapter::register_at(&home, &ctx()).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
@@ -2098,13 +2239,20 @@ mod tests {
         assert!(DshAdapter::is_our_entry(&entries[1]));
 
         // 卸载后用户条目原样保留，我们的条目消失
-        let mut ictx = InstallCtx { exe_path: String::new(), dry_run: false, backup: true };
+        let mut ictx = InstallCtx {
+            exe_path: String::new(),
+            dry_run: false,
+            backup: true,
+        };
         DshAdapter::unregister_at(&home, &mut ictx).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(DshAdapter::entry_str(&entries[0], "id").as_deref() == Some("user-plugin"));
         assert!(!DshAdapter::plugin_file(&home).exists(), "插件文件应被删除");
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::NotRegistered));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::NotRegistered
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2117,14 +2265,24 @@ mod tests {
 
         let err = DshAdapter::register_at(&home, &ctx()).expect_err("非法 YAML 必须中止");
         assert!(format!("{err:#}").contains("不是合法的 patch YAML"));
-        assert_eq!(std::fs::read_to_string(&patch).unwrap(), original, "文件不能被改写");
-        assert!(!DshAdapter::plugin_file(&home).exists(), "中止时不得留下插件文件");
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            original,
+            "文件不能被改写"
+        );
+        assert!(
+            !DshAdapter::plugin_file(&home).exists(),
+            "中止时不得留下插件文件"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn missing_home_is_an_error() {
-        let home = std::env::temp_dir().join(format!("agent-bark-dsh-none-{}", uuid::Uuid::new_v4().simple()));
+        let home = std::env::temp_dir().join(format!(
+            "agent-bark-dsh-none-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let err = DshAdapter::register_at(&home, &ctx()).expect_err("DSH_HOME 不存在必须报错");
         assert!(format!("{err:#}").contains("未检测到 DeepSeek Harness"));
         assert!(!home.exists(), "不得凭空创建 DSH_HOME");
@@ -2149,25 +2307,42 @@ mod tests {
 
         // 模拟 DSH_HOME 迁移（或用户手改）导致 insert 条目的 name 指向旧路径
         let patch = DshAdapter::patch_file(&home);
-        let stale = format!("- insert:\n  - id: {ENTRY_ID}\n    name: 'C:/old/location/agent-bark/plugin.js'\n");
+        let stale = format!(
+            "- insert:\n  - id: {ENTRY_ID}\n    name: 'C:/old/location/agent-bark/plugin.js'\n"
+        );
         std::fs::write(&patch, &stale).unwrap();
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::StalePath { .. }));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::StalePath { .. }
+        ));
 
         // 重新 register 就地修复，不新增条目
         DshAdapter::register_at(&home, &ctx()).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::Ok));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::Ok
+        ));
 
         // 旧版错误写法（顶层 id、无 insert）：同样报漂移并就地升级为 insert 形式
         let legacy = format!("- id: {ENTRY_ID}\n  name: 'C:/old/location/agent-bark/plugin.js'\n");
         std::fs::write(&patch, &legacy).unwrap();
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::StalePath { .. }));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::StalePath { .. }
+        ));
         DshAdapter::register_at(&home, &ctx()).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(DshAdapter::entry_insert_seq(&entries[0]).is_some(), "旧格式必须被升级为 insert 形式");
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::Ok));
+        assert!(
+            DshAdapter::entry_insert_seq(&entries[0]).is_some(),
+            "旧格式必须被升级为 insert 形式"
+        );
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::Ok
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2177,7 +2352,10 @@ mod tests {
         let home = tmp_home();
         DshAdapter::register_at(&home, &ctx()).unwrap();
         std::fs::remove_file(DshAdapter::plugin_file(&home)).unwrap();
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::NotRegistered));
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::NotRegistered
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2190,11 +2368,22 @@ mod tests {
         let _ = std::fs::remove_file(&bak); // 清掉 register 留下的备份便于观察
         let before = std::fs::read_to_string(&patch).unwrap();
 
-        let mut ictx = InstallCtx { exe_path: String::new(), dry_run: true, backup: true };
+        let mut ictx = InstallCtx {
+            exe_path: String::new(),
+            dry_run: true,
+            backup: true,
+        };
         DshAdapter::unregister_at(&home, &mut ictx).unwrap();
-        assert_eq!(std::fs::read_to_string(&patch).unwrap(), before, "dry_run 不得改文件");
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            before,
+            "dry_run 不得改文件"
+        );
         assert!(!bak.exists(), "dry_run 不得创建备份");
-        assert!(DshAdapter::plugin_file(&home).exists(), "dry_run 不得删插件文件");
+        assert!(
+            DshAdapter::plugin_file(&home).exists(),
+            "dry_run 不得删插件文件"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2219,10 +2408,17 @@ mod tests {
     fn our_entry_detection_by_id() {
         // 现行 insert 格式：insert 列表内含我们的 id 即归我们（寻址）
         let insert_entry = |id: &str, name: &str| {
-            serde_yaml::from_str::<Yaml>(&format!("insert:\n  - id: {id}\n    name: {name}\n")).unwrap()
+            serde_yaml::from_str::<Yaml>(&format!("insert:\n  - id: {id}\n    name: {name}\n"))
+                .unwrap()
         };
-        assert!(DshAdapter::is_our_entry(&insert_entry("agent-bark", "'/any/path/plugin.js'")));
-        assert!(!DshAdapter::is_our_entry(&insert_entry("user-plugin", "'/x/agent-bark/plugin.js'")));
+        assert!(DshAdapter::is_our_entry(&insert_entry(
+            "agent-bark",
+            "'/any/path/plugin.js'"
+        )));
+        assert!(!DshAdapter::is_our_entry(&insert_entry(
+            "user-plugin",
+            "'/x/agent-bark/plugin.js'"
+        )));
 
         // 旧版错误写法（顶层 id、无 insert）也算我们的：register 时就地修复
         let legacy = |id: &str, name: &str| {
@@ -2235,10 +2431,15 @@ mod tests {
             !DshAdapter::entry_is_current(&legacy_ours, &home),
             "旧格式即使路径碰巧一致也不算有效接入（DSH 根本不会挂载它）"
         );
-        assert!(!DshAdapter::is_our_entry(&legacy("user-plugin", "'/x/agent-bark/plugin.js'")));
+        assert!(!DshAdapter::is_our_entry(&legacy(
+            "user-plugin",
+            "'/x/agent-bark/plugin.js'"
+        )));
 
         // 非映射条目（如字符串）不算
-        assert!(!DshAdapter::is_our_entry(&Yaml::String("agent-bark".into())));
+        assert!(!DshAdapter::is_our_entry(&Yaml::String(
+            "agent-bark".into()
+        )));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2272,25 +2473,49 @@ mod tests {
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1, "混合条目仍是一条（不得整条替换/新增）");
         let seq = DshAdapter::entry_insert_seq(&entries[0]).expect("insert 形式保留");
-        assert_eq!(seq.len(), 2, "用户的子项必须原样保留（§1.8），实际 {}", seq.len());
-        assert_eq!(DshAdapter::entry_str(&seq[1], "id").as_deref(), Some("user-plugin"));
+        assert_eq!(
+            seq.len(),
+            2,
+            "用户的子项必须原样保留（§1.8），实际 {}",
+            seq.len()
+        );
+        assert_eq!(
+            DshAdapter::entry_str(&seq[1], "id").as_deref(),
+            Some("user-plugin")
+        );
         assert_eq!(
             DshAdapter::entry_str(&seq[1], "name").as_deref(),
             Some("@scope/dsh-user-plugin"),
             "用户子项内容逐字不动"
         );
-        assert_eq!(DshAdapter::entry_str(&seq[0], "id").as_deref(), Some(ENTRY_ID));
-        assert!(DshAdapter::entry_is_current(&entries[0], &home), "我们的子项就地修复到当前路径");
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::Ok));
+        assert_eq!(
+            DshAdapter::entry_str(&seq[0], "id").as_deref(),
+            Some(ENTRY_ID)
+        );
+        assert!(
+            DshAdapter::entry_is_current(&entries[0], &home),
+            "我们的子项就地修复到当前路径"
+        );
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::Ok
+        ));
 
         // unregister：只摘我们的子项，insert 列表还有用户子项 → 整条保留
-        let mut ictx = InstallCtx { exe_path: String::new(), dry_run: false, backup: true };
+        let mut ictx = InstallCtx {
+            exe_path: String::new(),
+            dry_run: false,
+            backup: true,
+        };
         DshAdapter::unregister_at(&home, &mut ictx).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1, "用户子项还在 → 外层条目保留");
         let seq = DshAdapter::entry_insert_seq(&entries[0]).expect("insert 形式保留");
         assert_eq!(seq.len(), 1, "只剩用户的子项");
-        assert_eq!(DshAdapter::entry_str(&seq[0], "id").as_deref(), Some("user-plugin"));
+        assert_eq!(
+            DshAdapter::entry_str(&seq[0], "id").as_deref(),
+            Some("user-plugin")
+        );
         assert_eq!(
             DshAdapter::entry_str(&seq[0], "name").as_deref(),
             Some("@scope/dsh-user-plugin")
@@ -2322,8 +2547,14 @@ mod tests {
         );
         // 只动 name：用户加的其它键原样保留
         let text = serde_yaml::to_string(sub).unwrap();
-        assert!(text.contains("enabled: false"), "用户的键不得被抹掉: {text}");
-        assert!(text.contains("note: user-tuned"), "用户的键不得被抹掉: {text}");
+        assert!(
+            text.contains("enabled: false"),
+            "用户的键不得被抹掉: {text}"
+        );
+        assert!(
+            text.contains("note: user-tuned"),
+            "用户的键不得被抹掉: {text}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2338,11 +2569,18 @@ mod tests {
         )
         .unwrap();
 
-        let mut ictx = InstallCtx { exe_path: String::new(), dry_run: false, backup: true };
+        let mut ictx = InstallCtx {
+            exe_path: String::new(),
+            dry_run: false,
+            backup: true,
+        };
         DshAdapter::unregister_at(&home, &mut ictx).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1, "只剩用户条目（空 insert 的外壳已删）");
-        assert_eq!(DshAdapter::entry_str(&entries[0], "id").as_deref(), Some("user-plugin"));
+        assert_eq!(
+            DshAdapter::entry_str(&entries[0], "id").as_deref(),
+            Some("user-plugin")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2368,8 +2606,14 @@ mod tests {
             1,
             "第二个条目里重复的我们的子项被去重，用户的保留（§1.8/§1.9）"
         );
-        assert_eq!(DshAdapter::entry_str(&seq_b[0], "id").as_deref(), Some("user-b"));
-        assert!(matches!(DshAdapter::verify_at(&home, &ctx()), VerifyReport::Ok));
+        assert_eq!(
+            DshAdapter::entry_str(&seq_b[0], "id").as_deref(),
+            Some("user-b")
+        );
+        assert!(matches!(
+            DshAdapter::verify_at(&home, &ctx()),
+            VerifyReport::Ok
+        ));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2378,16 +2622,30 @@ mod tests {
     fn legacy_top_level_entry_is_still_handled_whole() {
         let home = tmp_home();
         let patch = DshAdapter::patch_file(&home);
-        std::fs::write(&patch, format!("- id: {ENTRY_ID}\n  name: 'C:/old/agent-bark/plugin.js'\n")).unwrap();
+        std::fs::write(
+            &patch,
+            format!("- id: {ENTRY_ID}\n  name: 'C:/old/agent-bark/plugin.js'\n"),
+        )
+        .unwrap();
 
         DshAdapter::register_at(&home, &ctx()).unwrap();
         let entries = DshAdapter::read_patch(&patch).unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(DshAdapter::entry_insert_seq(&entries[0]).is_some(), "升级为 insert 形式");
+        assert!(
+            DshAdapter::entry_insert_seq(&entries[0]).is_some(),
+            "升级为 insert 形式"
+        );
 
-        let mut ictx = InstallCtx { exe_path: String::new(), dry_run: false, backup: true };
+        let mut ictx = InstallCtx {
+            exe_path: String::new(),
+            dry_run: false,
+            backup: true,
+        };
         DshAdapter::unregister_at(&home, &mut ictx).unwrap();
-        assert!(DshAdapter::read_patch(&patch).unwrap().is_empty(), "旧版顶层条目整条删除");
+        assert!(
+            DshAdapter::read_patch(&patch).unwrap().is_empty(),
+            "旧版顶层条目整条删除"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2402,12 +2660,19 @@ mod tests {
         let changed = DshAdapter::surgery_insert_entry(&mut entry, Some(&home), true);
         assert!(changed);
         let seq = DshAdapter::entry_insert_seq(&entry).unwrap();
-        assert_eq!(seq.len(), 2, "首个我们的子项留下 + 用户子项留下，重复的删掉");
+        assert_eq!(
+            seq.len(),
+            2,
+            "首个我们的子项留下 + 用户子项留下，重复的删掉"
+        );
         assert_eq!(
             DshAdapter::entry_str(&seq[0], "name").map(|n| n.replace('\\', "/")),
             Some(DshAdapter::plugin_path_str(&home))
         );
-        assert_eq!(DshAdapter::entry_str(&seq[1], "id").as_deref(), Some("user-x"));
+        assert_eq!(
+            DshAdapter::entry_str(&seq[1], "id").as_deref(),
+            Some("user-x")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2421,13 +2686,17 @@ mod tests {
         assert!(DshAdapter::surgery_insert_entry(&mut entry, None, false));
         assert!(entry.is_null(), "insert 删空后整条置 Null（外层随之删除）");
 
-        let mut mixed: Yaml =
-            serde_yaml::from_str("insert:\n  - id: agent-bark\n    name: '/a.js'\n  - id: user-x\n    name: '@u/x'\n")
-                .unwrap();
+        let mut mixed: Yaml = serde_yaml::from_str(
+            "insert:\n  - id: agent-bark\n    name: '/a.js'\n  - id: user-x\n    name: '@u/x'\n",
+        )
+        .unwrap();
         assert!(DshAdapter::surgery_insert_entry(&mut mixed, None, false));
         let seq = DshAdapter::entry_insert_seq(&mixed).unwrap();
         assert_eq!(seq.len(), 1);
-        assert_eq!(DshAdapter::entry_str(&seq[0], "id").as_deref(), Some("user-x"));
+        assert_eq!(
+            DshAdapter::entry_str(&seq[0], "id").as_deref(),
+            Some("user-x")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2471,18 +2740,36 @@ mod tests {
     #[test]
     fn generated_plugin_dual_key_session_memory() {
         let js = plugin_js(1234, "tok");
-        assert!(js.contains("function idKeys(agent, session, primary)"), "{js}");
+        assert!(
+            js.contains("function idKeys(agent, session, primary)"),
+            "{js}"
+        );
         // lastReason：双键登记 + 两键查询（登记发生在 keys 循环里）
         assert!(
             js.contains("lastReason.set(k, asText(reason && reason.kind));"),
             "lastReason 双键登记"
         );
-        assert!(js.contains("function reasonOf(keys)"), "lastReason 两键都查");
+        assert!(
+            js.contains("function reasonOf(keys)"),
+            "lastReason 两键都查"
+        );
         // settled（按回合标记）/ pending / running 同款
-        assert!(js.contains("function markSettled(keys, turn)"), "settledSessions 双键登记");
-        assert!(js.contains("function isSettledOf(keys, turn)"), "settledSessions 两键都查");
-        assert!(js.contains("for (const k of keys) pendingTerminal.set(k, job);"), "pendingTerminal 双键登记");
-        assert!(js.contains("for (const k of keys) running.add(k);"), "running 双键登记");
+        assert!(
+            js.contains("function markSettled(keys, turn)"),
+            "settledSessions 双键登记"
+        );
+        assert!(
+            js.contains("function isSettledOf(keys, turn)"),
+            "settledSessions 两键都查"
+        );
+        assert!(
+            js.contains("for (const k of keys) pendingTerminal.set(k, job);"),
+            "pendingTerminal 双键登记"
+        );
+        assert!(
+            js.contains("for (const k of keys) running.add(k);"),
+            "running 双键登记"
+        );
         // 注释里必须写明为什么（键分裂会让中止/出错回合被报成「任务完成」）
         assert!(js.contains("§2.12"), "双键的原因要留档: {js}");
     }
@@ -2493,14 +2780,26 @@ mod tests {
     fn generated_plugin_cleanup_covers_all_keys() {
         let js = plugin_js(1234, "tok");
         // finishTerminal / beginTurn / agent/disposed 都按 job.keys 清 pendingTerminal
-        let finish = js.split("function finishTerminal(sessionId)").nth(1).unwrap();
+        let finish = js
+            .split("function finishTerminal(sessionId)")
+            .nth(1)
+            .unwrap();
         let finish_body = finish.split("}").next().unwrap();
-        assert!(finish_body.contains("job.keys"), "finishTerminal 要按双键清理: {finish_body}");
+        assert!(
+            finish_body.contains("job.keys"),
+            "finishTerminal 要按双键清理: {finish_body}"
+        );
         let begin = js.split("function beginTurn(keys)").nth(1).unwrap();
         assert!(begin.contains("job.keys"), "beginTurn 要按双键清理");
         // disposed 清四张表都走 keys 循环
         let disposed = js.split("ctx.on(\"agent/disposed\"").nth(1).unwrap();
-        assert!(disposed.contains("for (const k of keys)"), "disposed 双键清理: {disposed}");
-        assert!(disposed.contains("lastReason.delete(k)"), "lastReason 也要清");
+        assert!(
+            disposed.contains("for (const k of keys)"),
+            "disposed 双键清理: {disposed}"
+        );
+        assert!(
+            disposed.contains("lastReason.delete(k)"),
+            "lastReason 也要清"
+        );
     }
 }

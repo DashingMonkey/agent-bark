@@ -75,6 +75,14 @@ export interface NormalizedEvent {
   message: string;
   timestamp: number;
   is_subagent?: boolean;
+  /**
+   * 派生出这个会话的**父会话 id**（主会话没有这个字段）。
+   *
+   * 与 [`SessionStatus.parent`] 同一份血缘来源，只是事件侧多带一份：终态驻留行要按它
+   * 插回父行的子树下面，否则子代理的「任务完成」行会落在列表末尾那行会话的子树里，
+   * 看着像挂到了别的会话下面（实测踩过）。
+   */
+  parent_session_id?: string | null;
   /// 纯保活心跳（不是活动信号）：daemon 侧只续命、绝不建档。
   /// 前端不消费（心跳本来就不入事件流），这里只为与后端结构保持一致。
   keepalive?: boolean;
@@ -97,6 +105,192 @@ export interface SessionStatus {
   /** 当前回合开始时刻（unix ms） */
   started_at: number;
   last_activity: number;
+  /**
+   * 父会话的**完整 id**（不是尾号）；**没有这个字段 = 主会话**（后端 `skip_serializing_if`）。
+   * 有值即「这是子代理」——与事件侧的 `is_subagent` 同一份血缘来源。
+   * 认亲一律拿它与 `session_id` 直接比对，别用截断值（见 [`parentTail`]）。
+   */
+  parent?: string;
+}
+
+/** 会话是否是子代理（悬浮窗、事件流的「运行中会话」区共用这一条判据） */
+export function isSubagentSession(s: SessionStatus): boolean {
+  return typeof s.parent === "string" && s.parent.length > 0;
+}
+
+/**
+ * 父会话 id 的**尾 6 位**（仅用于展示血缘小字）。匹配父子一律用完整 id
+ * （[`SessionStatus.parent`] 与 `session_id` 直接比对），别拿截断值去认亲。
+ */
+export function parentTail(parent: string): string {
+  return parent.slice(-6);
+}
+
+/** 排序 + 挂树后的会话行 */
+export interface SessionRow {
+  session: SessionStatus;
+  /** 缩进层级：0 = 主会话 / 占位父行；子代理挂在它的父行下面 */
+  depth: number;
+  /**
+   * 父链**整条**都不在本批快照里（回合已结束、被摘档或判死淘汰）。
+   *
+   * 这类子代理**不缩进**（`depth` 恒为 0）：父行不在，缩进就失去参照物，它会紧跟在上一行
+   * 的子树后面，看起来像「挂在了那个会话下面」（实测踩过：两个工作区各开一个 DSH 会话时，
+   * A 会话的子代理显示在 B 会话的子代理行下面）。父链只缺中间几节时走
+   * [`SessionRow.placeholder`]：缺的链节逐级补占位行，子树仍挂在占位行下面。
+   */
+  parentMissing: boolean;
+  /**
+   * 占位父行：快照里没有这个会话（已结束/被淘汰），是为了让还活着的子代理有地方可挂
+   * 而**合成**的一行。没有状态、没有 prompt，只显示 `会话 …尾号`；前端按此弱化渲染，
+   * 不要拿它当真实会话（它不会出现在 `store.sessions` 里）。
+   */
+  placeholder: boolean;
+}
+
+/** 缩进展示上限：再深的层级只保留 ↳ 记号、不再继续右移（卡片只有 240px / 列表也放不下） */
+export const SESSION_INDENT_MAX = 2;
+
+/** 占位父行的展示名：`会话 …8ec9f`（与血缘小字同一套尾号口径） */
+export function placeholderName(sessionId: string): string {
+  return `会话 …${sessionId.slice(-6)}`;
+}
+
+/**
+ * 把会话快照排成「父行 + 它的子行紧跟其后」的树序（深度优先，同级按开始时间倒序）。
+ *
+ * 后端快照是按 `started_at` 倒序的平铺列表，直接渲染会让子代理与父会话交错——
+ * 一个 fan-out 出去十几次派生的会话会把父行挤到列表深处，「谁派生了谁」完全看不出来。
+ *
+ * **父链上有节点不在本批快照里**（回合已结束 / 被摘档）时，缺的链节逐级合成**占位行**
+ * （`placeholder: true`），子代理照常挂在它下面：平铺到列表末尾会让它贴在别的会话子树
+ * 后面，被读成「挂到了那个会话下面」（实测事故）。合成行不承载状态、没有 prompt，
+ * 只显示 `会话 …尾号`；它的 `session_id` 就是缺的那个父 id，所以同一父的多个子代理会聚到
+ * 同一行下。若**整条父链**都不在快照里，缩进失去参照物 → 该子树顶格平铺（`parentMissing`）。
+ *
+ * 两条硬约束（都是实测踩过的坑，见 .tmp-svg/check-session-rows.mjs 的用例）：
+ * 1. 「缺不缺」一律拿 `byId` 判，**不能**用 `visited` 反推。子行的 `started_at` 更晚、
+ *    倒序下常常排在父行前面，先处理子行时会误判「父不在」而合成占位行——占位行与真父行
+ *    同 key（`agent|id`），真父行随后被 `visited` 静默吃掉，界面上只剩一条没有徽标、
+ *    没有 prompt 的假行。真行先全部走完（父在就挂父下），再收尾剩下的悬空链。
+ * 2. 悬空链只从**链首**挂一次。每个悬空子代理各自补链会补出重复占位行（同一父多个子代理时
+ *    直接炸成多行）。这里先把缺的 id 登记成 ghost 行、再按「父不在表里」收口，链只补一次。
+ *
+ * 环（血缘来自外部输入，理论上可被伪造）用 `visited` 兜底：宁可平铺，不死循环。
+ */
+export function sessionRows(list: SessionStatus[]): SessionRow[] {
+  const byParent = new Map<string, SessionStatus[]>();
+  const byId = new Map<string, SessionStatus>();
+  for (const s of list) {
+    byId.set(s.session_id, s);
+    if (isSubagentSession(s)) {
+      const kids = byParent.get(s.parent!);
+      if (kids) kids.push(s);
+      else byParent.set(s.parent!, [s]);
+    }
+  }
+  const byStart = (a: SessionStatus, b: SessionStatus) => b.started_at - a.started_at;
+  const childrenOf = (id: string) => (byParent.get(id) ?? []).slice().sort(byStart);
+  /**
+   * 合成占位父行：只在这个 id **确实不在快照里**时才建（`byId` 判，**不能**用 `visited`
+   * 反推——子行的 `started_at` 更晚、倒序下常排在父行前面，用它判「父不在」会合成一行与
+   * 真父行同 key（`agent|id`）的假行，真父行随后被 `visited` 静默吃掉，界面上只剩一条
+   * 没有徽标、没有 prompt 的假行）。同一 id 反复请求返回同一对象，于是「同一父的多个
+   * 子代理」共享一行。
+   */
+  const ghosts = new Map<string, SessionStatus>();
+  const pendingGhost = (id: string, kid: SessionStatus, parent: string | undefined): SessionStatus => {
+    const found = ghosts.get(id);
+    if (found) return found;
+    const g = ghostSession(kid, id, parent);
+    ghosts.set(id, g);
+    return g;
+  };
+  /**
+   * 沿 `parent` 往上补齐缺的链节，返回自顶向下的链。
+   *
+   * 每一节的 `parent` 都尽量接上**快照里的真实行**（查 `parentOfId` 反查出来的祖先）：
+   * 接得上时整条链就是那个真实行的子树，`walk` 自然把它挂进去；接不上（父链整条都不在
+   * 快照里）时才顶格平铺——缩进没有参照物。父已在表里 / 撞上已登记的链节 / 超上限就停
+   * （上限只是防御性的：快照 ≤64 行，长链只可能来自伪造血缘）。
+   */
+  const ghostChain = (kid: SessionStatus, ancestorOf: (id: string) => string | undefined): SessionStatus[] => {
+    const chain: SessionStatus[] = [];
+    let cur: string | undefined = kid.parent;
+    while (chain.length < 64 && cur && !byId.has(cur) && !ghosts.has(cur)) {
+      const parent = ancestorOf(cur);
+      const ghost = pendingGhost(cur, kid, parent !== cur ? parent : undefined);
+      chain.unshift(ghost);
+      cur = ghost.parent;
+    }
+    return chain;
+  };
+  const visited = new Set<string>();
+  const out: SessionRow[] = [];
+  const keyOf = (s: SessionStatus) => `${s.agent}|${s.session_id}`;
+  const walk = (s: SessionStatus, depth: number, parentMissing: boolean, placeholder: boolean) => {
+    const key = keyOf(s);
+    if (visited.has(key)) return;
+    visited.add(key);
+    out.push({ session: s, depth, parentMissing, placeholder });
+    // 孩子按「父会话 id == 本行 session_id」精确认领（完整 id，不做截断比对）
+    for (const kid of childrenOf(s.session_id)) walk(kid, depth + 1, false, false);
+  };
+  /** 悬空链的下游：顶格平铺，不再累加缩进——缩进没有参照物 */
+  const flatten = (s: SessionStatus, depth: number) => {
+    if (visited.has(keyOf(s))) return;
+    visited.add(keyOf(s));
+    out.push({ session: s, depth, parentMissing: true, placeholder: false });
+    for (const kid of childrenOf(s.session_id)) flatten(kid, depth);
+  };
+  // 第一步：快照里的真实行沿真实血缘走完（父在就挂父下，与处理顺序无关）
+  for (const s of list.slice().sort(byStart)) if (!isSubagentSession(s)) walk(s, 0, false, false);
+  // 第二步：收尾剩下的悬空子代理，给缺的链节登记占位行。
+  // **先登记再挂**：边遍历边补会为每个子代理各补一次，同一父补出重复占位行。
+  // 「缺的链节的父是谁」只能从真实行的 `parent` 反查——那一节不在快照里，别无来源
+  const parentOfId = new Map<string, string | undefined>();
+  for (const s of list) if (isSubagentSession(s)) parentOfId.set(s.session_id, s.parent);
+  const ancestorOf = (id: string) => parentOfId.get(id);
+  for (const kids of byParent.values()) {
+    for (const kid of kids.slice().sort(byStart)) if (!visited.has(keyOf(kid))) ghostChain(kid, ancestorOf);
+  }
+  // 第三步：把占位行挂上。链首顶格、往下逐级缩进，占位行下面接它的真实子树。
+  // 只从「自己上面没有占位行」的链首进——其余链节是它的孩子，`walk` 会顺着 `parent` 递归到
+  const ghostIdSet = new Set(ghosts.keys());
+  for (const [id, g] of ghosts) {
+    if (g.parent && ghostIdSet.has(g.parent)) continue;
+    walk(g, 0, false, true);
+  }
+  // 第四步：兜底——血缘成环或链长超上限时，上面几步都碰不到的行顶格平铺（宁可平铺，不丢行）
+  for (const s of list.slice().sort(byStart)) flatten(s, 0);
+  return out;
+}
+
+/**
+ * 合成一行占位父行（快照里没有这个会话）。
+ *
+ * `agent` 取子代理的：子代理与父会话必然是同一个 agent（血缘来自同一个插件的会话头），
+ * 这样同一父的多个子代理会聚到同一个 id 下，占位行只建一次。
+ *
+ * `parent` 尽量接上「缺的父自己的父」——由调用方沿血缘往上读。它能接上真实行时，
+ * 占位行本身就是那个真实行的一个孩子（直接挂进去，不用顶格平铺）。
+ */
+function ghostSession(kid: SessionStatus, id: string, parent: string | undefined): SessionStatus {
+  return {
+    agent: kid.agent,
+    session_id: id,
+    project: null,
+    cwd: kid.cwd,
+    phase: kid.phase,
+    prompt: null,
+    last_tool: null,
+    turn_count: 0,
+    tool_calls: 0,
+    // 用子代理的开始时刻排序：占位行紧挨着它下面的子代理
+    started_at: kid.started_at,
+    last_activity: kid.last_activity,
+    parent,
+  };
 }
 
 export type VerifyReport =
@@ -392,6 +586,22 @@ export function agentName(id: string): string {
   return AGENT_NAMES[id] ?? id;
 }
 
+/**
+ * 简称（跨工作区时行内用，见 widget.ts 的 `rowLabel`）。
+ *
+ * 行内要同时放下 agent 名与工作区名，全称 + 后缀（`DeepSeek Harness · passport-vibemic`）
+ * 在 240px 的卡片里必然被 ellipsis 从中间截掉——两个工作区同 agent 时截出来的前缀还可能
+ * 一模一样，等于什么都没显示。只在「需要靠工作区名区分」这一档缩写：单一工作区时行内
+ * 只有 agent 名，全称放得下，用简称反而丢信息。
+ */
+const AGENT_SHORT_NAMES: Record<string, string> = {
+  dsh: "DSH",
+};
+
+export function agentShortName(id: string): string {
+  return AGENT_SHORT_NAMES[id] ?? agentName(id);
+}
+
 export const EVENT_LABELS: Record<EventKind, string> = {
   session_start: "会话开始",
   tool_failed: "工具失败",
@@ -440,6 +650,21 @@ export function phaseBadgeClass(phase: SessionPhase): string {
     // 未知 phase（后端新增/坏推送）：中性灰，别渲染成无样式裸字
     default: return "badge";
   }
+}
+
+/**
+ * 子代理行的样式类（事件流 / 运行中会话区共用）：`is-sub` = 子代理行（名字与正文弱化），
+ * `sub-indent-1` / `sub-indent-2` = 缩进层级（来自 [`sessionRows`]，封顶到
+ * [`SESSION_INDENT_MAX`]，再深只保留记号不再右移）。
+ *
+ * 与悬浮窗的 `.row-item.sub` / `.tree` 是同一套视觉语言：↳ 记号表达层级、
+ * 弱化正文把视线让给父会话。类名抽在这里，消费方不会各写一份判据。
+ */
+export function subagentRowClass(row: SessionRow): string {
+  if (!isSubagentSession(row.session)) return "";
+  // 缩进层级照常给出：父行缺席时上面有一行**占位父行**兜着（见 sessionRows），
+  // 所以「子代理缩进到别人子树下」这件事不会发生
+  return `is-sub sub-indent-${Math.min(row.depth, SESSION_INDENT_MAX)}`;
 }
 
 /** 运行时长展示（如 "3分20秒" / "1小时02分"） */

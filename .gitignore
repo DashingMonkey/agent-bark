@@ -20,6 +20,8 @@ app/src-tauri/target/
 # 沙箱/调试临时产物
 app/vite-sandbox-patch.mjs
 *.log
+# 临时校验产物（截图、mockup、一次性脚本；本地放 .tmp-*/ 下，不入库）
+.tmp-*/
 
 # OS
 .DS_Store
