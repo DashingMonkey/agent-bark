@@ -931,6 +931,212 @@ console.log('case 19: 服务读不到（老版本 DSH）时监听器照常工作
   dump('case19');
 }
 
+// --- 用例 20：agent 被释放后**同一个回合**重新附着，保活心跳必须自愈 -------------
+//
+// 2026-10-10 用户实测（第二轮）：答完 `ask_user_question` 之后事件流一直停在
+// 「等待输入」，直到整段思考结束、回合终态到达才变「完成」——这正是「回合内没有任何
+// 心跳」的症状。DSH 会在**回合还在跑**时让 agent 走一次「拆掉再重挂」
+// （`agent/disposed`，官方语义：这个 agent 的生命周期被释放，例如 owner fiber 卸载后
+// 重新附着同一会话）。旧实现只在 `turn/start` 排心跳，而那时**不会**再有 `turn/start`
+// （回合没变），`stopHeartbeat` 一执行就再也没人补排 → 保活链永久死亡。
+//
+// 本用例锁住两条自愈路径：
+//   1. `agent/status: running`（重新附着的边沿）必须补排心跳；
+//   2. 回合开着时的会话事件（`busyOf` 判真）同样必须补排心跳。
+// 同时锁住反面：回合已经关掉之后，不得凭任何事件凭空续排心跳（否则 daemon 会挂出
+// 一条永远没有终态的「思考中」）。
+
+console.log('case 20: agent 释放后同回合重新附着，保活心跳必须自愈');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  // 投影显式跟着回合开关走：真实 DSH 里 `turnBoundary.openTurnStartSeq` 就是
+  // 「已写 turn/start、还没写 turn/end」（dsh-agent-loop 的投影定义），桩必须同步它，
+  // 否则用例测的是「投影说回合关了」这条不相干的路径。
+  const projections = makeProjections();
+  const ctx = makeCtx({ projections });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-reattach');
+
+  // 一个真实回合开始：建档 + 排上心跳
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  projections.open(agent.session, 0);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  check(timers.filter(isHeartbeat).length >= 1, '回合开始后排上了周期心跳');
+
+  // 提问 → daemon 进入「等待输入」
+  await ctx.dispatchWaterfall('user-questions/request', {
+    agent,
+    questions: [{ header: '确认', question: '继续吗' }],
+  });
+  check(sent.some((e) => e.type === 'input_required'), 'input_required 已上报');
+
+  // 用户还没回答，agent 被释放（owner 卸载 / 重新附着）：插件停掉心跳
+  await ctx.dispatch('agent/disposed', { agent });
+  check(
+    timers.filter(isHeartbeat).length === 0,
+    `agent 释放后心跳被停掉（实际 ${timers.filter(isHeartbeat).length} 个）`,
+  );
+
+  // 重新附着：同一个回合还在跑，**没有**新的 turn/start，只有 running 边沿
+  sent.length = 0;
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  check(
+    timers.filter(isHeartbeat).length >= 1,
+    `重新附着（running 边沿）后心跳自愈（实际 ${timers.filter(isHeartbeat).length} 个）`,
+  );
+  const fired = await fireTimer(isHeartbeat);
+  check(fired, '自愈后的心跳那一跳真的被推进');
+  check(
+    sent.some((e) => e.type === 'tool_finished' && e.keepalive === true && e.session_id === 'sess-reattach'),
+    '自愈后发出的 keepalive 带本会话 id（daemon 侧据此把等待相位打回思考中）',
+  );
+
+  // 第二条自愈路径：没有 running 边沿时，回合内的事件也必须补排心跳
+  await ctx.dispatch('agent/disposed', { agent });
+  check(timers.filter(isHeartbeat).length === 0, '再次释放后心跳再次停掉');
+  // 日志里回合仍然开着（没有 turn/end），未知事件类型照样算「还在跑」
+  await ctx.dispatch('session/event', agent.session, { type: 'step/start', data: { turn: 1, step: 1 } });
+  check(
+    timers.filter(isHeartbeat).length >= 1,
+    `回合开着时的会话事件也能让心跳自愈（实际 ${timers.filter(isHeartbeat).length} 个）`,
+  );
+
+  // 反面：回合关掉之后，心跳不得再发出保活（否则 daemon 侧留下永不收尾的「思考中」）。
+  // 允许挂着的对账跳数（`settle` 投递失败时它要重试），但那一跳**只对账、不发心跳**。
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  projections.close(agent.session);
+  await advance();
+  await ctx.dispatch('agent/status', { agent, status: 'idle' });
+  await advance();
+  check(
+    terminals('run_completed').length === 1,
+    `自愈不影响收尾（实际 ${terminals('run_completed').length} 条）`,
+  );
+  sent.length = 0;
+  await fireTimer(isHeartbeat);
+  await fireTimer(isHeartbeat);
+  check(
+    sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true).length === 0,
+    `回合关掉后不得再发保活心跳（实际 ${sent.filter((e) => e.type === 'tool_finished').length} 条）`,
+  );
+  dump('case20');
+}
+
+// --- 用例 20b：答完提问的收尾必须**不吃节流**立刻发出去 -------------------------
+//
+// 2026-10-10 生产 trace 实测（用户第三轮反馈「选完还是等待输入，过一会才蹦出完成」）：
+//   06:29:45.707 post tool_finished/keepalive   ← 提问**之前**的一条保活，占掉了节流窗
+//   06:29:51.946 post input_required            ← daemon 进入「等待输入」
+//   06:29:55.902 tool/result（用户答完）        ← 被 15s 节流吃掉，**没发出去**
+//   06:30:05.716 heartbeat.tick → keepalive     ← 相位一直到这一跳才回落（≈10s 滞后）
+// 用户看到的就是「卡在等待输入 → 直接蹦出已完成」。
+//
+// 锁两件事：节流窗**内**（同一会话 3 秒前刚发过保活）
+//   1. 答完提问的那条收尾必须照发（`force`，因为提问是低频人工事件）；
+//   2. 其它工具收尾仍按节流窗压掉，不得因此变成「每条事件都发」的刷屏。
+
+console.log('case 20b: 答完提问的收尾不吃节流，立刻发出');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const projections = makeProjections();
+  const ctx = makeCtx({ projections });
+  plugin.apply(ctx);
+  const agent = makeAgent('sess-answer');
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  projections.open(agent.session, 0);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+
+  // 提问前的空转：turn/start 那条保活 + 一条工具收尾，正好把节流窗（5s）占住
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { turn: 1, name: 'pwsh' } });
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
+  const beatsBefore = sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true).length;
+  check(beatsBefore >= 1, `提问前已有保活占掉节流窗（实际 ${beatsBefore} 条）`);
+
+  // 提问 → 用户答完（同回合内，没有 turn/end）
+  await ctx.dispatchWaterfall('user-questions/request', {
+    agent,
+    questions: [{ header: '确认', question: '继续吗' }],
+  });
+  check(sent.some((e) => e.type === 'input_required'), 'input_required 已上报');
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { turn: 1, name: 'ask_user_question' } });
+  sent.length = 0;
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
+  check(
+    sent.some((e) => e.type === 'tool_finished' && e.keepalive === true),
+    '答完提问的收尾立刻发出（否则 daemon 的「等待输入」要多等一个周期心跳才回落）',
+  );
+
+  // 反面：不是提问的收尾照样吃节流（3 秒前刚发过 → 不发）
+  sent.length = 0;
+  await ctx.dispatch('session/event', agent.session, { type: 'assistant/message', data: { turn: 1 } });
+  check(
+    sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true).length === 0,
+    '普通事件仍走节流（不得变成每条事件都发）',
+  );
+  dump('case20b');
+}
+
+// --- 用例 21：agent.id 与 session.id 分裂（双键家族）时心跳不得漏排/并行 ----------
+//
+// DSH 的两个 id 由 `AgentRegistry.enter` 断言相等（`agent.id !== agent.session.id`
+// 直接抛），但插件不能把「相等」当契约：`sessionIdOf` 优先 agent.id，而
+// `session/event` 只拿得到 session.id——两个键一旦不相等，会话记忆就分裂成两份。
+// 保活心跳尤其要按**家族键**判在位：只认 `keys[0]` 的话，另一条观察路径会以为
+// 「没排心跳」再排一条，同一会话两条心跳链并行（保活流量翻倍，且 stopHeartbeat
+// 只能清掉其中一条 → 会话收尾后残留一条永远不收的心跳）。
+
+console.log('case 21: agent.id 与 session.id 分裂时，心跳只排一条、且能被整体停掉');
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const projections = makeProjections();
+  const ctx = makeCtx({ projections });
+  plugin.apply(ctx);
+  // 双键分裂：agent.id 与 session.id 不相等（同一次运行两条观察路径各拿一个）
+  const agent = makeAgent('sess-split');
+  agent.id = 'agent-split-alias';
+
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  projections.open(agent.session, 0);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  check(
+    timers.filter(isHeartbeat).length === 1,
+    `双键分裂时心跳只排一条（实际 ${timers.filter(isHeartbeat).length} 条）`,
+  );
+
+  // 同一回合里再来一条 running 边沿（重新附着）：仍不得排出第二条
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  check(
+    timers.filter(isHeartbeat).length === 1,
+    `重复 running 边沿不得排出第二条（实际 ${timers.filter(isHeartbeat).length} 条）`,
+  );
+
+  // 心跳那一跳发的是**排表时那个键**（`session/event` 路径给的是 session.id，即
+  // `'sess-split'`）——与 daemon 侧收到 `input_required` 的键同源，续得到同一行。
+  // 这里要钉的是「键不是空的、也不是另一个会话」，不是钉死用哪个 id。
+  sent.length = 0;
+  await fireTimer(isHeartbeat);
+  check(
+    sent.some((e) => e.type === 'tool_finished' && e.keepalive === true && e.session_id === 'sess-split'),
+    '心跳带本会话 id（daemon 侧才能续到同名会话）',
+  );
+
+  // 释放：整体停掉，且残留标记要清干净（收尾后不得再发保活）
+  await ctx.dispatch('agent/disposed', { agent });
+  check(timers.filter(isHeartbeat).length === 0, `释放后心跳整体停掉（实际 ${timers.filter(isHeartbeat).length} 条）`);
+  check(
+    timers.length === 0,
+    `释放后不残留任何定时器（实际 ${timers.length} 个：${JSON.stringify(timers.map((t) => t.ms))}）`,
+  );
+  dump('case21');
+}
+
 // --- 汇总 -------------------------------------------------------------------
 
 console.log('');

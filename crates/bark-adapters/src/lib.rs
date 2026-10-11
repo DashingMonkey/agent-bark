@@ -6,6 +6,7 @@
 
 pub mod antigravity;
 pub mod claude_style;
+pub mod doubaowork;
 pub mod dsh;
 pub mod jsonio;
 pub mod kimi_code;

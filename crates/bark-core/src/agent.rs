@@ -49,6 +49,9 @@ pub enum AgentKind {
     /// Kimi Work（Kimi 电脑客户端 Work 模式，内嵌 daimon 守护进程跑 Kimi Code 内核，
     /// 会话以 kimi-code 格式落盘在自己的 runtime home 下——监控型轮询，见 kimiwork.rs）
     KimiWork,
+    /// 豆包工作（字节跳动 DoubaoWork 桌面客户端，2026-10 上线）：OpenAI 风格的
+    /// trajectory.jsonl 逐回合落盘在应用 profile 下——监控型轮询，见 doubaowork.rs
+    DoubaoWork,
 }
 
 /// adapter 的工作模式
@@ -66,7 +69,7 @@ impl AgentKind {
     /// 前两者没人用或被官方除名，后者并入了 Qoder。都不再注册 adapter，用户配置里
     /// 残留的旧 id 字符串无害——agents 段存的是 String，bark-cli 遇到未知 id 也只
     /// 打印一行并 exit 0）
-    pub const ALL: [AgentKind; 20] = [
+    pub const ALL: [AgentKind; 21] = [
         AgentKind::ClaudeCode,
         AgentKind::TraeCode,
         AgentKind::CodeBuddy,
@@ -87,6 +90,7 @@ impl AgentKind {
         AgentKind::Antigravity,
         AgentKind::KimiCode,
         AgentKind::KimiWork,
+        AgentKind::DoubaoWork,
     ];
 
     pub fn id(&self) -> &'static str {
@@ -111,6 +115,7 @@ impl AgentKind {
             AgentKind::Antigravity => "antigravity",
             AgentKind::KimiCode => "kimi-code",
             AgentKind::KimiWork => "kimi-work",
+            AgentKind::DoubaoWork => "doubao-work",
         }
     }
 
@@ -139,12 +144,15 @@ impl AgentKind {
             AgentKind::Antigravity => "Antigravity",
             AgentKind::KimiCode => "Kimi Code",
             AgentKind::KimiWork => "Kimi Work",
+            AgentKind::DoubaoWork => "豆包工作",
         }
     }
 
     pub fn mode(&self) -> AdapterMode {
         match self {
-            AgentKind::TraeWork | AgentKind::WorkBuddy | AgentKind::KimiWork => AdapterMode::Watch,
+            AgentKind::TraeWork | AgentKind::WorkBuddy | AgentKind::KimiWork | AgentKind::DoubaoWork => {
+                AdapterMode::Watch
+            }
             // DSH：生成原生 Cordis 插件并挂载（见 bark-adapters/src/dsh.rs）
             _ => AdapterMode::Hook,
         }

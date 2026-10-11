@@ -2,6 +2,7 @@
 
 use crate::antigravity;
 use crate::claude_style;
+use crate::doubaowork::DoubaoWorkWatch;
 use crate::dsh::DshAdapter;
 use crate::kimi_code;
 use crate::kimiwork::KimiWorkWatch;
@@ -35,7 +36,12 @@ pub fn hook_adapters() -> Vec<Box<dyn HookAdapter>> {
 }
 
 pub fn watch_adapters() -> Vec<Box<dyn WatchAdapter>> {
-    vec![Box::new(WorkBuddyWatch), Box::new(TraeWorkWatch), Box::new(KimiWorkWatch)]
+    vec![
+        Box::new(WorkBuddyWatch),
+        Box::new(TraeWorkWatch),
+        Box::new(KimiWorkWatch),
+        Box::new(DoubaoWorkWatch),
+    ]
 }
 
 /// 按种类查找 hook 型 adapter（hook 子命令归一化用）

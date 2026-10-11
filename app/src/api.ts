@@ -18,6 +18,7 @@ import iconDsh from "./assets/agents/dsh.svg?raw";
 import iconGemini from "./assets/agents/gemini-color.svg?raw";
 import iconQwen from "./assets/agents/qwen-color.svg?raw";
 import iconKimi from "./assets/agents/kimi.svg?raw";
+import iconDoubao from "./assets/agents/doubao-color.svg?raw";
 import iconCursor from "./assets/agents/cursor.svg?raw";
 import iconCopilot from "./assets/agents/copilot-color.svg?raw";
 import iconWindsurf from "./assets/agents/windsurf.svg?raw";
@@ -41,6 +42,7 @@ const AGENT_ICONS: Record<string, string> = {
   "qwen-code": iconQwen,
   "kimi-code": iconKimi,
   "kimi-work": iconKimi,
+  "doubao-work": iconDoubao,
   cursor: iconCursor,
   "copilot-cli": iconCopilot,
   windsurf: iconWindsurf,
@@ -580,6 +582,7 @@ export const AGENT_NAMES: Record<string, string> = {
   dsh: "DeepSeek Harness",
   "trae-work": "TraeWork",
   workbuddy: "WorkBuddy",
+  "doubao-work": "豆包工作",
 };
 
 export function agentName(id: string): string {

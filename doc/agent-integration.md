@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Windsurf、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
 | **插件型** | 生成插件文件并登记到宿主的插件配置里，插件内部直接 POST `/event` | OpenCode、DeepSeek Harness |
-| **监控型** | 轮询 agent 本地会话库（SQLite / JSONL，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork、Kimi Work |
+| **监控型** | 轮询 agent 本地会话库（SQLite / JSONL，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork、Kimi Work、豆包工作 |
 
 **统一事件**（所有 agent 归一化到这 9 类；`activity` 与 `tool_finished` 只用于状态推导，不通知、不入历史）：
 
@@ -49,6 +49,7 @@
 | Grok CLI | `StopCancelled`（官方事件，未实测） | **立即释放**——显式的用户取消信号，比 Claude 系干净 |
 | Kimi Code | `Interrupt`（官方事件，未实测） | **立即释放**（显式中断信号） |
 | Kimi Work | `turn.cancel`（本机 wire.jsonl 实测） | **立即释放**（run_aborted） |
+| 豆包工作 | **无**（trajectory 里不留中止记录） | 卡原状态到 10 分钟判死；继续对话则刷新 |
 | Gemini CLI / Qwen Code / Factory Droid / Cursor / Copilot CLI | `SessionEnd`/`sessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
 | Windsurf / Antigravity | **无**（官方就没有会话级/中断事件） | 卡原状态到 10 分钟判死；继续对话则刷新 |
 
@@ -399,7 +400,32 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
   不再等终态投递），但 POST 仍必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被
   「只接受连接不响应」的进程占用时，否则会把 DSH 的事件分发拖住；
 - **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，**重投复用同一个事件 id**——首投「daemon 已收下但响应丢了」时靠 daemon 的 id 去重兜住，绝不产生第二条通知）；`markSettled` 只在**确认送达**的路径上调用，并按**回合号**记账；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把静止兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
-- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾，用例 18/19 覆盖「答完提问后等待相位必须解除」与「服务读不到时不得崩」；本机没有 node 时该测试自动跳过）；
+- **`agent/disposed` 之后保活心跳必须能自愈**（2026-10-10 修，用户实测第二轮：答完 `ask_user_question` 后卡片/悬浮窗一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变「完成」）。事故形态与 10-09 那次**一模一样**（同一回合内回答 → 没有新 `turn/start` → 只能靠周期保活把 daemon 的等待相位打回思考中），但成因不同：
+  1. DSH 会在**回合还在跑**的时候让 agent 走一次「拆掉再重挂」——`agent/disposed`（官方语义：*agent 生命周期被释放*，`dsh-agent` 的 `detachEntered` 在 owner fiber 卸载/重新附着时发出）到达插件；插件按设计 `stopHeartbeat`（会话关掉就不该再有心跳）；
+  2. 但**同一个回合没有结束**，`turn/start` 不会再来，而心跳**只在 `turn/start` 里排过**——于是保活链永久死亡，谁也不会再补。daemon 的「等待输入」只能等回合终态来摘档。
+  修法：心跳改成**自愈**——`busyOf()` 判定「回合确实开着」时顺手补排（`keepAliveIfOpen`，`startHeartbeat` 自带「已排过就返回」所以幂等），`agent/status: running` 边沿也走一次 `busyOf`（重新附着正是这条边沿）。反面同样锁住：回合关着时**绝不**补排，否则会留下一条永远没有终态的「思考中」（daemon 侧 10 分钟后判死 → 红光 + 失败音）。同批还修掉一处**漏排漏洞**：心跳的在位判定与排下一跳**一律按家族键**（`heartbeatPending` + `armHeartbeat`）——旧写法排表用 `keys[0]`、清理用全家族键，两个 id 一旦不相等，另一条观察路径会以为「没排心跳」再排一条，同一会话两条心跳链并行、且 `stopHeartbeat` 清不干净（会话收尾后残留在心跳）。回归：`plugin_sim.mjs` case 20（释放 → 同回合重新附着 → 心跳必须自愈；回合关掉后不得再发保活）与 case 21（双键分裂时只排一条、且能被整体停掉）；
+- **排障用可选诊断日志**（2026-10-10 新增，默认关闭、零成本）：DSH 处于 Developer Preview，上报路径出问题时**进程外看不见**（哪个事件到了、哪一步 return 了、心跳排没排上、POST 发没发出去）。打开方式二选一（都在 DSH **启动时**生效）：环境变量 `BARK_DSH_TRACE=1`，或放一个标记文件 `$DSH_HOME/agent-bark/trace.on`。日志写到 `$DSH_HOME/agent-bark/trace.log`（JSONL，超 2 MB 自动截断），关键行：
+  - `apply {"proj":…}` = 插件挂上了、投影服务读得到（`proj:false` 说明属性读法/服务缺失，走了日志兜底）；
+  - `event {...}` / `event.liveness {... "busy":…, "heartbeat":…}` / `event.toolcall {...}` / `status.running {...}` = 事件到了、忙判定与心跳是否在位（**卡「等待输入」时先看这里**：`busy:true` 却 `heartbeat:false` 就是保活链断了；`status.running` 的 `busy` 是重新附着那条自愈路径的判据）；
+  - `heartbeat.start` / `heartbeat.tick {... "logOpen":…, "projOpen":…, "open":…}` / `heartbeat.stop` / `heartbeat.cancel` = 心跳排上、对账结果、何时被停（`logOpen`/`projOpen` 谁有值就说明走的哪条判定链）；
+  - `answered {...}` = 「刚答完提问」这条收尾被识别到（它的保活不吃节流）；
+  - `post {... "session_id":…, "keepalive":…, "status":…}` = **实际发出去的事件体 + HTTP 状态**（怀疑「同一会话两条行」时看这里：两条行的 key 差在哪一目了然）；
+  - `post.activity` / `post.liveness` / `rest` / `settle` / `disposed` / `event.error` = 上报摘要与收尾决策，以及被 `catch` 吞掉的抛点（契约漂移就在这条里）。
+  用完**删掉 `trace.on`**（或清掉环境变量）并重启 dsh 即恢复零开销；
+- **答完提问的收尾必须不吃节流**（2026-10-10 修，第三次用户实测 + 生产 trace 取证：用户「选完选项后卡片仍停在等待输入，过一会儿直接蹦出已完成」）。trace 把真相钉死了——**key 没分裂、心跳也送到了**（15 条上报的 `session_id` 完全一致、每条 POST 都是 200），卡的是**时延**：
+  ```text
+  06:29:45.707  post tool_finished/keepalive   ← 提问**之前**的一条保活，占掉了 15s 节流窗
+  06:29:51.946  post input_required            ← daemon 进入「等待输入」
+  06:29:55.902  tool/result（用户答完）        ← 被节流吃掉，**根本没发出去**
+  06:30:05.716  heartbeat.tick → keepalive     ← 相位到这一跳才回落（≈10s 滞后）
+  ```
+  用户视角就是「选完了还卡着，然后直接完成」；至于「多出来的第二行已完成」，那是悬浮窗自己的**终态驻留行**（`TERMINAL_HOLD_MS = 6000`，见 `widget.ts`）——会话行还没翻色时它先出现，看着就像两条会话（**不是** daemon 里两条 key；trace 已排除）。
+  修法两条（都只针对「用户刚做完一次人工交互」这条路径，不是全局降门槛）：
+  1. `LIVENESS_MIN_MS` 15s → **5s**：正常回合里工具收尾间隔远大于它、不会刷屏，而答完提问到下一个事件通常 < 5s，能立刻发出去；
+  2. `ask_user_question` 的工具收尾**无条件放行**（插件记 `questioned` 标记，收尾时带 `force: true`）：提问是低频人工事件，为它开一次强制放行零刷屏风险，时延从「最长一个周期心跳」压到「几十毫秒」。
+  回归：`plugin_sim.mjs` case 20b（节流窗内答完必须发；普通事件仍被压掉）；
+- ⚠️ **实测契约漂移：`sessionProjections` 未必读得到**（2026-10-10 trace 首行 `apply {"proj":false}`）。这个 DSH 版本里 `ctx.get("sessionProjections")` 返回空，插件一直在走**日志兜底**（`turnOpen` 推理 + `logScan`），而 trace 的 `heartbeat.tick {"logOpen":true,"projOpen":true}` 说明兜底判得正确。结论：**不要把「投影可用」当成前提**——它只是首选信号，日志推理才是真正的保底（`projectionsOf()` 返回 `null` 时功能不得降级，见用例 19）；
+- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾，用例 18/19 覆盖「答完提问后等待相位必须解除」与「服务读不到时不得崩」，用例 20/20b 覆盖「agent 释放后同回合重新附着时心跳自愈」与「答完提问的收尾不吃节流」，用例 21 覆盖「双键分裂时心跳只排一条、可整体停掉」；本机没有 node 时该测试自动跳过）；
 - 插件型 adapter 只送 cwd，daemon 侧 `handle_event` 会按 hook 链路的同一规则补出 `project`，两条链路的通知正文（项目名 + 摘要）保持一致；
 - 排障链路：`dsh web --dump-config` 证明条目在列；DSH 侧有没有真的发出去，看 Windows 通知历史 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表（按 AUMID `com.agentbark.app` 过滤就是 agent-bark 弹过的 toast）；
 - 桥接包需在 profile 里自行安装：`dsh plugin add @deepseek-ai/dsh-hooks-claude-code`；
@@ -414,6 +440,7 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 | 契约点 | 失效症状 | 插件侧位置 |
 | --- | --- | --- |
 | **读服务必须走 `ctx.get("sessionProjections")`**（属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上直接抛 `cannot get property … without inject`，Cordis 4.x） | 「等待输入/等待确认」**答完不解除**（一直橙到终态才变完成）；长回合被 daemon 判死误亮红光；派生/长工具静默期没有续命 | `projectionsOf`（唯一读点）/ `startHeartbeat` 的闸门 |
+| **`agent/disposed` 会在回合还开着时到达**（agent 生命周期被释放，例如 owner fiber 卸载后重新附着同一会话）；它**不保证**随后有 `turn/start` | 「等待输入」答完不回落，且**牌面一切正常**（面板/悬浮窗都卡在等待橙，直到回合终态才变完成） | `keepAliveIfOpen`（`busyOf` 的返回值上补排）/ `agent/status: running` 分支的 `busyOf(session, keys)` |
 | `sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
 | `agent/status` 的边沿语义（`idle` = 没有驱动器还在排队或运行） | 完成通知不来、或提前来；**边沿还可能根本不出现**（2026-09-30 实测：DSH 重启后连续两个回合收尾都没有 idle）——所以收尾**不能只挂在它上面**，插件用 `turn/end` + `REST_GRACE_MS` 宽限窗兜底 | `agent/status` 监听 + `scheduleRest` |
 | `session/event` 的 `turn/start` / `turn/end`（后者带 `data.turn` 与 `data.reason.kind`） | 完全不建档（面板空白）、或按回合去重失效（重复通知） | `session/event` 监听 |
@@ -627,7 +654,34 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 
 ---
 
-## 21. 已下线
+## 21. 豆包工作（监控型 · 非官方）
+
+字节跳动的 AI 工作桌面客户端 DoubaoWork（Chromium 壳 + 本地 agent 运行时 agent_infra，本地工具在其沙箱里执行）。**2026-10-10 在本机实测逆向**了它的数据布局（2.32.3）。
+
+| 项 | 值 |
+| --- | --- |
+| id | `doubao-work` |
+| 数据根 ① | `%LOCALAPPDATA%\DoubaoWork\User Data\<profile>\.doubaowork\agent_mode\workspace\.sessions\`（枚举全部 profile；`.doubaowork` 首次使用 Agent 模式后才出现） |
+| 数据根 ② | 同 profile 的 `IndexedDB\chrome_doubaowork-chat_0.indexeddb.leveldb`（渲染进程会话状态；只增量尾随编号最大的 `.log`，compaction 换日志时从头重扫） |
+| 会话布局 | `.sessions/<会话id>/agents/<agentid>/system/trajectory.jsonl`（OpenAI 风格对话流，逐回合 append-only，**只记录循环内部消息：用户输入、工具调用、工具结果**）+ `assignment.md`（逐回合追加的需求流水，头部有 `- Role: main`）+ `board.md` |
+| 事件映射 | trajectory `role=user`→activity（content 为任务文案）、`tool_calls`→activity（带工具名）、`interaction.ask`→**input_required**（带问题文案）、`role=tool`→tool_finished（**也是提问被回答的解除信号**）；**IndexedDB `extra.running_messages` 条目清除→run_completed**；无 `tool_calls` 的 assistant 行→run_completed（兜底，终态回声去重）；其余忽略 |
+| 需要你做 | 无（不写盘、不需要豆包工作任何设置）；Agent 模式跑过一次即自动监控 |
+
+实测要点（样本：一个完整会话 3 小时 / 24 条循环消息 / 1 次 `interaction.ask` 提问-回答闭环 / 多消息连发排队；IndexedDB 语义用分代 compaction 快照 + 当前日志逐点核对）：
+- **最终回复不落盘**——trajectory 里没有任何「无 `tool_calls` 的 assistant 行」，十几次回复都只在聊天 UI 里。回合完成信号唯一来自 IndexedDB：会话记录 `extra.running_messages` 随**回合开始**写入条目（`{消息id: {started_at_ms}}`）、随**回合真正结束**清除（`{}`）；
+- `interaction.ask` 是运行时**提问工具**：提问后回合挂起等用户回答（IndexedDB 条目保留），答完以 `role=tool` 结果恢复循环；
+- 工具失败（如 `image_gen` 报错）只留 `role=tool` 的错误文本，回合继续跑——**不是 run_failed**；
+- 运行中可以连发多条消息排队，trajectory 里表现为连续多条 `role=user`，每条都刷新任务文案；
+- 云端生图 / 长思考期间本地零事件，靠 60s 运行态心跳保活（远小于 10 分钟判死线）；
+- 通知正文用最近一次任务文案，项目目录取自 IndexedDB 的 `agent_task_param.workspace`。
+
+**为什么不做 Hook 型**：豆包工作没有 hooks / CLI 扩展点；Watch 型零写盘。
+
+**已知边界**：只看主 agent（`assignment.md` 头部 `Role: main`），子智能体不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）；**失败 / 中止不可见**——运行时崩溃、用户停止在两个数据源里都不留记录，条目清除统一映射为完成（失败的任务会误报「任务完成」），数据源失效时退化为事件静止 + 10 分钟判死；IndexedDB 不可读时降级为 trajectory 单源（完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场，不亮失败色、下次活动自动恢复）；完成/运行种子只覆盖 LevelDB 当前 `.log` 里的会话（compaction 会把老会话的最新状态挪进 `.ldb`，为它做完整 LevelDB reader 不值得），无种子的会话按 trajectory 文件停摆时长兜底——超过 15 分钟无文件活动按空闲建档（不点亮、不心跳，否则每次重启历史会话都会被重新点亮一遍），后续任何真实事件照常接管；数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
+
+---
+
+## 22. 已下线
 
 | id | 说明 |
 | --- | --- |
@@ -641,7 +695,7 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 
 ---
 
-## 22. 通用排查清单
+## 23. 通用排查清单
 
 先看 **Agents 接入**页的徽标，再对症处理：
 

@@ -121,7 +121,7 @@ fn remove_snapshot_dir(dir: &Path) {
 /// 会话，不是任务失败——RunFailed 会弹「任务失败」通知 + 亮失败色 + 失败音，
 /// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮失败色」，自己先亮失败色等于
 /// 换个时机复现同一问题。RunAborted 不通知、不亮失败色（TraeWork 一直如此）。
-fn emit_lost_row(
+pub(crate) fn emit_lost_row(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
     kind: AgentKind,

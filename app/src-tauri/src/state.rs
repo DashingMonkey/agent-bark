@@ -1952,6 +1952,38 @@ mod tests {
     }
 
     #[test]
+    fn keepalive_heartbeat_clears_waiting_phase() {
+        // 2026-10-10 生产 trace 实测（DSH）：用户答完 `ask_user_question` 之后，daemon 停在
+        // `WaitingInput` 上，**唯一**能把它打回「思考中」的就是插件那条保活心跳
+        // （`tool_finished` + `keepalive:true`）——因为回答落在同一个回合里，没有新的
+        // `turn/start`、也没有工具调用。这条路径一旦失效，用户看到的就是「选完了还卡在
+        // 等待输入，过一会儿直接蹦出已完成」（实际事故是那条心跳被插件的节流窗吃掉，
+        // 见 dsh.rs 的 LIVENESS_MIN_MS / questioned）。
+        // 这里把「保活心跳必须解除等待相位」钉在 daemon 侧，别再靠插件侧的行为假设。
+        let (mut sessions, mut finished) = table();
+        apply_session_event(
+            &mut sessions,
+            &mut finished,
+            &ev(EventKind::Activity, 1000, Some("ask_user_question"), ""),
+        );
+        apply_session_event(
+            &mut sessions,
+            &mut finished,
+            &ev(EventKind::InputRequired, 2000, None, "选择清理范围：第一轮清理执行哪些?"),
+        );
+        assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::WaitingInput);
+
+        // 保活心跳（不带工具名、keepalive=true）：相位必须回落，且算一次真实跃迁（要推快照）
+        let mut beat = ev(EventKind::ToolFinished, 3000, None, "");
+        beat.keepalive = true;
+        let d = apply_session_event(&mut sessions, &mut finished, &beat);
+        assert!(d.changed && d.phase_changed, "保活心跳必须把等待相位打回思考中");
+        assert!(d.urgent, "相位跃迁必须立即推快照（否则悬浮窗要等下一次推送才翻色）");
+        assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::Thinking);
+        assert_eq!(sessions["trae-code|s1"].last_activity, 3000, "同时续命");
+    }
+
+    #[test]
     fn keepalive_heartbeat_never_creates_a_session() {
         // 纯保活心跳（keepalive=true）只续命、绝不建档——DSH 插件按「回合开着就定期
         // 补心跳」续命时用的就是它。表里没有条目说明这条心跳没有可续的对象：建档会留下

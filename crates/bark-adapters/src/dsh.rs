@@ -627,8 +627,33 @@ const heldTerminal = new Map();
 
 /** 保活心跳的节流表：会话 id → 上次发送时刻（tool_finished 语义，只续命）。 */
 const lastLivenessAt = new Map();
-/** 保活心跳最小间隔：session/event 一轮可达几十条，节流防刷屏。 */
-const LIVENESS_MIN_MS = 15000;
+/**
+ * 「这个会话刚抛出提问、还在等人回答」的标记（`ask_user_question` 的工具收尾要用）。
+ *
+ * 为什么单独记一笔：答完提问的那条 `tool/result` 是 daemon 侧「等待输入 → 思考中」
+ * 的唯一时点，**不能**被节流（`LIVENESS_MIN_MS`）吃掉——实测就是这么卡的：一条保活
+ * 刚好在提问前发出，用户 10 秒后答完，那条收尾落在节流窗里被丢掉，相位只能等周期
+ * 心跳（最长 20 秒）才回落。提问是低频、人工节奏的事件，为它开一次「无条件放行」
+ * 不会造成任何刷屏。
+ */
+const questioned = new Set();
+/**
+ * 事件驱动保活的最小间隔：`session/event` 一轮可达几十条，节流防刷屏。
+ *
+ * ⚠️ **必须是「用户能忍受的滞后」而不是「防刷屏的下限」**（2026-10-10 实测调小，
+ * 15s → 5s）：这条保活唯一的**相位语义**是「工具收尾 / 答完提问 → 回合继续思考」
+ * ——daemon 的 `WaitingInput` / `WaitingPermission` 靠它回落「思考中」。而用户答完
+ * `ask_user_question` 是**几十秒内就会发生**的事，落在 15 秒窗里就会被整条丢掉，
+ * 只能等周期心跳（最长 20 秒）来补：实测 trace 里就是这么一幕——
+ * `06:29:45.707` 一条保活占掉窗口 → `06:29:55.902` 用户答完，那条 `tool/result`
+ * 被节流吃掉、**没发出去** → 相位一直橙到 `06:30:05.716` 的周期心跳。
+ * 用户看到的就是「选完了还卡在等待输入，过一会儿直接蹦出完成」。
+ *
+ * 5 秒的依据：正常回合里「工具收尾」的间隔远大于它（一个工具至少跑几秒），
+ * 不会因此刷屏；而答完提问到下一个事件的间隔通常 < 5 秒，能立刻发出去。
+ * 长静默仍由 `HEARTBEAT_INTERVAL_MS` 的周期心跳（`force: true`，不吃节流）兜底。
+ */
+const LIVENESS_MIN_MS = 5000;
 
 /**
  * 见过「回合级活动」的会话（建档门槛）：只有 `turn/start` / `tool/call` /
@@ -649,6 +674,76 @@ const seenActivity = new Map();
 
 function asText(value) {
   return typeof value === "string" && value !== "" ? value : "";
+}
+
+// ---------------------------------------------------------------------------
+// 可选诊断日志（默认关闭，零成本）
+// ---------------------------------------------------------------------------
+//
+// 为什么要有它：DSH 处于 Developer Preview，插件的上报路径出问题时**外部看不见**
+// ——「等待输入不回落」这类事故只能在宿主进程里取证（哪个事件到了、哪一步 return 了、
+// 心跳排没排上、POST 发没发出去）。2026-10-10 的事故就是靠推理定位的，代价很大。
+//
+// 打开方式（二选一，都在 DSH 进程启动时生效）：
+//   - 环境变量 `BARK_DSH_TRACE=1`
+//   - 标记文件 `<插件同目录>/trace.on` 存在
+// 日志写到 `<插件同目录>/trace.log`，JSONL 一行一条，超过 TRACE_MAX_BYTES 自动截断。
+//
+// 注意：**默认必须零副作用**——没打开时连 fs 都不加载；任何读取/写入失败都只是
+// 永久闭嘴，绝不影响观察与上报。
+let traceOn = false;
+let traceFile = "";
+let traceFs = null;
+let tracePath = null;
+let traceBroken = false;
+/** 同步读文件的唯一实现：插件是 ESM，没有 require；优先用 Node 的 getBuiltinModule。 */
+function fsSync() {
+  if (traceFs) return traceFs;
+  try {
+    if (typeof process !== "undefined" && typeof process.getBuiltinModule === "function") {
+      traceFs = process.getBuiltinModule("node:fs");
+    }
+    const url = import.meta && import.meta.url;
+    if (typeof url === "string" && url.startsWith("file:")) {
+      tracePath = decodeURIComponent(url.slice("file:".length).replace(/^\/+/, "").replace(/\/[^/]*$/, ""));
+    }
+  } catch {
+    traceFs = null;
+  }
+  return traceFs;
+}
+function traceInit() {
+  try {
+    const viaEnv = typeof process !== "undefined" && process.env && process.env.BARK_DSH_TRACE === "1";
+    const fs = fsSync();
+    if (!fs || !tracePath) {
+      traceOn = viaEnv; // 拿不到文件系统：环境变量开了也没处写，保持关闭
+      return;
+    }
+    if (viaEnv || fs.existsSync(tracePath + "/trace.on")) {
+      traceFile = tracePath + "/trace.log";
+      traceOn = true;
+      fs.appendFileSync(traceFile, "");
+    }
+  } catch {
+    traceBroken = true;
+  }
+}
+const TRACE_MAX_BYTES = 2 * 1024 * 1024;
+function trace(step, data) {
+  if (!traceOn || traceBroken || !traceFs) return;
+  try {
+    let meta = "";
+    try {
+      meta = data === undefined ? "" : " " + JSON.stringify(data);
+    } catch {
+      meta = " <unserializable>";
+    }
+    if (traceFs.statSync(traceFile).size > TRACE_MAX_BYTES) traceFs.writeFileSync(traceFile, "");
+    traceFs.appendFileSync(traceFile, new Date().toISOString() + " " + step + meta + "\n");
+  } catch {
+    traceBroken = true; // 写失败就彻底闭嘴，绝不因为诊断影响观察
+  }
 }
 
 function sessionIdOf(agent, session) {
@@ -844,13 +939,33 @@ function logScan(session, limit) {
  */
 function busyOf(session, keys) {
   const open = turnOpenOf(session);
-  if (open !== undefined) return open;
+  if (open !== undefined) return keepAliveIfOpen(session, keys, open);
   // 投影拿不到（老版本 / 服务没挂）就**读日志**：比本进程的事件记账硬——事件可能没送到
   const scan = logScan(session);
-  if (scan.open !== undefined) return scan.open;
+  if (scan.open !== undefined) return keepAliveIfOpen(session, keys, scan.open);
   const tracked = trackTurnOf(keys);
-  if (tracked !== undefined) return tracked;
+  if (tracked !== undefined) return keepAliveIfOpen(session, keys, tracked);
   return keys.some((k) => running.has(k)) || hasActivity(keys);
+}
+
+/**
+ * 「忙」判定为真时顺手**补排**周期保活心跳（自愈），返回原判定值。
+ *
+ * 为什么必须自愈：心跳不是只在 `turn/start` 那一刻需要。DSH 会在**同一个回合还在跑**
+ * 的时候让 agent 走一次「拆掉再重挂」——`agent/disposed`（官方语义：这个 agent 的
+ * 生命周期被释放，例如 owner fiber 被卸载后重新附着同一会话）到达时我们会
+ * `stopHeartbeat`，而 `turn/start` **不会再发**（回合没变）。旧实现没有任何重排路径，
+ * 于是保活链**永久死亡**，直到下一个回合：用户答完 `ask_user_question` 之后
+ * daemon 的「等待输入」再也没人打回「思考中」，只能等回合终态来摘档
+ * （用户实测症状：一直橙到整段思考结束才变「已完成」——2026-10-10）。
+ *
+ * 这里只补**回合确实开着**（日志/投影/记账任一给出 true）的会话，且 `startHeartbeat`
+ * 自带「已排过就返回」，所以对每个事件调用它是幂等的；回合关着时绝不重排
+ * ——否则会给已收尾的会话留一条永久心跳（daemon 侧就是幽灵「思考中」）。
+ */
+function keepAliveIfOpen(session, keys, open) {
+  if (open === true) startHeartbeat(keys, session);
+  return open;
 }
 
 /** 静默期保活心跳的节奏：回合开着就定期补，别让长工具 / 长子代理被 daemon 判死。 */
@@ -864,6 +979,8 @@ const REST_GRACE_MS = 1500;
 
 /** 会话键 → 周期心跳定时器 / 待收尾定时器（见 startHeartbeat / scheduleRest）。 */
 const heartbeats = new Map();
+/** 家族键（agent.id / session.id）→ 该会话的心跳「正在跑」标记（见 armHeartbeat）。 */
+const heartbeatPending = new Set();
 const restTimers = new Map();
 /** 会话键 → 最近一次 `agent/error` 的正文（请求级错误会被 DSH 重试，不作为终态）。 */
 const lastError = new Map();
@@ -886,36 +1003,66 @@ const lastError = new Map();
 function startHeartbeat(keys, session) {
   if (!session || !keys.length) return;
   const anchor = keys[0];
-  if (heartbeats.has(anchor)) return;
+  // 双键（§2.12）防漏排：agent.id 与 session.id 都要查——任一键上还挂着（或在跑）
+  // 这个会话的心跳就不再排第二条，否则同一个会话会有两条心跳链并行发保活。
+  if (keys.some((k) => heartbeats.has(k) || heartbeatPending.has(k))) return;
+  trace("heartbeat.start", { key: anchor, keys });
   // cwd / 子代理 / 血缘在启动时取一次：心跳期间这些字段不会变
   const cwd = cwdOf(undefined, session);
   const isSub = isSubagentOf(undefined, session);
   const parent = parentStringOf(undefined, session);
+  /**
+   * 「这一跳已经在跑」的标记（双键）：tick 一开始就把家族键全部标上。
+   *
+   * 为什么不靠定时器表当这个标记：定时器表是按**会话键**存的（`stopHeartbeat` 按家族清），
+   * 而排下一条时只写 anchor 一个键；标记放定时器表里会让「正在跑」与「没排」在非 anchor
+   * 键上无法区分（`keys[0]` 换成另一个键就会被误判成没排 → 并行两条心跳链）。
+   */
+  for (const k of keys) heartbeatPending.add(k);
   const tick = () => {
-    heartbeats.delete(anchor);
+    for (const k of keys) {
+      heartbeats.delete(k);
+      heartbeatPending.delete(k);
+    }
     // 每一跳都是一次**对账**：状态取自会话日志（事件可能没送到），投影只作兜底。
     const scan = logScan(session);
     const open = scan.open === undefined ? turnOpenOf(session) === true : scan.open;
+    trace("heartbeat.tick", { key: anchor, logOpen: scan.open, projOpen: turnOpenOf(session), open });
     if (open === true) {
       postLiveness({ sessionId: anchor, cwd, isSubagent: isSub, parentSessionId: parent, keepalive: true, force: true });
-      heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+      armHeartbeat(keys, anchor, tick);
       return;
     }
     // 回合已经关了：顺手收尾（按回合号去重）。没报成功且会话还在跑 → 下一跳再对一次。
+    trace("heartbeat.stop", { key: anchor, hasEnd: scan.end !== undefined });
     if (scan.end !== undefined) reportAtRest(undefined, session, keys);
     if (scan.end !== undefined && !isSettledOf(keys, scan.end.turn) && keys.some((k) => running.has(k))) {
-      heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+      armHeartbeat(keys, anchor, tick);
     }
   };
-  heartbeats.set(anchor, setTimeout(tick, HEARTBEAT_INTERVAL_MS));
+  armHeartbeat(keys, anchor, tick);
+}
+
+/**
+ * 排下一条心跳（`HEARTBEAT_INTERVAL_MS` 之后），并把家族键都标上「在跑」。
+ *
+ * 家族键（双键 family）都要登记：只写 anchor 的话，另一个键上查不到定时器，
+ * `startHeartbeat` 会在同一次运行里排出第二条心跳链（同一个会话两倍保活流量）。
+ */
+function armHeartbeat(keys, anchor, tick) {
+  const timer = setTimeout(tick, HEARTBEAT_INTERVAL_MS);
+  heartbeats.set(anchor, timer);
+  for (const k of keys) heartbeatPending.add(k);
 }
 
 function stopHeartbeat(keys) {
   for (const k of keys) {
     const t = heartbeats.get(k);
+    heartbeatPending.delete(k);
     if (t !== undefined) {
       clearTimeout(t);
       heartbeats.delete(k);
+      trace("heartbeat.cancel", { key: k });
     }
   }
 }
@@ -961,6 +1108,7 @@ function reportAtRest(agent, session, keys) {
   // 回合状态、回合号与收尾原因**一律从会话日志读**（官方契约：日志是唯一真源）。
   // 只信事件的话，`turn/end` 一旦没送到插件，这里就永远不会收尾（2026-09-30 实测）。
   const scan = logScan(session);
+  trace("rest", { key: keys[0], logOpen: scan.open, end: scan.end });
   if (scan.end === undefined) return; // 日志里没有 turn/end：无从报起（空会话 / 空转唤醒）
   if (scan.open === true) return; // 回合还开着（等子代理 / 等审批）：等它关
   const sessionId = sessionIdOf(agent, session);
@@ -1196,7 +1344,21 @@ async function deliver(body) {
   }
   try {
     const res = await fetch(ENDPOINT, options);
-    return !!res && res.status >= 200 && res.status < 300;
+    const ok = !!res && res.status >= 200 && res.status < 300;
+    // 诊断：把**实际发出去的事件体**记下来（含 session_id / type / keepalive / HTTP 状态）。
+    // 这正是「同一会话被 daemon 记成两条行」这类事故的唯一取证点：两条行的 key
+    // 到底哪里不一样，只有这里看得到。
+    trace("post", {
+      type: body.type,
+      session_id: body.session_id,
+      keepalive: body.keepalive === true,
+      tool: body.tool_name,
+      sub: body.is_subagent === true,
+      parent: body.parent_session_id,
+      status: res ? res.status : 0,
+      ok,
+    });
+    return ok;
   } catch {
     // daemon 未运行时静默失败，绝不阻塞 DSH
     return false;
@@ -1260,6 +1422,7 @@ async function settle(type, agent, session, fields) {
   // 本回合的标记：优先调用方给的 turn 号（turn-stopping / turn/end 都带），
   // 其次用本会话最近一次 turn/end 记下的回合号，最后才退化成一个周期标记
   const turn = typeof f.turn === "number" ? f.turn : lastTurnNoFor(keys);
+  trace("settle", { type, key: sessionId, turn, skip: !keys.length || isSettledOf(keys, turn) });
   if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k) || heldTerminal.has(k))) return;
   // 先算完 cwd / 子代理标记再入队：取字段抛异常时（结构随版本变动）
   // 不该把本回合标记成已上报——那样随后的兜底也会被跳过，一条通知都不剩。
@@ -1372,6 +1535,7 @@ function postActivity(fields) {
     isSubagent: f.isSubagent === true,
     parentSessionId: asText(f.parentSessionId),
   }));
+  trace("post.activity", { key: asText(f.sessionId), tool: asText(f.toolName) });
 }
 
 /**
@@ -1409,6 +1573,7 @@ function postLiveness(fields) {
     parentSessionId: asText(f.parentSessionId),
     keepalive,
   }));
+  trace("post.liveness", { key: sessionId, keepalive, force: f.force === true });
 }
 
 export const name = "agent-bark";
@@ -1432,6 +1597,8 @@ export function apply(ctx) {
   // 0) 取官方回合边界服务（每次读，服务晚挂载也能用上）。读不到 = 老版本 DSH，
   //    退回日志推理 / running 兜底，功能不降级、也不抛错。
   ctxRef = ctx;
+  traceInit();
+  trace("apply", { proj: !!projectionsOf(), endpoint: ENDPOINT });
 
   // 1) 回合收尾闸门（serial 事件）：**不作为终态**。
   //    官方原文（dsh-agent/README）："`agent/turn-stopping` runs before an otherwise
@@ -1471,6 +1638,13 @@ export function apply(ctx) {
       for (const k of keys) running.add(k);
       // 新回合开始：作废上一回合还挂着的待投终态（但绝不置「本回合已上报」）
       beginTurn(keys);
+      // **补排保活心跳**（2026-10-10）：running 边沿还覆盖「附着/唤醒」——agent 被
+      // 释放后重新附着同一会话（`agent/disposed` 已经 `stopHeartbeat` 过）时也走这里。
+      // 那种情形下回合没有重开、`turn/start` 不会再来，不在这里补排就再也没人补，
+      // 保活链永久死亡（用户实测：答完提问后「等待输入」一直不回落）。busyOf 同时
+      // 覆盖「投影拿不到、按日志判」的老宿主路径。
+      const busy = busyOf(session, keys);
+      trace("status.running", { key: sessionId, busy, heartbeat: heartbeats.has(keys[0]) });
       // 这里**不**排对账定时器：收尾的对账点有三个（turn-stopping / turn/end / idle），
       // 周期心跳还会在读日志时兜一次；在回合开头多排一个必然空转（回合正开着）。
       return;
@@ -1581,6 +1755,7 @@ export function apply(ctx) {
       // idKeys 顺手记血缘（hasActiveDescendants 的父子树靠它重建）
       const keys = idKeys(undefined, session, sessionId);
       if (!keys.length) return;
+      trace("event", { type: asText(type), key: sessionId });
       // 兜底门槛（老版本 DSH 拿不到回合投影时用）：只有回合级事件才算「真的在干活」。
       // 开屏预创建的空会话也可能发零星生命周期事件，「任何事件都算」挡不住（ProNet 实测）
       if (type === "turn/start" || type === "tool/call" || type === "assistant/message") {
@@ -1619,25 +1794,38 @@ export function apply(ctx) {
       }
 
       if (type === "tool/call") {
-        if (!busyOf(session, keys)) return;
-        postActivity({
-          sessionId,
-          cwd,
-          toolName: asText(event.data && event.data.name),
-          isSubagent: isSub,
-          parentSessionId: parent,
-        });
+        const busy = busyOf(session, keys);
+        const toolName = asText(event.data && event.data.name);
+        // 提问会挂起等用户：记下来，好在它收尾时**无条件**补一条保活（见下方 answered）
+        if (toolName === "ask_user_question") {
+          for (const k of keys) questioned.add(k);
+        }
+        trace("event.toolcall", { key: sessionId, busy, heartbeat: heartbeats.has(keys[0]), tool: toolName });
+        if (!busy) return;
+        postActivity({ sessionId, cwd, toolName, isSubagent: isSub, parentSessionId: parent });
         return;
       }
       // 用户操作 / 审批审计 / 提问审计不算「agent 活跃」：前者会把静默当活跃，
       // 后两者会把刚亮起的等待色打回思考色（见 postLiveness 的说明）
       if (typeof type === "string" && /(user\/|approval\/|question|plan-review)/.test(type)) return;
+      // 「刚答完提问」的收尾：daemon 正停在「等待输入」上，这一条**必须立刻发出去**，
+      // 不能吃节流——否则相位要多等最长一个周期心跳（20s）才回落，用户看到的就是
+      // 「选完了还卡在等待输入、过一会儿直接蹦出完成」（2026-10-10 trace 实测：
+      // 答完那条 tool/result 被 15s 节流窗吃掉，相位一直到周期心跳才翻）。
+      const answered = keys.some((k) => questioned.has(k));
+      if (answered) {
+        for (const k of keys) questioned.delete(k);
+        trace("answered", { key: sessionId, type: asText(type) });
+      }
       // 其余事件（step/*、tool/result、未知新增类型）只在回合开着时续命。未知类型宁可当活跃
       // （向后兼容新词汇，社区 turn-tracker 同口径），⚠️ DSH 升级新增事件类型时这里无需跟着改
-      if (!busyOf(session, keys)) return;
-      postLiveness({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent });
-    } catch {
-      // 日志结构随版本变动，观察者绝不打断会话
+      const stillBusy = busyOf(session, keys);
+      trace("event.liveness", { type: asText(type), key: sessionId, busy: stillBusy, heartbeat: heartbeats.has(keys[0]), force: answered });
+      if (!stillBusy) return;
+      postLiveness({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent, force: answered });
+    } catch (error) {
+      // 日志结构随版本变动，观察者绝不打断会话（开诊断时记下抛点，便于定位契约漂移）
+      trace("event.error", { message: String((error && error.message) || error) });
     }
   }, { global: true });
 
@@ -1653,6 +1841,7 @@ export function apply(ctx) {
     if (!keys.length) return;
     const turn = lastTurnNoFor(keys);
     const wasActive = keys.some((k) => running.has(k)) || keys.some((k) => turnRan.get(k) === true);
+    trace("disposed", { key: sessionId, wasActive });
     stopHeartbeat(keys);
     cancelRest(keys);
     // 上一回合的待投 / 被扣终态作废：会话都没了，再投只会往 daemon 塞一条无主事件
@@ -1672,6 +1861,7 @@ export function apply(ctx) {
       lastReason.delete(k);
       lastTurnNo.delete(k);
       lastLivenessAt.delete(k);
+      questioned.delete(k);
       seenActivity.delete(k);
       turnOpen.delete(k);
       turnRan.delete(k);
@@ -2001,6 +2191,27 @@ mod tests {
                 && js.contains("function busyOf(session, keys)")
                 && js.contains("return keys.some((k) => running.has(k)) || hasActivity(keys);"),
             "心跳必须有分层建档/放行门槛: {js}"
+        );
+        // ⚠️ 2026-10-10 事故回归：保活心跳必须**自愈**。DSH 会在回合还开着时让 agent
+        //    走一次「拆掉再重挂」（`agent/disposed`，owner fiber 卸载/重新附着），
+        //    插件按设计 stopHeartbeat，而 `turn/start` 不会再来——心跳只在 turn/start 排
+        //    就永久死亡，daemon 的「等待输入」只能等回合终态才被摘掉
+        //    （用户实测：答完提问一直橙到整段思考结束；`plugin_sim.mjs` 用例 20/21 锁着）。
+        //    两处自愈 + 一处双键防漏排，缺一条都会退回事故形态。
+        assert!(
+            js.contains("function keepAliveIfOpen(session, keys, open)")
+                && js.contains("if (open === true) startHeartbeat(keys, session);")
+                && js.contains("return keepAliveIfOpen(session, keys, open);")
+                && js.contains("const busy = busyOf(session, keys);"),
+            "忙判定为真时必须补排保活心跳（agent 释放后重新附着不能永久失心跳）: {js}"
+        );
+        // 双键家族（agent.id / session.id 不相等时）判在位：任一键上有心跳就不再排第二条，
+        // 否则同一会话会有两条心跳链并行、且 stopHeartbeat 清不干净（用例 21 锁着）。
+        assert!(
+            js.contains("const heartbeatPending = new Set()")
+                && js.contains("keys.some((k) => heartbeats.has(k) || heartbeatPending.has(k))")
+                && js.contains("function armHeartbeat(keys, anchor, tick)"),
+            "心跳必须按家族键防漏排/可整体停掉: {js}"
         );
         // ⚠️ 2026-10-09 事故回归：读官方投影**必须经 `ctx.get("sessionProjections")`**。
         //    属性访问 `ctx.sessionProjections` 在真实 Cordis 4.x 上对未声明 inject 的插件

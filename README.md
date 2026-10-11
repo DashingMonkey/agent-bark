@@ -26,6 +26,7 @@
 | Antigravity | [Hook](doc/agent-integration.md#18-antigravity) |
 | Kimi Code | [Hook](doc/agent-integration.md#19-kimi-code) |
 | Kimi Work | [Watch](doc/agent-integration.md#20-kimi-work监控型--非官方) |
+| 豆包工作（DoubaoWork） | [Watch](doc/agent-integration.md#21-豆包工作监控型--非官方) |
 
 > **每种 agent 的配置路径、注册事件、需要你在应用侧做的动作（信任/重启）以及排障步骤，见 [doc/agent-integration.md](doc/agent-integration.md)。**
 

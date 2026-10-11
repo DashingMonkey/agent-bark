@@ -20,6 +20,7 @@
 | gemini-color.svg | gemini-color | Gemini CLI |
 | qwen-color.svg | qwen-color | Qwen Code |
 | kimi.svg | kimi（单色，currentColor；color 变体的主形是白色，浅色背景下看不清） | Kimi Code、Kimi Work |
+| doubao-color.svg | doubao-color | 豆包工作 |
 | cursor.svg | cursor（单色，currentColor；该图标无 color 变体） | Cursor |
 | copilot-color.svg | copilot-color | Copilot CLI |
 | windsurf.svg | windsurf（单色，currentColor；该图标无 color 变体） | Windsurf |
