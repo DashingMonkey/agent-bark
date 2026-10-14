@@ -23,7 +23,6 @@
 | doubao-color.svg | doubao-color | 豆包工作 |
 | cursor.svg | cursor（单色，currentColor；该图标无 color 变体） | Cursor |
 | copilot-color.svg | copilot-color | Copilot CLI |
-| windsurf.svg | windsurf（单色，currentColor；该图标无 color 变体） | Windsurf |
 | grok.svg | grok（单色，currentColor；该图标无 color 变体） | Grok CLI |
 | antigravity-color.svg | antigravity-color | Antigravity |
 | generic.svg | 自绘（描边风格，currentColor） | 无品牌图标的 agent 兜底 |

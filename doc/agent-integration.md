@@ -12,7 +12,7 @@
 
 | 类型 | 做法 | 使用者 |
 | --- | --- | --- |
-| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Windsurf、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
+| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
 | **插件型** | 生成插件文件并登记到宿主的插件配置里，插件内部直接 POST `/event` | OpenCode、DeepSeek Harness |
 | **监控型** | 轮询 agent 本地会话库（SQLite / JSONL，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork、Kimi Work、豆包工作 |
 
@@ -28,11 +28,13 @@
 | `input_required` | 等人输入 | 是 |
 | `run_completed` | 回合完成 | 是 |
 | `run_failed` | 回合出错 | 是 |
-| `run_aborted` | **用户主动中止**（自己按的停止/中断） | 否（流光在没有别的会话在跑时直接收起，见 configuration.md 的状态推导表） |
+| `run_aborted` | **已终止**（用户停止/中断或外部取消） | 否（流光在没有别的会话在跑时直接收起，见 configuration.md 的状态推导表） |
+
+所有接入共用 `NormalizedEvent / EventKind → state.rs 会话状态机 → 事件流、悬浮窗、流光和通知`。适配器负责把宿主信号翻译为统一事件，并补齐结束原因；状态机负责跃迁、移除运行态和抑制重复终态。正常完成、明确取消、执行失败分别为 `run_completed`、`run_aborted`、`run_failed`，不应仅凭宿主字段名 `completed` 就认定成功。前端事件流和悬浮窗共用事件标签，取消统一展示「已终止」。
 
 > **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败仍由回合结束信号 + 心跳判死兜底。
 
-> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 是运行中被归档、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
+> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 要从回合记录区分取消与完成、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
 
 **各 agent 的「手动中止」信号现状**（2026-09 核对，详情见各节）：
 
@@ -43,15 +45,18 @@
 | Claude Code | `SessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
 | CodeBuddy | `SessionEnd`（官方文档；本机可实测） | 同 Claude Code |
 | OpenCode | `session.error` 带 `MessageAbortedError`（社区插件实证，未实测） | 立即释放（run_aborted，其后的 idle 被压制） |
-| WorkBuddy | 运行中被归档 → run_aborted（实测） | 立即释放 |
+| WorkBuddy | 回合 JSONL 的 assistant/incomplete + skipRun + `Interrupted by user`；运行中被归档也视为终止 | 下一轮轮询释放（约 5 秒） |
 | TraeWork | `chat_turn.turn_status=canceled`（实测） | 立即释放（run_aborted） |
-| TraeCode / Codex | **无**（官方事件表就没有） | 卡原状态到 10 分钟判死；继续对话则刷新 |
+| TraeCode | **无官方事件**；补读本地 renderer.log 的 canceled 终态 | 秒级清除运行态；日志不可用时退回 10 分钟判死 |
+| Codex | `Interrupt` / `SessionEnd`（当前 hooks 映射） | 收到信号后释放（需要已信任对应 hooks） |
 | Grok CLI | `StopCancelled`（官方事件，未实测） | **立即释放**——显式的用户取消信号，比 Claude 系干净 |
 | Kimi Code | `Interrupt`（官方事件，未实测） | **立即释放**（显式中断信号） |
 | Kimi Work | `turn.cancel`（本机 wire.jsonl 实测） | **立即释放**（run_aborted） |
-| 豆包工作 | **无**（trajectory 里不留中止记录） | 卡原状态到 10 分钟判死；继续对话则刷新 |
-| Gemini CLI / Qwen Code / Factory Droid / Cursor / Copilot CLI | `SessionEnd`/`sessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
-| Windsurf / Antigravity | **无**（官方就没有会话级/中断事件） | 卡原状态到 10 分钟判死；继续对话则刷新 |
+| 豆包工作 | `saman_*.log` 的 `sdk.message.break.request` 确认用户停止 | 按会话 ID + 运行消息 ID 关联后显示已终止；缺少日志/运行消息 ID 时仍按数据库结束信号兜底 |
+| Cursor | `stop.status=aborted`；`sessionEnd.reason` 按完成/取消/失败分类 | 收到信号后释放；已做载荷测试，未现场实测 |
+| Copilot CLI | `sessionEnd.reason=abort/user_exit` 释放；complete 为完成，error/timeout 为失败 | 会话级信号；未现场验证每次取消是否触发 |
+| Gemini CLI / Qwen Code / Factory Droid | `SessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
+| Antigravity | **无**（官方就没有会话级/中断事件） | 卡原状态到 10 分钟判死；继续对话则刷新 |
 
 **三条硬约束**（见 `crates/bark-cli/src/lib.rs` 模块注释，改 hook 逻辑必须守住）：
 1. 永远退出码 0——绝不能阻塞 agent；
@@ -97,19 +102,22 @@
 
 ---
 
-## 2. TraeCode
+## 2. TRAE（原 TraeCode）
 
 | 项 | 值 |
 | --- | --- |
 | id | `trae-code` |
 | 配置文件 | `~/.trae-cn/hooks.json`（国内版）与 `~/.trae/hooks.json`（国际版），**存在哪个写哪个，都存在则都写** |
 | 安装标记 | 上述任一目录存在 |
-| 注册事件 | `SessionStart`、`UserPromptSubmit`→activity、`PreToolUse`→activity、`Stop`→run_completed、`Notification`→input_required |
-| 需要你做 | 首次要在 IDE 的 **设置 > Hooks** 里点「启用」（安全警示面板），否则不生效 |
+| 注册事件 | `SessionStart`、`UserPromptSubmit`→activity、`PreToolUse`→activity、`PostToolUse`→tool_finished、`Stop`→run_completed；`Notification` 按通知类型识别权限/输入等待，忽略 `idle_prompt` 完成回声 |
+| 需要你做 | 在 IDE 的 **设置 > Hooks** 启用全局配置，并将「运行方式」从默认的「沙箱运行」改为「本地自动运行」，否则不生效 |
 
 **坑**：
-- TraeCode **没有失败事件**，所以收不到 `run_failed`；
-- **手动中止无信号**（官方文档 docs.trae.cn/ide_hook-configuration-reference，2026-09 核对）：官方事件表就 6 个，没有 SessionEnd、没有中断事件；中断的回合只能等继续对话（UserPromptSubmit 会刷新会话）或 10 分钟判死。这是官方事件表的能力边界，后续版本加了 SessionEnd 再补；
+- [官方配置文档](https://docs.trae.cn/ide_hook-configuration-reference)（2026-10-14 核对）明确 Windows 默认用 PowerShell。命令必须写成 `& 'D:/path/AgentBark.exe' hook ...`；只有双引号路径会报 `UnexpectedToken: hook`，本机 Agent Hooks 日志已复现。Codex 的 Windows PowerShell 命令也采用此调用格式；使用 Bash/cmd 的适配器保留原命令格式。
+- TRAE 的 `Notification` 包括 `permission_prompt`（权限确认）、`ask_user_question` / `document_review` / `browser_interaction`（输入等待），以及 `idle_prompt`（任务完成）。完成由 `Stop` 上报，不能将 `idle_prompt` 重新解释为等待。
+- 首次或更新配置后，检查 **设置 > Hooks** 的全局配置已启用，且运行方式为 **本地自动运行**；同页可打开 **Agent Hooks** 执行日志。说明在启用接入后的 message 和卡片提示中显示，接入页不再显示顶部「接入更新提醒」。
+- TRAE **没有失败事件**，所以收不到 `run_failed`；
+- **手动中止不发 Hook**：2026-10-14 本机日志确认只有 SessionStart / UserPromptSubmit，但 `renderer.log` 的 `[DoneHandler] Stream done event received` 带 `status: "canceled"` 和准确的 sessionId。GUI 每秒增量读取国内版/国际版最新启动目录下各窗口日志，合成 RunAborted（静默移除运行态，不报任务失败）。日志时间早于会话最新活动时忽略，管道消费时再次校验，防止旧中止清掉新回合。此补充机制依赖非官方日志格式，日志缺失或版本变化时仍由 10 分钟判死兜底；
 - `PreToolUse` 是阻塞型 hook，我们的子命令恒为放行（exit 0、不输出 stdout），不影响工具执行；
 - 心跳（activity）是「思考中 / 执行工具」实时状态的来源，缺了它流光只会亮等待 / 完成 / 失败色，不会亮思考色。
 
@@ -173,10 +181,16 @@
 | id | `codex` |
 | 配置文件 | `~/.codex/hooks.json` |
 | 安装标记 | `~/.codex` 目录存在 |
-| 注册事件 | `SessionStart`、`Stop`→run_completed、`PermissionRequest`→permission_required |
-| 需要你做 | 注册后需在会话内运行 `/hooks` 完成**信任确认** |
+| 注册事件 | `SessionStart`；`UserPromptSubmit` / `PreToolUse`→activity；`PostToolUse`→tool_finished；`PermissionRequest`→permission_required；`Stop`→run_completed；`Interrupt` / `SessionEnd`→run_aborted |
+| 需要你做 | 首次接入或新增/修改钩子后，在 Codex CLI 的 `/hooks` 中审阅并信任对应定义 |
 
-**手动中止无信号**（2026-09 核对官方与社区资料）：Codex hooks 仍是 beta，事件表只有 `SessionStart` / `Stop` / `agent-turn-complete`，没有 SessionEnd、没有结束原因载荷、没有中断事件；社区还报过 hooks 在交互式会话不触发的问题（openai/codex#17532）。中断的回合同样只能等下一条事件或 10 分钟判死，官方补事件后再接。
+[官方 Hooks 文档](https://learn.chatgpt.com/docs/hooks)（2026-10-14 核对；本机 CLI `0.162.0-alpha.17.2`）已包含回合、工具与中断事件。此前仅注册 SessionStart / Stop / PermissionRequest，缺少 activity 来源：SessionStart 只表示会话建立，本程序不会据此显示思考中。现在使用实际回合与工具事件推进状态。
+
+`agent-turn-complete` 属于旧 `notify` 机制，不注册进 `hooks.json`。`Interrupt` 用于主会话的活动回合中断，`SessionEnd` 用于主会话结束；两者按中止收场，不冒充成功。未提供独立失败事件的路径不推测为失败。
+
+Windows PowerShell 下命令使用 `& 'D:/path/AgentBark.exe' hook ...`。2026-10-14 本机复现旧双引号路径写法报 `Unexpected token 'hook'`；启动对齐会修正旧命令，保留用户其他 hooks。
+
+Codex 的信任按钩子定义 hash 记录；新增或修改后会跳过执行，直到用户重新信任。启动对齐改动配置时显示信息提示，不自动修改信任记录。已有未变化钩子的定义保留。默认启用 hooks；若用户或管理配置显式关闭，需在相应配置层处理。
 
 ---
 
@@ -254,7 +268,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 | 生成的插件 | `<配置目录>/agent-bark/opencode-plugin.js`（Windows 为 `%APPDATA%\agent-bark\opencode-plugin.js`） |
 | 登记位置 | `~/.config/opencode/opencode.json` 的 `plugin` 数组（绝对路径） |
 | 安装标记 | `~/.config/opencode/opencode.json` 存在 |
-| 事件映射 | 终态：`session.idle`→run_completed、`session.error`→run_failed（**载荷含 `MessageAbortedError`（Esc 取消）时→run_aborted**，且其后 10s 内的 `session.idle` 被压制）；打断：`permission.updated`→permission_required；会话：`session.created`→session_start；心跳：`session.status`（busy→activity、retry→tool_failed）、`message.part.updated` 的 tool 部件（pending/running→activity 带 tool_name、error→tool_failed） |
+| 事件映射 | 终态：`session.idle`→run_completed、`session.error`→run_failed（**载荷含 `MessageAbortedError`（Esc 取消）时→run_aborted**，后续 `session.idle` 压制到新 busy 回合开始）；打断：`permission.updated`→permission_required；会话：`session.created`→session_start；心跳：`session.status`（busy→activity、retry→tool_failed）、`message.part.updated` 的 tool 部件（pending/running→activity 带 tool_name、error→tool_failed） |
 
 **心跳与元数据（事件名以官方 SDK `types.gen.ts` 为准）**：
 - 旧版映射里的 `permission.asked` / `question.asked` **在 opencode 里不存在**（权限打断实际是 `permission.updated`，question 事件根本没有），导致权限打断也收不到；已修正。
@@ -288,7 +302,8 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 | `session/event` 的 `turn/start` | emit | `activity`（**唯一建档点**） | 不带 `keepalive`，daemon 允许据此新建「运行中」条目；同时启动回合内的周期保活 |
 | `session/event` 的 `tool/call` | emit | `activity` | 带 `tool_name`，面板显示「执行工具」；**含子代理**（带 `is_subagent` + `parent_session_id` 血缘）；只在回合开着时发 |
 | `session/event` 的 `turn/end` | emit | （记原因，不直接发终态） | 记下 `reason.kind` 与回合号、停掉保活；agent 已知静止时排一次收尾 |
-| `session/event` 其余事件 | emit | `tool_finished` + `keepalive: true`（节流保活） | `user/*`、`approval/*`、提问审计除外；**只在回合开着时**发（回合外的 title / end-seed / compaction / command / model-selection… 一律不上报——它们正是「没有会话在跑却挂着思考中」的来源） |
+| `session/event` 的 `tool/result` | emit | `tool_finished`（不带 `keepalive`，即 false） | 真实工具收尾立即上报，`force: true` 绕过节流；允许解除等待输入/确认，不等待周期心跳 |
+| `session/event` 其余事件 | emit | `tool_finished` + `keepalive: true`（5s 节流保活） | `user/*`、`approval/*`、提问审计除外；**只在回合开着时**发（回合外的 title / end-seed / compaction / command / model-selection… 一律不上报——它们正是「没有会话在跑却挂着思考中」的来源） |
 | `agent/status` running | emit | 只登记（**不建档**） | 唤醒但没回合（消息被清空 / 回执唤醒）、开屏预创建的空会话都会走 running，建档交给 `turn/start` |
 | `agent/status` running→idle | emit | 终态（**静止边沿**） | 经 `reportAtRest` 报一次：按 `turn/end` 的 reason 分类（`completed` → 完成；`aborted`/`interrupted` → **`run_aborted`**（用户主动中止：不亮失败色、不亮完成色、不通知）；`error` → `run_failed`；`blocked` → `run_failed`「回合被拦截」；`max-tokens` → 完成但正文带「〔达到输出上限〕」前缀；未知类型按完成兜底），按**回合号**去重 |
 | `agent/turn-stopping` | serial（无 `next()`） | 只记回合号提示 | **不再当终态**：官方原文 *"runs before an otherwise completed turn closes and can steer to keep it open"*，按它报完成会在运行还没结束时谎报并吞掉真终态（社区事故 agent-presence#83） |
@@ -312,7 +327,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 ⚠️ **为什么不能用「事件静默时长」推断**：父会话等子代理、等审批、等用户回答时**回合开着却
 可能十几分钟零事件**（官方口径：*a turn waiting for an approval or an answer included*）。
-长静默靠**周期保活心跳**（20s，带 `keepalive: true`）兜底，而不是靠判「它不动了」。
+长静默靠**周期保活心跳**（20s，带 `keepalive: true`）兜底，而不是靠判「它不动了」。纯保活只更新时间和血缘信息，**不改相位、不建档**；等待由真实 `tool/result` / `tool/call`（或新回合 `turn/start`）恢复，回合终态则移除会话。`step/*`、计时器和未知事件不能证明用户已经回答或授权。
 
 ⚠️ **为什么不能靠 `agent/status` 当状态源**：它是**边沿通知**（官方目录：*`idle` means no
 driver remains scheduled or active*，实现里只在状态跳变时 emit），官方规范明确写
@@ -392,40 +407,24 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
      `ToolFinished` 对该标志**只续命、绝不建档**（`state.rs` 的同名分支 + 单测
      `keepalive_heartbeat_never_creates_a_session`）。hook 型 agent 不发这个标志（Claude 系
      只订阅 PostToolUse，靠它建档），行为不变；
-- **「等待输入/等待确认」答完却不解除**（2026-10-09 修，用户实测：DSH 弹出 `ask_user_question`，选完（并在输入框里补了句话）之后事件流一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变成「完成」）。两个事实叠在一起才成灾：
-  1. **回答落在同一个回合里**——真实会话日志（本机 `session.v4.jsonl.zstd` 实测）是 `ask_user_question` → `tool/result` → 继续 `step/*`，**没有** `turn/end`、`turn` 号不变。于是没有任何「新回合」信号：插件不会发建档 `activity`（`postLiveness` 里 `user/*` 的跳过是**有意设计**：用户打字 ≠ agent 活跃），daemon 那条 `WaitingInput` 只能靠**周期保活心跳**回落「思考中」（`state.rs` 的 `ToolFinished` 分支）；
-  2. **那条心跳从来没跑起来**——`startHeartbeat` 的闸门写成 `if (!ctxRef || !ctxRef.sessionProjections || …) return;`，而属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上被 Cordis 4.x 直接拒绝（抛 `cannot get property "sessionProjections" without inject`，实测 0.2.0-rc.2；官方读法是 `ctx.get("sessionProjections")`，DSH 自己的 `dsh-user-questions` 就这么读）。这个**恒抛**还连带两处伤害：异常掀翻 `turn/start` 分支（心跳定时器根本没排上），并落进 `session/event` 处理器的 `catch {}` 把**整条事件处理**吞掉（该事件不再产生任何上报与记忆）。
-  修法两条：读服务一律走 `projectionsOf()`（`ctx.get` 优先、属性访问只作旧宿主兜底、读不到返回 `null` 而不抛），**且心跳闸门只认「回合是否开着」**——判定本来就是「日志优先、投影兜底」（`logScan`），不允许拿服务可用性当门槛。回归：`plugin_sim.mjs` case 18（同一回合内答完提问后，心跳必须把等待相位解除）与 case 19（服务读不到时监听器照常工作）；桩 `ctx` 也改成与真实 Cordis 同形（属性访问抛、只认 `ctx.get`），否则这类「本机装得上、到真宿主恒抛」的写法测不出来；
+- **等待解除与保活分离**（2026-10-12）：同一回合内回答提问后可能只有 `tool/result`，没有新 `turn/start`。真实 `tool/result` 立即上报 `tool_finished`（不带 `keepalive`，按 false 处理），使 daemon 恢复思考；周期心跳和普通事件保活一律 `keepalive: true`，保留等待相位，避免用户尚未操作时等待色被计时器清掉。回归：`plugin_sim.mjs` case 18/20b/22，以及 daemon 的 `keepalive_preserves_waiting_until_real_tool_result`。
+- **官方投影必须经 `ctx.get("sessionProjections")` 读取**：未声明 `inject` 时直接访问 `ctx.sessionProjections` 会被 Cordis 拒绝，异常还会中断会话事件处理。服务缺失返回 `null` 并走日志兜底；心跳闸门只认回合是否开着，不以服务可用性为前提。回归：case 18/19（属性访问抛异常、服务缺失两种情形）。
 - `agent/turn-stopping` 是 serial 事件且 DSH 会 `await` 监听器返回的 Promise（现在它只记回合号，
   不再等终态投递），但 POST 仍必须带超时（插件用 `AbortSignal.timeout(2000)`）：端口被
   「只接受连接不响应」的进程占用时，否则会把 DSH 的事件分发拖住；
 - **终态投递必须看响应状态码且要重投**（2026-09-23 修，用户实测「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」）：daemon 的 `/event` 在事件通道打满时用 `try_send` 回 **503**（见 `bark-server::handle_event`）——请求「成功」但事件已丢。旧插件对响应不闻不问、并且在投递**之前**就把会话标成「本回合已报过终态」，于是一次瞬时失败就让这条终态永久消失，随后的 `status idle` 兜底也被那句「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死巡检收场（几十次里中一次，与工具调用量成正比）。现在的做法：`deliver()` 只认 2xx；终态首投失败进重投队列（1s→2s→4s→8s→16s，共 5 次，**重投复用同一个事件 id**——首投「daemon 已收下但响应丢了」时靠 daemon 的 id 去重兜住，绝不产生第二条通知）；`markSettled` 只在**确认送达**的路径上调用，并按**回合号**记账；新回合开始时取消上一回合还挂着的重投（迟到的终态会把刚开始的新回合从状态表里误删），但**不**顺手置「已终态」——那会把静止兜底这条补救路径重新堵死。心跳（`activity`）不进这个队列：丢了下一跳会补，只补一次；
-- **`agent/disposed` 之后保活心跳必须能自愈**（2026-10-10 修，用户实测第二轮：答完 `ask_user_question` 后卡片/悬浮窗一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变「完成」）。事故形态与 10-09 那次**一模一样**（同一回合内回答 → 没有新 `turn/start` → 只能靠周期保活把 daemon 的等待相位打回思考中），但成因不同：
-  1. DSH 会在**回合还在跑**的时候让 agent 走一次「拆掉再重挂」——`agent/disposed`（官方语义：*agent 生命周期被释放*，`dsh-agent` 的 `detachEntered` 在 owner fiber 卸载/重新附着时发出）到达插件；插件按设计 `stopHeartbeat`（会话关掉就不该再有心跳）；
-  2. 但**同一个回合没有结束**，`turn/start` 不会再来，而心跳**只在 `turn/start` 里排过**——于是保活链永久死亡，谁也不会再补。daemon 的「等待输入」只能等回合终态来摘档。
-  修法：心跳改成**自愈**——`busyOf()` 判定「回合确实开着」时顺手补排（`keepAliveIfOpen`，`startHeartbeat` 自带「已排过就返回」所以幂等），`agent/status: running` 边沿也走一次 `busyOf`（重新附着正是这条边沿）。反面同样锁住：回合关着时**绝不**补排，否则会留下一条永远没有终态的「思考中」（daemon 侧 10 分钟后判死 → 红光 + 失败音）。同批还修掉一处**漏排漏洞**：心跳的在位判定与排下一跳**一律按家族键**（`heartbeatPending` + `armHeartbeat`）——旧写法排表用 `keys[0]`、清理用全家族键，两个 id 一旦不相等，另一条观察路径会以为「没排心跳」再排一条，同一会话两条心跳链并行、且 `stopHeartbeat` 清不干净（会话收尾后残留在心跳）。回归：`plugin_sim.mjs` case 20（释放 → 同回合重新附着 → 心跳必须自愈；回合关掉后不得再发保活）与 case 21（双键分裂时只排一条、且能被整体停掉）；
+- **`agent/disposed` 之后保活心跳必须能自愈**：DSH 可能在回合未结束时释放并重新附着 agent，此时不会再发 `turn/start`。`busyOf()` 确认回合开着后通过 `keepAliveIfOpen` 补排心跳，`agent/status: running` 也走此路径；回合关着时不补排。保活在这里承担存活与日志收尾对账，不能承担等待解除。同一会话的 `agent.id` / `session.id` 家族键共享 `heartbeatPending` 和 `armHeartbeat`，防止双链和清理遗漏。回归：case 20/21。
 - **排障用可选诊断日志**（2026-10-10 新增，默认关闭、零成本）：DSH 处于 Developer Preview，上报路径出问题时**进程外看不见**（哪个事件到了、哪一步 return 了、心跳排没排上、POST 发没发出去）。打开方式二选一（都在 DSH **启动时**生效）：环境变量 `BARK_DSH_TRACE=1`，或放一个标记文件 `$DSH_HOME/agent-bark/trace.on`。日志写到 `$DSH_HOME/agent-bark/trace.log`（JSONL，超 2 MB 自动截断），关键行：
   - `apply {"proj":…}` = 插件挂上了、投影服务读得到（`proj:false` 说明属性读法/服务缺失，走了日志兜底）；
-  - `event {...}` / `event.liveness {... "busy":…, "heartbeat":…}` / `event.toolcall {...}` / `status.running {...}` = 事件到了、忙判定与心跳是否在位（**卡「等待输入」时先看这里**：`busy:true` 却 `heartbeat:false` 就是保活链断了；`status.running` 的 `busy` 是重新附着那条自愈路径的判据）；
+  - `event {...}` / `event.liveness {... "busy":…, "heartbeat":…}` / `event.toolcall {...}` / `status.running {...}` = 事件到了、忙判定与心跳是否在位（等待未解除时先核对是否收到 `tool/result` 及其 `busy`；`busy:true` 却 `heartbeat:false` 表示保活链断了，与等待解除是两条不同路径）；
   - `heartbeat.start` / `heartbeat.tick {... "logOpen":…, "projOpen":…, "open":…}` / `heartbeat.stop` / `heartbeat.cancel` = 心跳排上、对账结果、何时被停（`logOpen`/`projOpen` 谁有值就说明走的哪条判定链）；
-  - `answered {...}` = 「刚答完提问」这条收尾被识别到（它的保活不吃节流）；
   - `post {... "session_id":…, "keepalive":…, "status":…}` = **实际发出去的事件体 + HTTP 状态**（怀疑「同一会话两条行」时看这里：两条行的 key 差在哪一目了然）；
   - `post.activity` / `post.liveness` / `rest` / `settle` / `disposed` / `event.error` = 上报摘要与收尾决策，以及被 `catch` 吞掉的抛点（契约漂移就在这条里）。
   用完**删掉 `trace.on`**（或清掉环境变量）并重启 dsh 即恢复零开销；
-- **答完提问的收尾必须不吃节流**（2026-10-10 修，第三次用户实测 + 生产 trace 取证：用户「选完选项后卡片仍停在等待输入，过一会儿直接蹦出已完成」）。trace 把真相钉死了——**key 没分裂、心跳也送到了**（15 条上报的 `session_id` 完全一致、每条 POST 都是 200），卡的是**时延**：
-  ```text
-  06:29:45.707  post tool_finished/keepalive   ← 提问**之前**的一条保活，占掉了 15s 节流窗
-  06:29:51.946  post input_required            ← daemon 进入「等待输入」
-  06:29:55.902  tool/result（用户答完）        ← 被节流吃掉，**根本没发出去**
-  06:30:05.716  heartbeat.tick → keepalive     ← 相位到这一跳才回落（≈10s 滞后）
-  ```
-  用户视角就是「选完了还卡着，然后直接完成」；至于「多出来的第二行已完成」，那是悬浮窗自己的**终态驻留行**（`TERMINAL_HOLD_MS = 6000`，见 `widget.ts`）——会话行还没翻色时它先出现，看着就像两条会话（**不是** daemon 里两条 key；trace 已排除）。
-  修法两条（都只针对「用户刚做完一次人工交互」这条路径，不是全局降门槛）：
-  1. `LIVENESS_MIN_MS` 15s → **5s**：正常回合里工具收尾间隔远大于它、不会刷屏，而答完提问到下一个事件通常 < 5s，能立刻发出去；
-  2. `ask_user_question` 的工具收尾**无条件放行**（插件记 `questioned` 标记，收尾时带 `force: true`）：提问是低频人工事件，为它开一次强制放行零刷屏风险，时延从「最长一个周期心跳」压到「几十毫秒」。
-  回归：`plugin_sim.mjs` case 20b（节流窗内答完必须发；普通事件仍被压掉）；
+- **真实工具收尾不吃节流**：所有 `tool/result` 都以 `force: true` 立即发出；`LIVENESS_MIN_MS = 5000` 只限制 `assistant/message`、`step/*` 等纯保活。每次工具收尾增加一次本地 POST，daemon 的 `ToolFinished` 不入历史、不入事件流、不响音效、不触发通知。无需 `questioned` 记账，也不能从「曾经提问 + 后来有任意事件」推断用户已作答。回归：case 20b 检查真实工具结果即时发送、普通保活仍节流；case 22 检查等待期间的周期心跳不冒充工具完成。
+- **升级要重启运行中的 dsh**：daemon 启动时会刷新磁盘插件，内容或接入配置变化时在 Agents 页以「接入更新提醒」信息框显示重启提示。旧插件可能仍驻留内存，并把答完提问后的事件标成纯保活；新 daemon 会保留等待相位，直到收到真正的工具活动或回合终态。重启 dsh 后才能保证两端使用同一契约。文件内容未变时不重复提示；此提示只确认磁盘更新，不代表已经检测到宿主重载。用户重启 dsh 后可点「知道了」关闭；重新扫描和切页不会重新显示已确认的提示，真实接入故障仍单独显示为告警。
 - ⚠️ **实测契约漂移：`sessionProjections` 未必读得到**（2026-10-10 trace 首行 `apply {"proj":false}`）。这个 DSH 版本里 `ctx.get("sessionProjections")` 返回空，插件一直在走**日志兜底**（`turnOpen` 推理 + `logScan`），而 trace 的 `heartbeat.tick {"logOpen":true,"projOpen":true}` 说明兜底判得正确。结论：**不要把「投影可用」当成前提**——它只是首选信号，日志推理才是真正的保底（`projectionsOf()` 返回 `null` 时功能不得降级，见用例 19）；
-- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾，用例 18/19 覆盖「答完提问后等待相位必须解除」与「服务读不到时不得崩」，用例 20/20b 覆盖「agent 释放后同回合重新附着时心跳自愈」与「答完提问的收尾不吃节流」，用例 21 覆盖「双键分裂时心跳只排一条、可整体停掉」；本机没有 node 时该测试自动跳过）；
+- 上面这条有两条回归测试锁着：`dsh.rs` 的结构断言（生成物必须出现 2xx 判定 / 重投 / `markSettled` 只在送达路径），以及 `crates/bark-adapters/tests/plugin_sim.mjs`（Node 直接跑生成物，用假 `fetch` 把 daemon 换成「503 / 连接被拒 / 正常」三种行为：用例 1/3/5 覆盖首投失败重投、静止兜底补报、新回合作废迟到终态，用例 4 覆盖心跳不重试，用例 6 覆盖子代理扣完成，用例 7/8 覆盖等待类与保活，用例 9-13 覆盖空会话 / 回合外事件不上报 / 周期保活 / turn-stopping 不是终态 / 会话关闭收尾，用例 18/19 覆盖「答完提问后等待相位必须解除」与「服务读不到时不得崩」，用例 20/20b 覆盖「agent 释放后同回合重新附着时心跳自愈」与「答完提问的收尾不吃节流」，用例 21 覆盖「双键分裂时心跳只排一条、可整体停掉」，用例 22 覆盖「等待期间纯保活不解除等待、真实工具结果立即恢复」；本机没有 node 时该测试自动跳过）；
 - 插件型 adapter 只送 cwd，daemon 侧 `handle_event` 会按 hook 链路的同一规则补出 `project`，两条链路的通知正文（项目名 + 摘要）保持一致；
 - 排障链路：`dsh web --dump-config` 证明条目在列；DSH 侧有没有真的发出去，看 Windows 通知历史 `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 的 `Notification` 表（按 AUMID `com.agentbark.app` 过滤就是 agent-bark 弹过的 toast）；
 - 桥接包需在 profile 里自行安装：`dsh plugin add @deepseek-ai/dsh-hooks-claude-code`；
@@ -433,16 +432,17 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 
 ---
 
-**DSH 处于 Developer Preview：升级后只核对这 7 个契约点**
+**DSH 处于 Developer Preview：升级后核对以下契约点**
 
 改版可能让下面任何一条失效。每条都写明「失效症状」，出问题时先看对应那条，**不要**先怀疑通知链路：
 
 | 契约点 | 失效症状 | 插件侧位置 |
 | --- | --- | --- |
 | **读服务必须走 `ctx.get("sessionProjections")`**（属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上直接抛 `cannot get property … without inject`，Cordis 4.x） | 「等待输入/等待确认」**答完不解除**（一直橙到终态才变完成）；长回合被 daemon 判死误亮红光；派生/长工具静默期没有续命 | `projectionsOf`（唯一读点）/ `startHeartbeat` 的闸门 |
-| **`agent/disposed` 会在回合还开着时到达**（agent 生命周期被释放，例如 owner fiber 卸载后重新附着同一会话）；它**不保证**随后有 `turn/start` | 「等待输入」答完不回落，且**牌面一切正常**（面板/悬浮窗都卡在等待橙，直到回合终态才变完成） | `keepAliveIfOpen`（`busyOf` 的返回值上补排）/ `agent/status: running` 分支的 `busyOf(session, keys)` |
+| **`agent/disposed` 会在回合还开着时到达**（agent 生命周期被释放，例如 owner fiber 卸载后重新附着同一会话）；它**不保证**随后有 `turn/start` | 重新附着后保活链消失，长回合可能被 daemon 错误判为失联；等待解除另由真实工具活动负责 | `keepAliveIfOpen`（`busyOf` 的返回值上补排）/ `agent/status: running` 分支的 `busyOf(session, keys)` |
 | `sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
 | `agent/status` 的边沿语义（`idle` = 没有驱动器还在排队或运行） | 完成通知不来、或提前来；**边沿还可能根本不出现**（2026-09-30 实测：DSH 重启后连续两个回合收尾都没有 idle）——所以收尾**不能只挂在它上面**，插件用 `turn/end` + `REST_GRACE_MS` 宽限窗兜底 | `agent/status` 监听 + `scheduleRest` |
+| `tool/result` 为真实工具收尾，纯保活不改相位 | `tool/result` 缺失时答完仍等待；把定时器当真实活动则会在未回答时误解除等待 | `session/event` 的 `resumed` / `postLiveness` / daemon 的 `ToolFinished` 分支 |
 | `session/event` 的 `turn/start` / `turn/end`（后者带 `data.turn` 与 `data.reason.kind`） | 完全不建档（面板空白）、或按回合去重失效（重复通知） | `session/event` 监听 |
 | `ctx.on(..., { global: true })` 的 scope 分发行径 | 偶发丢 `turn/end`，状态飘 | 5 处 `{ global: true }` |
 | 两个 waterfall（`approval/request` / `user-questions/request`）必须把 `next()` 交还 | 审批/提问请求被吞 | 两个 waterfall 监听 |
@@ -458,7 +458,7 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 | 项 | 值 |
 | --- | --- |
 | id | `workbuddy` |
-| 数据源 | `~/.workbuddy/workbuddy.db`（SQLite，`sessions` 表） |
+| 数据源 | `~/.workbuddy/workbuddy.db`（SQLite，`sessions` 表）；`projects/*/<session>.jsonl` 补充取消原因 |
 | 轮询间隔 | 5 秒；运行态（`working` / `planning`）每 12 轮（60 秒）重发一次 activity 心跳 |
 | 安装标记 | 上述 db 文件存在 |
 
@@ -466,7 +466,8 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
 - 非官方方案：**应用升级可能失效**（已在 2.137.1 实测校准状态机），UI 上标「监控型」；
 - 读库采用「先复制 db 与 `-wal` 到临时目录再打开」，避免与宿主写锁冲突；两次复制无法保证同一时点，极端情况下会读到撕裂快照（单轮失败可接受，下轮自愈）；
 - 监控型拿不到每回合的 `UserPromptSubmit`/`PreToolUse`，所以靠周期性心跳（activity）维持「运行中」——否则 daemon 侧 10 分钟无活动会把会话判死，流光永远不亮思考色。**「接入成功但流光不亮」多半就是心跳没发出去**。
-- 状态跃迁映射：`working/planning` → `pending` = 等输入（等待色）；→ `completed` = 完成（完成色）；→ `terminated`/`error` = 失败（失败色）；**运行中被 `archived` = `run_aborted`（中止：不亮失败色也不亮完成色，没有别的会话时收起光效）**。`terminated` 分不清「用户终止」还是「进程挂了」，保守按失败处理（失败色）——这是本仓唯一一处中止语义做不到精确的地方。
+- 状态跃迁映射：`working/planning` → `pending` = 等输入；→ `completed` 默认完成；→ `terminated`/`error` 默认失败；运行中被 `archived` = `run_aborted`。在完成/失败跃迁前，用回合记录中明确的取消原因覆盖为 `run_aborted`，再交给统一状态机。
+- **2026-10-14 取消误报完成修复**：本机 WorkBuddy 手动停止时 SDK 写 `TURN_COMPLETED / stopReason=cancelled`，会话库却仍为 `completed`。对应 JSONL 写 `type=message, role=assistant, status=incomplete, providerData.skipRun=true, providerData.error.message="Interrupted by user"`。仅检查最后一条有效回合记录（跳过 session-meta/file-history-snapshot），且记录时间必须在会话 `updated_at` 前 5 秒内，避免旧取消、工具失败、正文提及取消、继续对话之后的历史记录被误用。每次终态跃迁最多读取 256 KiB 尾部；记录缺失/格式不匹配时保留原数据库映射，不能保证识别取消。
 
 ---
 
@@ -565,7 +566,7 @@ Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格*
 | id | `cursor` |
 | 配置文件 | `~/.cursor/hooks.json`（**扁平结构** + 顶层 `version: 1`，文件不存在时 agent-bark 自动创建） |
 | 安装标记 | `~/.cursor` 目录存在 |
-| 注册事件 | `beforeSubmitPrompt`/`preToolUse`→activity、`postToolUse`→**tool_finished**（等待解除信号）、`stop`→run_completed、`sessionEnd`→run_aborted |
+| 注册事件 | `beforeSubmitPrompt`/`preToolUse`→activity、`postToolUse`→**tool_finished**；`stop.status` 与 `sessionEnd.reason` 区分完成/终止/失败 |
 | 需要你做 | 无信任环节 |
 
 官方 18 个 agent 事件的子集（**未实测**）；payload 用 `conversation_id` + `workspace_roots`（数组）。**没有等待类钩子**（官方无 Notification 类事件）——Cursor 只有运行/完成两态，权限等待退化为事件静止 + 判死。本节覆盖 IDE 端；Cursor CLI（`cursor-agent`）对 hooks 的支持官方未文档化，不承诺。
@@ -579,24 +580,16 @@ Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格*
 | id | `copilot-cli` |
 | 配置文件 | `~/.copilot/hooks/agent-bark.json`（**专用文件**：官方按 `~/.copilot/hooks/*.json` 逐文件加载，独占文件名即不碰用户条目） |
 | 安装标记 | `~/.copilot` 目录存在 |
-| 注册事件 | `userPromptSubmitted`→activity、`postToolUse`→tool_finished、`postToolUseFailure`→tool_failed、`notification`→input_required、`permissionRequest`→permission_required、`agentStop`→run_completed、`sessionEnd`→run_aborted |
+| 注册事件 | `userPromptSubmitted`→activity、`postToolUse`→tool_finished、`postToolUseFailure`→tool_failed、`notification`→input_required、`permissionRequest`→permission_required、`agentStop`→run_completed、`sessionEnd.reason` 区分完成/终止/失败 |
 | 需要你做 | 无信任环节 |
 
 ⚠️ 事件名按**官方 CLI 文档的 camelCase 主事件集**（`agentStop` 而非 `Stop`、`userPromptSubmitted` 而非 `UserPromptSubmit`）——AgentPet 写的 PascalCase 集是 VS Code 兼容层。**未实测**；若实机只认 PascalCase 回调，把映射表切过去即可（代码注释有记录）。**故意不注册 `preToolUse`**：Copilot 的 command hook 是 fail-closed（hook 出错会阻塞用户工具），少一个高风险挂载点（本子命令恒退出 0，这是纵深防御）。
 
 ---
 
-## 17. Windsurf
+## 17. 已移除的接入
 
-| 项 | 值 |
-| --- | --- |
-| id | `windsurf` |
-| 配置文件 | `~/.codeium/windsurf/hooks.json`（扁平结构，**无** version 键） |
-| 安装标记 | `~/.codeium/windsurf` 目录存在 |
-| 注册事件 | `pre_user_prompt`→activity、`post_cascade_response`（及 `_with_transcript` 变体）→run_completed |
-| 需要你做 | 无信任环节；工作区处于**受限模式（Restricted Mode）**时 hooks 不会加载 |
-
-官方 12 个事件里只注册两个会话级事件（**未实测**）：其余工具级事件全是阻塞型 pre-hook，不注册；运行中相位靠回合开始心跳 + 判死兜底。**没有等待类钩子**——只有运行/完成两态。payload 用 `trajectory_id`（会话 id）+ `agent_action_name`，无项目目录字段，通知正文不带项目名属能力边界。
+Windsurf 已按用户要求移除检测、接入入口和适配器；旧 agent id 不再识别。
 
 ---
 
@@ -646,11 +639,13 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 - **没有 `turn.end` 记录**——模型给出最终回答就是最后一步 `step.end` 的 `finishReason=end_turn`；
 - `turn.cancel` 是显式用户中止，立即释放；
 - 通知正文用 `state.json` 的会话标题（wire 里只有流式分片，不拼装正文）；
-- 长思考回合没有 `tool.call` 心跳，靠 60s 运行态心跳保活（远小于 10 分钟判死线）。
+- 首次发现会话，仅当文件修改时间和尾部最新 `time` 时间戳都在最近 2 分钟内，才从未收尾记录恢复运行态；历史日志或缺少可识别时间戳的日志只记录读取位置，不重放活动。之后新增的真实任务记录仍正常处理。
+- 短时静默每 60s 发一次运行态心跳，但心跳不算日志增长。连续 10 分钟没有真实日志增长，发一次 `run_aborted` 释放会话并停止心跳；后续新增 `turn.prompt` / `step.begin` / `tool.call` / `content.part` 可以恢复运行态。持续有流式日志的长任务不受总时长限制。
+- 真实 `end_turn` / `turn.cancel` 与静默超时分开处理：真实终态之后的迟到分片和工具结果不能重新点亮，只有下一条 `turn.prompt` 才能开启新回合。启动读取只消费完整行，并以本轮观测的文件长度为界；未写完的行或中文字符等补齐后再处理，避免漏读或重复消费。豆包工作的 JSONL 读取也遵循此规则。
 
 **为什么不做 Hook 型**：内核读的 `runtime/kimi-code/config.toml` 是**应用托管生成**的（内含 Daimon 权限规则、设备元数据，随应用启动重写），写入的 `[[hooks]]` 活不过一次 Kimi Work 重启；Watch 型零写盘，不受影响。
 
-**已知边界**：只看主 agent（`agents/main/wire.jsonl`），Agent Swarm 子智能体不出事件；协议 1.3 只有审批**解决**记录没有**请求**记录，「等待确认」相位推不出来（表现为执行工具直到审批完成）；数据布局按 2026-07 版本（daimon-bundle 0.5.36 / X-Msh-Version 0.22.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
+**已知边界**：只看主 agent（`agents/main/wire.jsonl`），Agent Swarm 子智能体不出事件；协议 1.3 只有审批**解决**记录没有**请求**记录，「等待确认」相位推不出来（表现为执行工具直到审批完成）。纯日志监控无法区分超过 10 分钟的真实静默任务与已经退出的宿主，因此前者也会暂时移除，日志恢复后重新显示。数据布局按 2026-07 版本（daimon-bundle 0.5.36 / X-Msh-Version 0.22.3）校准，应用大版本升级可能导致监控失效。
 
 ---
 
@@ -662,22 +657,28 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 | --- | --- |
 | id | `doubao-work` |
 | 数据根 ① | `%LOCALAPPDATA%\DoubaoWork\User Data\<profile>\.doubaowork\agent_mode\workspace\.sessions\`（枚举全部 profile；`.doubaowork` 首次使用 Agent 模式后才出现） |
-| 数据根 ② | 同 profile 的 `IndexedDB\chrome_doubaowork-chat_0.indexeddb.leveldb`（渲染进程会话状态；只增量尾随编号最大的 `.log`，compaction 换日志时从头重扫） |
+| 数据根 ② | 同 profile 的 `IndexedDB\chrome_doubaowork-chat_0.indexeddb.leveldb`（渲染进程会话状态；只读解析 `.log` WAL 与 `.ldb` SST，按 sequence 合并，缓存未变化文件） |
+| 数据根 ③ | `%LOCALAPPDATA%\DoubaoWork\User Data\sdk_storage\log\saman_*.log`（增量只读；启用时从 EOF 开始，支持日志轮转） |
 | 会话布局 | `.sessions/<会话id>/agents/<agentid>/system/trajectory.jsonl`（OpenAI 风格对话流，逐回合 append-only，**只记录循环内部消息：用户输入、工具调用、工具结果**）+ `assignment.md`（逐回合追加的需求流水，头部有 `- Role: main`）+ `board.md` |
-| 事件映射 | trajectory `role=user`→activity（content 为任务文案）、`tool_calls`→activity（带工具名）、`interaction.ask`→**input_required**（带问题文案）、`role=tool`→tool_finished（**也是提问被回答的解除信号**）；**IndexedDB `extra.running_messages` 条目清除→run_completed**；无 `tool_calls` 的 assistant 行→run_completed（兜底，终态回声去重）；其余忽略 |
+| 事件映射 | trajectory `role=user`→activity（content 为任务文案）、`tool_calls`→activity（带工具名）、`interaction.ask`→**input_required**（带问题文案）、`role=tool`→tool_finished（**也是提问被回答的解除信号**）；**SDK 日志确认用户取消且会话/消息 ID 匹配→run_aborted；IndexedDB `extra.running_messages` 条目清除等待 6s 补齐取消日志后→run_completed**；无 `tool_calls` 的 assistant 行→run_completed（兜底，终态回声去重）；其余忽略 |
 | 需要你做 | 无（不写盘、不需要豆包工作任何设置）；Agent 模式跑过一次即自动监控 |
 
 实测要点（样本：一个完整会话 3 小时 / 24 条循环消息 / 1 次 `interaction.ask` 提问-回答闭环 / 多消息连发排队；IndexedDB 语义用分代 compaction 快照 + 当前日志逐点核对）：
+- 2026-10-14 本机取消样本：`sdk.message.break.request` 的 `break_reason_name=click_break_button`、`result=success` 明确证明用户停止。与数据库运行消息 ID 关联后按「已终止」收场，清除提问等待、完成延迟和心跳；重复日志和旧消息不能关闭下一轮，消息 ID 变化也能识别轮询间错过空闲的新回合。正常完成最多增加约 6–9s 延迟；监控启动不重放历史停止。
 - **最终回复不落盘**——trajectory 里没有任何「无 `tool_calls` 的 assistant 行」，十几次回复都只在聊天 UI 里。回合完成信号唯一来自 IndexedDB：会话记录 `extra.running_messages` 随**回合开始**写入条目（`{消息id: {started_at_ms}}`）、随**回合真正结束**清除（`{}`）；
+- 2026-10-13 本机复核：任务开始先写数据库，trajectory 的 user 消息可能在任务完成时才落盘。监控按数据库运行信号点亮主 agent（已有 assignment 即可，不要求轨迹已创建），按数据库空闲信号收场；晚到的轨迹不能重新点亮。
+- 数据库读取先重组 LevelDB WAL 分段、校验 CRC32C，解开 SST 块及 Chromium 值包装里的 Snappy，再解码 V8 单字节/UTF-16 字符串，最后解析 `extra` JSON。原来的原始字节搜索会漏掉压缩和双字节记录；只读当前 `.log` 也会漏掉 compaction 后进入 `.ldb` 的状态。新旧记录按 sequence 合并，文件编号不代表业务状态新旧。
 - `interaction.ask` 是运行时**提问工具**：提问后回合挂起等用户回答（IndexedDB 条目保留），答完以 `role=tool` 结果恢复循环；
 - 工具失败（如 `image_gen` 报错）只留 `role=tool` 的错误文本，回合继续跑——**不是 run_failed**；
 - 运行中可以连发多条消息排队，trajectory 里表现为连续多条 `role=user`，每条都刷新任务文案；
 - 云端生图 / 长思考期间本地零事件，靠 60s 运行态心跳保活（远小于 10 分钟判死线）；
+- **完成后不允许旧信号复活回合**：完成标记阻止缓存的 `running=true` 继续发心跳，迟到的工具记录也不能重新点亮。IndexedDB 已确认空闲时，后续 trajectory 的 user/工具记录只消费读取位置，不上报活动；新 user 文案暂存，待 IndexedDB 下一次 `false→true` 确认运行后再开启。无 IndexedDB 空闲结论时，新的 user 记录仍可开启下一轮。
+- `interaction.ask` 清除条目的宽限期内，真实 tool 回答及其后续工具仍可继续当前回合；空 trajectory 也不等于已完成，IndexedDB 确认运行的云端任务仍正常保活。首次读到空闲状态时，若之前仅凭轨迹点亮，也会收场。
 - 通知正文用最近一次任务文案，项目目录取自 IndexedDB 的 `agent_task_param.workspace`。
 
 **为什么不做 Hook 型**：豆包工作没有 hooks / CLI 扩展点；Watch 型零写盘。
 
-**已知边界**：只看主 agent（`assignment.md` 头部 `Role: main`），子智能体不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）；**失败 / 中止不可见**——运行时崩溃、用户停止在两个数据源里都不留记录，条目清除统一映射为完成（失败的任务会误报「任务完成」），数据源失效时退化为事件静止 + 10 分钟判死；IndexedDB 不可读时降级为 trajectory 单源（完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场，不亮失败色、下次活动自动恢复）；完成/运行种子只覆盖 LevelDB 当前 `.log` 里的会话（compaction 会把老会话的最新状态挪进 `.ldb`，为它做完整 LevelDB reader 不值得），无种子的会话按 trajectory 文件停摆时长兜底——超过 15 分钟无文件活动按空闲建档（不点亮、不心跳，否则每次重启历史会话都会被重新点亮一遍），后续任何真实事件照常接管；数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
+**已知边界**：只看主 agent（`assignment.md` 头部 `Role: main`），子智能体不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）；**失败原因仍不可见**；取消日志缺失/格式漂移，或未观测到对应运行消息 ID 时，条目清除仍回退为完成（可能把停止或失败误报为完成），数据源失效时退化为事件静止 + 10 分钟判死；IndexedDB 不可读时降级为 trajectory 单源（完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场，不亮失败色、下次活动自动恢复）；完成/运行种子覆盖 LevelDB WAL 与 SST；无法从数据库读到种子的会话按 trajectory 文件停摆时长兜底——超过 15 分钟无文件活动按空闲建档（不点亮、不心跳，否则每次重启历史会话都会被重新点亮一遍），后续任何真实事件照常接管；数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
 
 ---
 

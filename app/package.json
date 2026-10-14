@@ -1,12 +1,14 @@
 {
   "name": "agent-bark-ui",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "test:tools": "node --test ../tools/traework-probe.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

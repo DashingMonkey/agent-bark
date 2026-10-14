@@ -554,7 +554,7 @@ console.log('case 8: session/event 其余事件按「还活着」处理（节流
   await flush();
   check(
     sent.filter((e) => e.type === 'tool_finished').length === 1,
-    'approval/* 审计不发保活（会把等待色打回思考色）',
+    'approval/* 审计不上报（不能证明 agent 已恢复工作）',
   );
   dump('case8');
 }
@@ -845,31 +845,22 @@ console.log('case 17: agent/status 一条都不来时（只有回合级事件）
   dump('case17');
 }
 
-// --- 用例 18：答完提问（仍在同一回合内）必须靠保活心跳把等待相位解除 -------------
+// --- 用例 18：同一回合内的工具结果解除等待，周期心跳继续续命 -------------------
 //
-// 2026-10-09 用户实测：DSH 弹出 ask_user_question、他选完（还在输入框里补了句话）之后，
-// 事件流一直停在「等待输入」，直到 AI 整段思考结束、回合终态到达才变成「完成」。
-// 原因是真实会话日志里这次回答**落在同一个回合内**（`ask_user_question` → `tool/result`
-// → 继续 step/*，没有 `turn/end`）——于是没有任何「新回合」信号，daemon 的 WaitingInput
-// 只能靠插件那条「回合开着就定期补」的保活心跳（tool_finished + keepalive）回落「思考中」。
-// 而旧实现的 startHeartbeat 用 `ctxRef.sessionProjections` 属性访问做闸门，在真实 Cordis
-// 上**恒抛**（无 inject），闸门把整条心跳链掐死 → 等待相位再也回落不了。
-//
-// 本用例同时锁住三件事：
-//   1. 服务只经 `ctx.get()` 可读、属性访问抛异常时，插件**不得**抛穿监听器（事件照常上报）；
-//   2. 回合开着时周期心跳真的排上了（20s 一跳）；
-//   3. 那一跳发的是 keepalive 心跳（daemon 侧据此把等待相位打回思考中，且只续命不建档）。
-
-console.log('case 18: 答完提问后（同一回合内）保活心跳必须把「等待输入」解除');
+// 同一回合答完提问后，由真实 tool/result 解除等待；周期心跳只续命。
+// 官方投影仍须经 ctx.get() 读取，不能因属性访问异常掐断事件与心跳。
+console.log('case 18: 工具返回解除等待，周期心跳继续续命');
 {
   sent.length = 0;
   timers.length = 0;
   behavior = null;
-  const ctx = makeCtx({ projections: makeProjections() });
+  const projections = makeProjections();
+  const ctx = makeCtx({ projections });
   plugin.apply(ctx);
   const agent = makeAgent('sess-ask');
 
   await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  projections.open(agent.session, 0);
   await ctx.dispatch('agent/status', { agent, status: 'running' });
   const beat = timers.filter((t) => t.ms === 20000).length;
   check(beat >= 1, `回合开着时排上了周期保活心跳（实际 ${beat} 个 20s 定时器）`);
@@ -890,13 +881,14 @@ console.log('case 18: 答完提问后（同一回合内）保活心跳必须把�
   sent.length = 0;
   await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
 
-  // 保活心跳那一跳：必须真的发出 keepalive 心跳，否则等待相位只能等终态才落幕
+  check(sent.some((e) => e.type === 'tool_finished' && e.keepalive !== true), '工具返回立即解除等待');
+  // 周期心跳仍然继续，只承担续命。
   const fired = await fireTimer((t) => t.ms === 20000);
   check(fired, '保活心跳那一跳被推进（存在 20s 定时器）');
   const beats = sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true);
   check(
     beats.length >= 1,
-    `心跳发出 keepalive 保活（daemon 侧 ToolFinished 分支把等待相位回落思考中；实际 ${beats.length} 条）`,
+    `心跳发出 keepalive 保活（不改变相位；实际 ${beats.length} 条）`,
   );
   check(
     beats.length >= 1 && beats[0].session_id === 'sess-ask',
@@ -990,7 +982,7 @@ console.log('case 20: agent 释放后同回合重新附着，保活心跳必须�
   check(fired, '自愈后的心跳那一跳真的被推进');
   check(
     sent.some((e) => e.type === 'tool_finished' && e.keepalive === true && e.session_id === 'sess-reattach'),
-    '自愈后发出的 keepalive 带本会话 id（daemon 侧据此把等待相位打回思考中）',
+    '自愈后发出的 keepalive 带本会话 id（daemon 侧只续命）',
   );
 
   // 第二条自愈路径：没有 running 边沿时，回合内的事件也必须补排心跳
@@ -1026,16 +1018,8 @@ console.log('case 20: agent 释放后同回合重新附着，保活心跳必须�
 
 // --- 用例 20b：答完提问的收尾必须**不吃节流**立刻发出去 -------------------------
 //
-// 2026-10-10 生产 trace 实测（用户第三轮反馈「选完还是等待输入，过一会才蹦出完成」）：
-//   06:29:45.707 post tool_finished/keepalive   ← 提问**之前**的一条保活，占掉了节流窗
-//   06:29:51.946 post input_required            ← daemon 进入「等待输入」
-//   06:29:55.902 tool/result（用户答完）        ← 被 15s 节流吃掉，**没发出去**
-//   06:30:05.716 heartbeat.tick → keepalive     ← 相位一直到这一跳才回落（≈10s 滞后）
-// 用户看到的就是「卡在等待输入 → 直接蹦出已完成」。
-//
-// 锁两件事：节流窗**内**（同一会话 3 秒前刚发过保活）
-//   1. 答完提问的那条收尾必须照发（`force`，因为提问是低频人工事件）；
-//   2. 其它工具收尾仍按节流窗压掉，不得因此变成「每条事件都发」的刷屏。
+// 真实 tool/result 都立即发送（keepalive=false），不区分是否来自提问。
+// assistant/message 等纯保活仍受 5 秒节流，不能冒充等待已解除。
 
 console.log('case 20b: 答完提问的收尾不吃节流，立刻发出');
 {
@@ -1051,11 +1035,11 @@ console.log('case 20b: 答完提问的收尾不吃节流，立刻发出');
   projections.open(agent.session, 0);
   await ctx.dispatch('agent/status', { agent, status: 'running' });
 
-  // 提问前的空转：turn/start 那条保活 + 一条工具收尾，正好把节流窗（5s）占住
+  // 提问前已有真实工具收尾，后续提问收尾也不能被节流吞掉
   await ctx.dispatch('session/event', agent.session, { type: 'tool/call', data: { turn: 1, name: 'pwsh' } });
   await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
-  const beatsBefore = sent.filter((e) => e.type === 'tool_finished' && e.keepalive === true).length;
-  check(beatsBefore >= 1, `提问前已有保活占掉节流窗（实际 ${beatsBefore} 条）`);
+  const beatsBefore = sent.filter((e) => e.type === 'tool_finished' && e.keepalive !== true).length;
+  check(beatsBefore >= 1, `提问前已有真实工具收尾（实际 ${beatsBefore} 条）`);
 
   // 提问 → 用户答完（同回合内，没有 turn/end）
   await ctx.dispatchWaterfall('user-questions/request', {
@@ -1067,11 +1051,12 @@ console.log('case 20b: 答完提问的收尾不吃节流，立刻发出');
   sent.length = 0;
   await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
   check(
-    sent.some((e) => e.type === 'tool_finished' && e.keepalive === true),
-    '答完提问的收尾立刻发出（否则 daemon 的「等待输入」要多等一个周期心跳才回落）',
+    sent.some((e) => e.type === 'tool_finished' && e.keepalive !== true),
+    '答完提问的真实收尾立刻发出（纯保活不能代替它解除等待）',
   );
 
-  // 反面：不是提问的收尾照样吃节流（3 秒前刚发过 → 不发）
+  await ctx.dispatch('session/event', agent.session, { type: 'assistant/message', data: { turn: 1 } });
+  // 反面：普通消息保活仍吃节流（刚发过 → 不发）。
   sent.length = 0;
   await ctx.dispatch('session/event', agent.session, { type: 'assistant/message', data: { turn: 1 } });
   check(
@@ -1135,6 +1120,30 @@ console.log('case 21: agent.id 与 session.id 分裂时，心跳只排一条、�
     `释放后不残留任何定时器（实际 ${timers.length} 个：${JSON.stringify(timers.map((t) => t.ms))}）`,
   );
   dump('case21');
+}
+
+// 等待审批或回答期间，计时器不能冒充工具已经完成。
+console.log('case 22: 未回答时只有纯保活，真实工具结果到达后才恢复');
+for (const request of ['approval/request', 'user-questions/request']) {
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const projections = makeProjections();
+  const ctx = makeCtx({ projections });
+  plugin.apply(ctx);
+  const agent = makeAgent(`sess-wait-${request}`);
+  await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+  projections.open(agent.session, 0);
+  await ctx.dispatch('agent/status', { agent, status: 'running' });
+  await ctx.dispatchWaterfall(request, { agent, toolName: 'pwsh', questions: [{ question: '继续吗？' }] });
+  check(sent.some((e) => e.type === (request === 'approval/request' ? 'permission_required' : 'input_required')), '等待事件已发出');
+  sent.length = 0;
+  check(await fireTimer(isHeartbeat), '等待期间仍有周期心跳');
+  check(sent.some((e) => e.type === 'tool_finished' && e.keepalive === true), '尚未回答时只收到纯保活');
+  check(!sent.some((e) => e.type === 'tool_finished' && e.keepalive !== true), '计时器不会宣称工具已完成');
+  sent.length = 0;
+  await ctx.dispatch('session/event', agent.session, { type: 'tool/result', data: { turn: 1 } });
+  check(sent.some((e) => e.type === 'tool_finished' && e.keepalive !== true), '真实工具结果立即恢复会话状态');
 }
 
 // --- 汇总 -------------------------------------------------------------------

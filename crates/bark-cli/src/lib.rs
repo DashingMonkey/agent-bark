@@ -231,14 +231,21 @@ fn trim_pending(path: &PathBuf) {
 /// 改为投递全部处置完（含 requeue）后由调用方 [`ack_drained`] 统一删除——
 /// 语义是**至少一次投递 + daemon 侧 id 去重**：崩溃后残留的 draining 文件下次
 /// drain 会再回放一遍，重复的事件由 daemon 的 `seen-ids` 去重窗口吞掉，宁重不丢。
-pub fn drain_pending() -> Vec<NormalizedEvent> {
-    let Some(path) = pending_path() else { return Vec::new() };
+#[derive(Default)]
+pub struct DrainedPending {
+    pub events: Vec<NormalizedEvent>,
+    files: Vec<PathBuf>,
+}
+
+/// 读取可用补投文件，返回事件及本批次可确认的文件清单。
+pub fn drain_pending() -> DrainedPending {
+    let Some(path) = pending_path() else { return DrainedPending::default() };
     drain_pending_at(&path)
 }
 
 /// 指定路径版（测试用；生产走 [`drain_pending`]）
-fn drain_pending_at(path: &PathBuf) -> Vec<NormalizedEvent> {
-    let mut out = Vec::new();
+fn drain_pending_at(path: &PathBuf) -> DrainedPending {
+    let mut out = DrainedPending::default();
 
     // 1) 消费上次崩溃残留的 draining 文件（唯一名各不相同，全部回收）
     if let Some(dir) = path.parent() {
@@ -254,7 +261,8 @@ fn drain_pending_at(path: &PathBuf) -> Vec<NormalizedEvent> {
                 // 读失败（被占用等）就留着，下次再试；**读成功也不删**——
                 // 删除统一由 ack_drained 在投递处置完后做（见函数头注释）
                 if let Ok(text) = std::fs::read_to_string(&p) {
-                    out.extend(parse_or_warn(&p, &text));
+                    out.events.extend(parse_or_warn(&p, &text));
+                    out.files.push(p);
                 }
             }
         }
@@ -264,7 +272,8 @@ fn drain_pending_at(path: &PathBuf) -> Vec<NormalizedEvent> {
     let tmp = path.with_extension(format!("jsonl.draining-{}", uuid::Uuid::new_v4().simple()));
     if std::fs::rename(path, &tmp).is_ok() {
         if let Ok(text) = std::fs::read_to_string(&tmp) {
-            out.extend(parse_or_warn(&tmp, &text));
+            out.events.extend(parse_or_warn(&tmp, &text));
+            out.files.push(tmp);
         }
     }
     out
@@ -282,27 +291,16 @@ fn parse_or_warn(path: &PathBuf, text: &str) -> Vec<NormalizedEvent> {
     events
 }
 
-/// 投递全部处置完（成功投出 + requeue 写回）后，删除所有 draining 文件。
+/// 本批次投递全部处置完（成功投出 + requeue 写回）后，只删除该批成功读取的文件。
+/// 读取失败或在本批读取之后出现的 draining 文件保留，供下次重试。
 ///
 /// 删除失败只 warn 留痕：宁可下次 drain 重复回放（id 去重兜住），也不能让
 /// 「删不掉」变成静默异常。
-pub fn ack_drained() {
-    let Some(path) = pending_path() else { return };
-    ack_drained_at(&path);
-}
-
-/// 指定路径版（测试用；生产走 [`ack_drained`]）
-fn ack_drained_at(path: &PathBuf) {
-    let Some(dir) = path.parent() else { return };
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("pending.jsonl.draining") {
-            continue;
-        }
-        if let Err(e) = std::fs::remove_file(entry.path()) {
-            tracing::warn!(path = %entry.path().display(), "补投 draining 文件删除失败（下次 drain 会重复回放，由 id 去重兜住）: {e}");
+pub fn ack_drained(batch: DrainedPending) {
+    // 只确认本批次成功读取的文件，不重新扫描目录。
+    for path in batch.files {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), "补投文件删除失败，下次重试: {e}");
         }
     }
 }
@@ -329,37 +327,36 @@ fn parse_pending_lines(text: &str) -> (Vec<NormalizedEvent>, usize) {
 }
 
 /// B5：把 drain 后未能投递的事件写回补投队列（如补投通道已满）。
-pub fn requeue_pending(events: &[NormalizedEvent]) {
+pub fn requeue_pending(events: &[NormalizedEvent]) -> std::io::Result<()> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
-    let Some(path) = pending_path() else { return };
-    requeue_pending_at(&path, events);
+    let path = pending_path().ok_or_else(|| std::io::Error::other("补投目录不可用"))?;
+    requeue_pending_at(&path, events)
 }
 
 /// 指定路径版（测试用；生产走 [`requeue_pending`]）
-fn requeue_pending_at(path: &PathBuf, events: &[NormalizedEvent]) {
+fn requeue_pending_at(path: &PathBuf, events: &[NormalizedEvent]) -> std::io::Result<()> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     for ev in events {
-        if let Ok(line) = serde_json::to_string(ev) {
-            // 与 append_pending 同款：整行单次 write（writeln! 会拆两次 write，
-            // 并发交错会把 JSON 行拼坏，见 append_line 的注释）
-            let _ = f.write_all(format!("{line}\n").as_bytes());
-        }
+        let line = serde_json::to_string(ev)?;
+        // 与 append_pending 同款：整行单次 write（writeln! 会拆两次 write，
+        // 并发交错会把 JSON 行拼坏，见 append_line 的注释）
+        f.write_all(format!("{line}\n").as_bytes())?;
     }
+    f.sync_all()?;
     drop(f);
     if std::fs::metadata(path).map(|m| m.len() > TRIM_TRIGGER_BYTES).unwrap_or(false) {
         trim_pending(path);
     }
+    Ok(())
 }
 
 fn post_to_daemon(config: &BarkConfig, event: &NormalizedEvent) -> bool {
@@ -460,7 +457,7 @@ mod tests {
         }
         // requeue 同款契约
         let (dir2, p2) = temp_queue();
-        requeue_pending_at(&p2, &[a, b]);
+        requeue_pending_at(&p2, &[a, b]).unwrap();
         let text2 = std::fs::read_to_string(&p2).unwrap();
         assert_eq!(text2.lines().count(), 2);
         for l in text2.lines() {
@@ -510,7 +507,7 @@ mod tests {
         std::fs::write(&residue, serde_json::to_string(&stale).unwrap() + "\n").unwrap();
 
         let got = drain_pending_at(&p);
-        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = got.events.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"live") && ids.contains(&"crash-residue"), "崩溃残留必须被回收");
         // drain 后文件仍在：此刻事件只在内存里，删文件 = 删事件（旧实现的崩溃丢事件窗口）
         assert!(residue.exists(), "drain 不得删除 draining 文件（待 ack）");
@@ -522,7 +519,7 @@ mod tests {
         assert_eq!(draining.len(), 2, "残留 + 本次 rename 的两个 draining 文件都还在");
 
         // 投递处置完（成功投出或 requeue 写回）后统一删除
-        ack_drained_at(&p);
+        ack_drained(got);
         let draining_after: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -530,7 +527,60 @@ mod tests {
             .collect();
         assert!(draining_after.is_empty(), "ack 后所有 draining 文件必须删除");
         // 幂等：没有可删文件时不炸
-        ack_drained_at(&p);
+        ack_drained(DrainedPending::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ack_only_removes_files_read_in_its_batch() {
+        let (dir, path) = temp_queue();
+        append_pending_at(&path, &sample());
+        let batch = drain_pending_at(&path);
+        assert_eq!(batch.events.len(), 1);
+        let later = dir.join("pending.jsonl.draining-later");
+        std::fs::write(&later, "later batch").unwrap();
+        ack_drained(batch);
+        assert!(later.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ack_keeps_unread_files_for_retry() {
+        let (dir, path) = temp_queue();
+        let unread = dir.join("pending.jsonl.draining-unread");
+        std::fs::write(&unread, [0xff]).unwrap();
+        let batch = drain_pending_at(&path);
+        assert!(batch.events.is_empty());
+        ack_drained(batch);
+        assert!(unread.exists());
+        std::fs::write(&unread, serde_json::to_string(&sample()).unwrap()).unwrap();
+        let batch = drain_pending_at(&path);
+        assert_eq!(batch.events.len(), 1);
+        ack_drained(batch);
+        assert!(!unread.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ack_keeps_locked_unread_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (dir, path) = temp_queue();
+        let unread = dir.join("pending.jsonl.draining-locked");
+        std::fs::write(&unread, serde_json::to_string(&sample()).unwrap()).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).write(true).share_mode(4).open(&unread).unwrap();
+        let batch = drain_pending_at(&path);
+        assert!(batch.events.is_empty());
+        ack_drained(batch);
+        drop(held);
+        assert!(unread.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requeue_reports_write_failure() {
+        let (dir, _) = temp_queue();
+        assert!(requeue_pending_at(&dir, &[sample()]).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

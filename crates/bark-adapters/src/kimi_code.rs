@@ -67,7 +67,7 @@ fn entry_is_ours(item: &Table) -> bool {
         .and_then(|i| i.as_str())
         .is_some_and(|cmd| {
             let exe = jsonio::first_token(cmd);
-            let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+            let name = exe.rsplit(['/', '\\']).next().unwrap_or(&exe);
             jsonio::KNOWN_EXE_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         })
 }
@@ -163,34 +163,29 @@ impl HookAdapter for KimiCodeAdapter {
         // 保证重复注册幂等（内容无变化就不写盘）
         let mut changed = false;
         let mut kept: Vec<bool> = vec![false; EVENT_MAP.len()];
-        let mut removed = true;
-        while removed {
-            removed = false;
-            for idx in (0..aot.len()).rev() {
-                let ours = aot.get(idx).is_some_and(|t| entry_is_ours(t));
-                if !ours {
-                    continue;
-                }
-                let ev_name = aot.get(idx).and_then(entry_event).map(str::to_string);
-                let pos = ev_name
-                    .as_deref()
-                    .and_then(|e| EVENT_MAP.iter().position(|(name, _)| *name == e));
-                match pos {
-                    Some(p) if !kept[p] => {
-                        // 保留的第一个条目：就地修 command（exe 漂移自愈）
-                        let command = self.hook_command(ctx, EVENT_MAP[p].0);
-                        let item = aot.get_mut(idx).expect("idx 有效");
-                        if item.get("command").and_then(|i| i.as_str()) != Some(command.as_str()) {
-                            item.insert("command", value(command));
-                            changed = true;
-                        }
-                        kept[p] = true;
-                    }
-                    _ => {
-                        aot.remove(idx);
+        for idx in (0..aot.len()).rev() {
+            let ours = aot.get(idx).is_some_and(|t| entry_is_ours(t));
+            if !ours {
+                continue;
+            }
+            let ev_name = aot.get(idx).and_then(entry_event).map(str::to_string);
+            let pos = ev_name
+                .as_deref()
+                .and_then(|e| EVENT_MAP.iter().position(|(name, _)| *name == e));
+            match pos {
+                Some(p) if !kept[p] => {
+                    // 保留的第一个条目：就地修 command（exe 漂移自愈）
+                    let command = self.hook_command(ctx, EVENT_MAP[p].0);
+                    let item = aot.get_mut(idx).expect("idx 有效");
+                    if item.get("command").and_then(|i| i.as_str()) != Some(command.as_str()) {
+                        item.insert("command", value(command));
                         changed = true;
-                        removed = true;
                     }
+                    kept[p] = true;
+                }
+                _ => {
+                    aot.remove(idx);
+                    changed = true;
                 }
             }
         }
@@ -423,6 +418,35 @@ api_key = "sk-test"
         assert!(!text.contains("[[hooks]]"), "清空后 hooks 键应摘掉");
         assert_eq!(text, original, "应还原成接入前的形态");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_cleanup_preserves_one_hook_per_event_and_user_hooks() {
+        let dir = tmpdir();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let adapter = KimiCodeAdapter::with_config(cfg.clone());
+        adapter.register(&ctx()).unwrap();
+        let mut doc = std::fs::read_to_string(&cfg).unwrap().parse::<DocumentMut>().unwrap();
+        let hooks = doc["hooks"].as_array_of_tables_mut().unwrap();
+        hooks.push(hooks.get(0).unwrap().clone());
+        let mut user = Table::new();
+        user.insert("event", value("Stop"));
+        user.insert("command", value("echo user-hook"));
+        hooks.push(user);
+        std::fs::write(&cfg, doc.to_string()).unwrap();
+        adapter.register(&ctx()).unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        let hooks = doc["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(hooks.len(), EVENT_MAP.len() + 1);
+        for (event, _) in EVENT_MAP {
+            assert_eq!(hooks.iter().filter(|t| entry_is_ours(t) && entry_event(t) == Some(event)).count(), 1);
+        }
+        assert!(text.contains("echo user-hook"));
+        adapter.register(&ctx()).unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 非法 TOML 拒绝写入

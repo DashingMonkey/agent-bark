@@ -21,7 +21,7 @@ const loadError = ref("");
 const errorMsg = ref("");
 
 /**
- * 全页即时落盘：页面没有「保存」按钮，任何控件改一下就保存整份配置（后端口径）。
+ * 全页即时落盘：页面没有「保存」按钮，任何控件改一下就保存声音与光效分区。
  *
  * 成功不弹「已保存」——开关/下拉本身的变化就是反馈；失败才 toast，并把刚改的
  * 值回滚（界面不能撒谎）。总开关、各开关、下拉、数字框全走这一条路。
@@ -30,7 +30,7 @@ async function persist(): Promise<boolean> {
   if (!config.value) return false;
   sanitizeSoundPlays(config.value);
   try {
-    await api.saveConfig(config.value);
+    await api.saveConfig({ notify: config.value.notify, glow: config.value.glow });
     return true;
   } catch (e) {
     toast(`保存失败：${e}`, "error");

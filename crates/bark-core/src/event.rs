@@ -44,7 +44,7 @@ pub enum EventKind {
     /// **中止**：用户主动终止（或外部取消）导致回合结束——既不是完成，也不是失败。
     ///
     /// 引入它的原因：同一个动作（手动点停止）在不同 agent 上落到了不同的信号里——
-    /// Qoder 是 `SessionEnd`、ZCode 靠读日志推断、WorkBuddy 是运行中被归档，
+    /// Qoder 是 `SessionEnd`、ZCode 靠读日志推断、WorkBuddy 靠回合记录补齐取消原因，
     /// 而「Stop 之后紧跟的终态回声」又会把正常完成的完成色压掉。按失败处理会亮失败色 +
     /// 弹「任务失败」（用户自己按的，纯噪音），按完成处理会亮完成色（谎报完成）。
     /// 统一成这一类：**不通知**；流光在没有别的会话在跑时**直接收起**（不亮失败色也不亮完成色），
@@ -63,7 +63,7 @@ impl EventKind {
             EventKind::InputRequired => "等待输入",
             EventKind::RunCompleted => "任务完成",
             EventKind::RunFailed => "任务失败",
-            EventKind::RunAborted => "已中止",
+            EventKind::RunAborted => "已终止",
         }
     }
 
@@ -73,7 +73,7 @@ impl EventKind {
     /// ToolFinished 是每次工具收尾都发的纯状态信号，同理只能进状态机）。
     ///
     /// RunAborted 也不通知：这是**用户自己按的停止**，他就在键盘前，
-    /// 再来一条「已中止」只是噪音（事件仍入历史与事件流，会话列表照常清掉）。
+    /// 再来一条「已终止」只是噪音（事件仍入历史与事件流，会话列表照常清掉）。
     pub fn should_notify(&self) -> bool {
         !matches!(
             self,
@@ -120,7 +120,8 @@ pub struct NormalizedEvent {
     /// 只有显式声明血缘的 adapter 才填（目前仅 DSH 插件）；hook 型事件恒为 None。
     #[serde(default)]
     pub parent_session_id: Option<String>,
-    /// **纯保活心跳**（不是活动信号）：只允许刷新已有条目的存活时刻，**绝不建档**。
+    /// **纯保活心跳**（不是活动信号）：只刷新已有条目的存活时刻并可回填血缘，
+    /// **不改相位、绝不建档**，不能据此解除等待输入或等待确认。
     ///
     /// 引入它的原因（DSH 实测，2026-09-30）：插件按「回合开着就定期补心跳」续命时，
     /// 会与「回合早已结束、但某条迟到的会话级事件仍被当成活跃」共用同一个 `tool_finished`

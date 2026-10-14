@@ -39,13 +39,14 @@
 //! **回合状态一律从日志派生**（2026-09-30 重写，对齐 DSH 官方契约与社区做法）：
 //! - **建档**只在 `session/event` 的 `turn/start`：发一条不带 `keepalive` 的 `activity`；
 //! - **放行门**（`busyOf`）优先读官方回合投影
-//!   `ctx.sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq !== null`
+//!   `ctx.get("sessionProjections").stateOf(session, "turnBoundary").openTurnStartSeq !== null`
 //!   （纯日志派生；DSH 自己在 dsh-agent-instructions / agent-preset-registry /
 //!   dsh-hooks-codex 里就用这个判定式），读不到时退回本进程的 `turn/start`…`turn/end`
 //!   推理，再退回 `agent/status` running / 见过回合级事件（老版本 DSH）；
-//! - **回合内**：`tool/call` → 带 tool_name 的 `activity`；其余事件 → 节流的
-//!   `tool_finished`（**带 `keepalive: true`**，daemon 只续命不建档）；回合开着且长时间
-//!   静默（长工具 / 长子代理 / 等审批 / 等回答）时另有 20s 周期保活心跳兜底判死；
+//! - **回合内**：`tool/call` → 带 tool_name 的 `activity`；`tool/result` → 不节流的
+//!   `tool_finished`（不带 keepalive，允许解除等待）。其余允许上报的事件折叠为
+//!   5s 节流保活（`keepalive: true`，只续命、不改相位、不建档）；长静默另有 20s
+//!   周期保活兜底判死。等待只由真实工具活动或回合终态解除；
 //! - **收尾**：`turn/end` 记下 `reason.kind` 与回合号，**静止边沿**（`agent/status: idle`
 //!   且没有回合开着）经 `reportAtRest` 报一次终态，正文取会话日志里最后一条
 //!   `assistant/message` 的 text 块，按**回合号**去重（`markSettled(keys, turn)`）；
@@ -292,7 +293,7 @@ impl DshAdapter {
 
     // -- 核心：在指定 home 下执行（便于测试注入临时目录） -------------------
 
-    fn register_at(home: &Path, ctx: &RegisterCtx) -> anyhow::Result<()> {
+    fn register_at(home: &Path, ctx: &RegisterCtx) -> anyhow::Result<bool> {
         if !home.exists() {
             anyhow::bail!(
                 "未检测到 DeepSeek Harness（{} 不存在）。请先安装 dsh（npm i -g @deepseek-ai/dsh）并至少启动一次。",
@@ -308,7 +309,8 @@ impl DshAdapter {
         //    每次都换 mtime（也让「文件确实没变」这件事可观察），不一致才原子写。
         let plugin = Self::plugin_file(home);
         let js = plugin_js(ctx.port, &ctx.token);
-        if std::fs::read_to_string(&plugin).map(|current| current != js).unwrap_or(true) {
+        let plugin_changed = std::fs::read_to_string(&plugin).map(|current| current != js).unwrap_or(true);
+        if plugin_changed {
             jsonio::write_text_atomic(&plugin, &js)?;
         }
 
@@ -363,7 +365,13 @@ impl DshAdapter {
             }
             Self::write_patch_checked(&patch, &entries, &raw)?;
         }
-        Ok(())
+        Ok(plugin_changed || changed)
+    }
+
+    fn register_for_startup_at(home: &Path, ctx: &RegisterCtx) -> anyhow::Result<Option<&'static str>> {
+        Ok(Self::register_at(home, ctx)?.then_some(
+            "DeepSeek Harness 插件或接入配置已更新；若 dsh 正在运行，请重启 dsh 以加载新版插件，否则等待状态可能无法及时更新。",
+        ))
     }
 
     fn unregister_at(home: &Path, ctx: &InstallCtx) -> anyhow::Result<()> {
@@ -492,7 +500,11 @@ impl HookAdapter for DshAdapter {
     }
 
     fn register(&self, ctx: &RegisterCtx) -> anyhow::Result<()> {
-        Self::register_at(&Self::home(), ctx)
+        Self::register_at(&Self::home(), ctx).map(|_| ())
+    }
+
+    fn register_for_startup(&self, ctx: &RegisterCtx) -> anyhow::Result<Option<&'static str>> {
+        Self::register_for_startup_at(&Self::home(), ctx)
     }
 
     fn unregister(&self, ctx: &mut InstallCtx) -> anyhow::Result<()> {
@@ -628,30 +640,10 @@ const heldTerminal = new Map();
 /** 保活心跳的节流表：会话 id → 上次发送时刻（tool_finished 语义，只续命）。 */
 const lastLivenessAt = new Map();
 /**
- * 「这个会话刚抛出提问、还在等人回答」的标记（`ask_user_question` 的工具收尾要用）。
- *
- * 为什么单独记一笔：答完提问的那条 `tool/result` 是 daemon 侧「等待输入 → 思考中」
- * 的唯一时点，**不能**被节流（`LIVENESS_MIN_MS`）吃掉——实测就是这么卡的：一条保活
- * 刚好在提问前发出，用户 10 秒后答完，那条收尾落在节流窗里被丢掉，相位只能等周期
- * 心跳（最长 20 秒）才回落。提问是低频、人工节奏的事件，为它开一次「无条件放行」
- * 不会造成任何刷屏。
- */
-const questioned = new Set();
-/**
- * 事件驱动保活的最小间隔：`session/event` 一轮可达几十条，节流防刷屏。
- *
- * ⚠️ **必须是「用户能忍受的滞后」而不是「防刷屏的下限」**（2026-10-10 实测调小，
- * 15s → 5s）：这条保活唯一的**相位语义**是「工具收尾 / 答完提问 → 回合继续思考」
- * ——daemon 的 `WaitingInput` / `WaitingPermission` 靠它回落「思考中」。而用户答完
- * `ask_user_question` 是**几十秒内就会发生**的事，落在 15 秒窗里就会被整条丢掉，
- * 只能等周期心跳（最长 20 秒）来补：实测 trace 里就是这么一幕——
- * `06:29:45.707` 一条保活占掉窗口 → `06:29:55.902` 用户答完，那条 `tool/result`
- * 被节流吃掉、**没发出去** → 相位一直橙到 `06:30:05.716` 的周期心跳。
- * 用户看到的就是「选完了还卡在等待输入，过一会儿直接蹦出完成」。
- *
- * 5 秒的依据：正常回合里「工具收尾」的间隔远大于它（一个工具至少跑几秒），
- * 不会因此刷屏；而答完提问到下一个事件的间隔通常 < 5 秒，能立刻发出去。
- * 长静默仍由 `HEARTBEAT_INTERVAL_MS` 的周期心跳（`force: true`，不吃节流）兜底。
+ * 事件驱动的纯保活最多每 5 秒一次，只刷新存活时间，不解除等待。
+ * tool/result 是真实工具收尾，以 keepalive=false、force=true 绕过节流；
+ * 每次工具收尾都发送一次本地 POST，避免短时间内的等待解除信号被吞掉。
+ * 20 秒周期保活也用 force=true，但仍带 keepalive=true，不能代替真实活动。
  */
 const LIVENESS_MIN_MS = 5000;
 
@@ -990,8 +982,8 @@ const lastError = new Map();
  *
  * 存在理由：父会话等子代理 / 等审批 / 等回答可以静默十几分钟，其间没有任何会话事件；
  * daemon 侧「心跳静止 10 分钟判死」会把这条行误判成意外终止（红光 + 失败音），
- * 而「等待输入/等待确认」相位也要靠它回落「思考中」（daemon 侧 ToolFinished 分支）。
- * 心跳带 `keepalive: true`：daemon 侧只续命、绝不建档（那条行必须已经由 turn/start 建好）。
+ * 心跳带 `keepalive: true`：只续命，保留等待相位且绝不建档。
+ * 等待结束由真实 tool/result / tool/call 或回合终态确认，不能从计时器推断。
  *
  * ⚠️ **闸门只认「回合是否开着」，不认「投影服务能不能读」**（2026-10-09 修）：
  * 旧实现写成 `if (!ctxRef || !ctxRef.sessionProjections || …) return;`，而属性访问在
@@ -1539,26 +1531,22 @@ function postActivity(fields) {
 }
 
 /**
- * 节流的保活心跳（tool_finished 语义：daemon 侧只刷 last_activity、相位回落
- * 思考中，不通知、不入历史、不响音效）：`session/event` 的其余事件
- * （assistant/message、step/*、tool/result、未知新增类型）在**回合开着**时
- * 算「还活着」，节流后借此给长思考 / 长子代理的静默窗口续命。
+ * 发送真实工具收尾或节流保活：tool/result 以 force=true、keepalive=false 立即发送。
+ * assistant/message、step/*、未知新增类型只证明「还活着」，在回合开着时节流续命，
+ * daemon 保留当前相位。
  *
- * `keepalive: true`：明确告诉 daemon「我只是续命，别拿我建档」。只有**已经由
+ * `keepalive: true`：明确告诉 daemon「我只是续命，别改相位或建档」。只有**已经由
  * turn/start 建好行**的会话才该收到它——见 bark-core 的同名字段说明。
  *
- * 两类事件**不发**：`user/*`（用户打字 ≠ agent 活跃）、`approval/*`
- * （审计事件会与 waterfall 的 permission_required 抢相位，把刚亮起的等待色
- * 打回思考色）。
+ * `user/*`、`approval/*` 和提问审计不上报：它们本身不能证明 agent 已恢复工作。
  */
 function postLiveness(fields) {
   const f = fields && typeof fields === "object" ? fields : {};
   const sessionId = asText(f.sessionId);
   if (!sessionId) return;
-  // 语义：保活心跳一律 keepalive=true——daemon 侧只续命、绝不建档。
-  // 建档只由回合级 activity（turn/start / tool/call）负责，幽灵行因此在协议层就不可能。
+  // 纯保活默认 true；真实 tool/result 显式传 false，允许恢复思考相位。
   const keepalive = f.keepalive !== false;
-  // 节奏：周期心跳自带节奏（force），事件驱动的保活走 15s 节流窗
+  // 节奏：周期心跳自带节奏（force），事件驱动的纯保活走 5s 节流窗
   if (f.force !== true) {
     const now = Date.now();
     const last = lastLivenessAt.get(sessionId) || 0;
@@ -1796,33 +1784,22 @@ export function apply(ctx) {
       if (type === "tool/call") {
         const busy = busyOf(session, keys);
         const toolName = asText(event.data && event.data.name);
-        // 提问会挂起等用户：记下来，好在它收尾时**无条件**补一条保活（见下方 answered）
-        if (toolName === "ask_user_question") {
-          for (const k of keys) questioned.add(k);
-        }
         trace("event.toolcall", { key: sessionId, busy, heartbeat: heartbeats.has(keys[0]), tool: toolName });
         if (!busy) return;
         postActivity({ sessionId, cwd, toolName, isSubagent: isSub, parentSessionId: parent });
         return;
       }
-      // 用户操作 / 审批审计 / 提问审计不算「agent 活跃」：前者会把静默当活跃，
-      // 后两者会把刚亮起的等待色打回思考色（见 postLiveness 的说明）
+      // 用户操作 / 审批审计 / 提问审计不能证明 agent 已恢复工作。
       if (typeof type === "string" && /(user\/|approval\/|question|plan-review)/.test(type)) return;
       // 「刚答完提问」的收尾：daemon 正停在「等待输入」上，这一条**必须立刻发出去**，
-      // 不能吃节流——否则相位要多等最长一个周期心跳（20s）才回落，用户看到的就是
-      // 「选完了还卡在等待输入、过一会儿直接蹦出完成」（2026-10-10 trace 实测：
-      // 答完那条 tool/result 被 15s 节流窗吃掉，相位一直到周期心跳才翻）。
-      const answered = keys.some((k) => questioned.has(k));
-      if (answered) {
-        for (const k of keys) questioned.delete(k);
-        trace("answered", { key: sessionId, type: asText(type) });
-      }
-      // 其余事件（step/*、tool/result、未知新增类型）只在回合开着时续命。未知类型宁可当活跃
+      // tool/result 不吃节流，并明确标为真实活动；周期心跳不能代替它解除等待。
+      const resumed = type === "tool/result";
+      // tool/result 恢复相位；step/* 和未知类型只在回合开着时续命。未知类型只证明存活
       // （向后兼容新词汇，社区 turn-tracker 同口径），⚠️ DSH 升级新增事件类型时这里无需跟着改
       const stillBusy = busyOf(session, keys);
-      trace("event.liveness", { type: asText(type), key: sessionId, busy: stillBusy, heartbeat: heartbeats.has(keys[0]), force: answered });
+      trace("event.liveness", { type: asText(type), key: sessionId, busy: stillBusy, heartbeat: heartbeats.has(keys[0]), force: resumed });
       if (!stillBusy) return;
-      postLiveness({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent, force: answered });
+      postLiveness({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent, force: resumed, keepalive: !resumed });
     } catch (error) {
       // 日志结构随版本变动，观察者绝不打断会话（开诊断时记下抛点，便于定位契约漂移）
       trace("event.error", { message: String((error && error.message) || error) });
@@ -1861,7 +1838,6 @@ export function apply(ctx) {
       lastReason.delete(k);
       lastTurnNo.delete(k);
       lastLivenessAt.delete(k);
-      questioned.delete(k);
       seenActivity.delete(k);
       turnOpen.delete(k);
       turnRan.delete(k);
@@ -2371,6 +2347,32 @@ mod tests {
         let entries = DshAdapter::read_patch(&DshAdapter::patch_file(&home)).unwrap();
         assert_eq!(entries.len(), 1, "刷新不得追加条目");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn startup_refresh_only_requests_restart_when_files_change() {
+        let home = tmp_home();
+        let context = ctx();
+        assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_some());
+        assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_none());
+
+        let plugin = DshAdapter::plugin_file(&home);
+        std::fs::write(&plugin, "// previous plugin version\n").unwrap();
+        let notice = DshAdapter::register_for_startup_at(&home, &context).unwrap().unwrap();
+        assert!(notice.contains("重启 dsh"));
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), plugin_js(context.port, &context.token));
+        assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_none());
+
+        // 接入配置被宿主清掉、插件正文未变，也需要重启才能重新挂载。
+        std::fs::remove_file(DshAdapter::patch_file(&home)).unwrap();
+        assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_some());
+        assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_none());
+
+        let changed_token = RegisterCtx { token: "new-token".into(), ..context };
+        assert!(DshAdapter::register_for_startup_at(&home, &changed_token).unwrap().is_some());
+        std::fs::write(DshAdapter::patch_file(&home), "[malformed").unwrap();
+        assert!(DshAdapter::register_for_startup_at(&home, &changed_token).is_err());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

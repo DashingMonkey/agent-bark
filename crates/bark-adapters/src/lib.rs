@@ -7,14 +7,18 @@
 pub mod antigravity;
 pub mod claude_style;
 pub mod doubaowork;
+mod doubaowork_idb;
+mod doubaowork_log;
 pub mod dsh;
 pub mod jsonio;
+mod jsonl;
 pub mod kimi_code;
 pub mod kimiwork;
 pub mod opencode;
 pub mod registry;
 pub mod traework_db;
 pub mod watch;
+mod workbuddy;
 pub mod zcode;
 
 use bark_core::{AdapterMode, AgentKind, EventKind, NormalizedEvent};
@@ -112,6 +116,12 @@ pub trait HookAdapter: Send + Sync {
 
     /// 外科手术式写入：只添加/修复自己的条目，写前备份
     fn register(&self, ctx: &RegisterCtx) -> anyhow::Result<()>;
+    /// 启动刷新接入；插件内容变化时可返回需要用户处理的提示。
+    /// 普通 hook 没有驻留在宿主内存中的代码，默认无需重启提示。
+    fn register_for_startup(&self, ctx: &RegisterCtx) -> anyhow::Result<Option<&'static str>> {
+        self.register(ctx)?;
+        Ok(None)
+    }
     /// 精确回收自己的条目（保留同组内用户自己的 hook）
     fn unregister(&self, ctx: &mut InstallCtx) -> anyhow::Result<()>;
 

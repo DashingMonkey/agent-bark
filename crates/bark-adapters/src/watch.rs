@@ -153,9 +153,9 @@ pub(crate) fn emit_lost_row(
 ///   `error`（不可恢复错误）、`pending`（等待授权/提问/暂停）、`archived`（归档）
 /// - daemon 冷启动的 `sweepStaleActiveSessions()` 会把残留 `active`/`working` 批量置
 ///   `terminated`——所以轮询侧的 `working→terminated` 恰好覆盖「WorkBuddy 进程被杀」判死
-/// - 打断（用户停止 / 等待授权 / 提问）在运行时是子状态（interrupted / waiting_permission /
-///   waiting_question），DB 侧归入 `error` / `pending` 组：
-///   `working→pending` 视为等待输入，`working→error` 视为失败
+/// - 2026-10-14 校准：手动停止也会写 completed；回合 JSONL 的 assistant incomplete
+///   + providerData.error.message="Interrupted by user" 才能区别中止，见 workbuddy.rs。
+///   等待授权/提问归 pending；runtime 崩溃仍按 terminated/error 处理。
 
 pub struct WorkBuddyWatch;
 
@@ -323,7 +323,7 @@ impl WorkBuddyWatch {
     /// asar 内 `UPDATE sessions SET status=...` 语句印证）。升版后若失效，
     /// 重新核对列：id / title / status / cwd（status/cwd NOT NULL）。
     const QUERY: &'static str =
-        "SELECT id, COALESCE(title, ''), status, COALESCE(cwd, '') FROM sessions WHERE deleted_at IS NULL";
+        "SELECT id, COALESCE(title, ''), status, COALESCE(cwd, ''), updated_at FROM sessions WHERE deleted_at IS NULL";
     const POLL_SECS: u64 = 5;
     /// 运行态心跳重发间隔（轮）：12 × 5s = 60s，远小于 daemon 侧 10 分钟判死线
     const HEARTBEAT_EVERY_ROUNDS: u64 = 12;
@@ -399,7 +399,7 @@ impl WatchAdapter for WorkBuddyWatch {
                     Ok(snap) => {
                         fail_count = 0;
                         round += 1;
-                        for (session, title, status, cwd) in snap {
+                        for (session, title, status, cwd, updated_at) in snap {
                             let prev = last.get(&session).map(|s| s.status.as_str()).unwrap_or("");
                             let suppress = prev.is_empty() && tombstone.contains_key(&session);
                             let hb = needs_heartbeat(&status, last.get(&session), round, Self::HEARTBEAT_EVERY_ROUNDS);
@@ -409,6 +409,12 @@ impl WatchAdapter for WorkBuddyWatch {
                                 emit(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title, None);
                             }
                             if let Some(ev) = run_event(prev, &status, suppress, first) {
+                                // 会话级 completed 不代表回合成功；先补齐结束原因，再进入统一状态机。
+                                let ev = if matches!(ev, EventKind::RunCompleted | EventKind::RunFailed) {
+                                    db.parent().and_then(|home| crate::workbuddy::terminal_override(
+                                        &home.join("projects"), &session, updated_at,
+                                    )).unwrap_or(ev)
+                                } else { ev };
                                 emit(&stop, &tx, kind, ev, &session, &cwd, &terminal_message(&title, &status), None);
                             }
                             let last_hb = if hb {
@@ -447,7 +453,7 @@ impl WatchAdapter for WorkBuddyWatch {
 
 /// 复制 db（及 -wal，存在才复制）到临时目录后只读查询四列
 /// (id, title, status, cwd)。返回 Err 时携带阶段摘要，由调用方做连续失败计数告警。
-fn snapshot_rows(db: &Path, query: &str) -> anyhow::Result<Vec<(String, String, String, String)>> {
+fn snapshot_rows(db: &Path, query: &str) -> anyhow::Result<Vec<(String, String, String, String, i64)>> {
     let tmp_dir = std::env::temp_dir().join(format!("agent-bark-watch-{}", uuid::Uuid::new_v4().simple()));
     let result = snapshot_rows_in(db, query, &tmp_dir);
     // 用完即删；删失败必须留痕（§2.7c，见 remove_snapshot_dir）
@@ -488,7 +494,7 @@ pub fn cleanup_stale_snapshot_dirs(tmp: &Path, min_age: Duration) {
     }
 }
 
-fn snapshot_rows_in(db: &Path, query: &str, tmp_dir: &Path) -> anyhow::Result<Vec<(String, String, String, String)>> {
+fn snapshot_rows_in(db: &Path, query: &str, tmp_dir: &Path) -> anyhow::Result<Vec<(String, String, String, String, i64)>> {
     std::fs::create_dir_all(tmp_dir).map_err(|e| anyhow::anyhow!("创建临时目录失败: {e}"))?;
     let tmp_db = tmp_dir.join("snapshot.db");
     // 先复制主库、再复制 -wal：两步之间宿主可能继续写库，故无法保证同一时点
@@ -520,6 +526,7 @@ fn snapshot_rows_in(db: &Path, query: &str, tmp_dir: &Path) -> anyhow::Result<Ve
                 row.get::<_, String>(1).unwrap_or_default(),
                 row.get::<_, String>(2).unwrap_or_default(),
                 row.get::<_, String>(3).unwrap_or_default(),
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| anyhow::anyhow!("查询失败: {e}"))?;
@@ -553,6 +560,7 @@ fn snapshot_rows_in(db: &Path, query: &str, tmp_dir: &Path) -> anyhow::Result<Ve
 ///   `tools/traework-probe.mjs`），失效时 is_available 会给出具体原因
 
 struct SeenTurn {
+    session_id: String,
     status: String,
     last_seen: u64,
 }
@@ -629,7 +637,7 @@ fn prune_turns(
             if is_turn_terminal(&t.status) {
                 dropped.push(id.clone());
             } else {
-                lost_running.push(id.clone());
+                lost_running.push(t.session_id.clone());
             }
         }
         keep
@@ -657,6 +665,11 @@ fn prune_turns(
         }
     }
     tombstone.retain(|_, at| round.saturating_sub(*at) < TOMBSTONE_TTL_ROUNDS);
+    // 终态事件按 session 收场；同一 session 仍有未过期的运行回合时，不能因旧回合
+    // 被删就把新任务一并中止。多个消失回合也只需收场一次。
+    lost_running.retain(|sid| !last.values().any(|t| t.session_id == *sid && !is_turn_terminal(&t.status)));
+    lost_running.sort();
+    lost_running.dedup();
     lost_running
 }
 
@@ -864,7 +877,7 @@ impl WatchAdapter for TraeWorkWatch {
                                     None,
                                 );
                             }
-                            turns.insert(turn_id.clone(), SeenTurn { status: status.clone(), last_seen: round });
+                            turns.insert(turn_id.clone(), SeenTurn { session_id: sid.clone(), status: status.clone(), last_seen: round });
                         }
 
                         // 3) 回合行持续消失（会话被删）时主动闭环运行中条目：
@@ -1123,14 +1136,26 @@ mod tests {
     fn trae_work_prune_reports_lost_open_turns_and_tombstones_terminal() {
         let mut last: HashMap<String, SeenTurn> = HashMap::new();
         let mut tombstone: HashMap<String, u64> = HashMap::new();
-        last.insert("done".into(), SeenTurn { status: "completed".into(), last_seen: 1 });
-        last.insert("open".into(), SeenTurn { status: "running".into(), last_seen: 1 });
+        last.insert("done".into(), SeenTurn { session_id: "done-session".into(), status: "completed".into(), last_seen: 1 });
+        last.insert("open".into(), SeenTurn { session_id: "open-session".into(), status: "running".into(), last_seen: 1 });
 
         assert!(prune_turns(&mut last, &mut tombstone, 1 + MISSING_KEEP_ROUNDS - 1).is_empty());
         let lost = prune_turns(&mut last, &mut tombstone, 1 + MISSING_KEEP_ROUNDS);
         assert!(last.is_empty(), "消失的行不应继续占用内存");
-        assert_eq!(lost, vec!["open".to_string()], "运行中回合的行消失（会话被删）应上报闭环");
+        assert_eq!(lost, vec!["open-session".to_string()], "运行中回合的行消失（会话被删）应上报闭环");
         assert!(tombstone.contains_key("done"), "终态条目进 tombstone 防撕裂快照重现时重复通知");
+    }
+
+    #[test]
+    fn trae_work_prune_does_not_abort_a_new_turn_in_the_same_session() {
+        let round = 1 + MISSING_KEEP_ROUNDS;
+        let mut last = HashMap::from([
+            ("old".into(), SeenTurn { session_id: "s".into(), status: "running".into(), last_seen: 1 }),
+            ("new".into(), SeenTurn { session_id: "s".into(), status: "running".into(), last_seen: round }),
+        ]);
+        let mut tombstone = HashMap::new();
+        assert!(prune_turns(&mut last, &mut tombstone, round).is_empty());
+        assert!(last.contains_key("new"));
     }
 
     // ---- §1.12 / §2.7 回归 --------------------------------------------------

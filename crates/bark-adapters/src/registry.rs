@@ -26,7 +26,6 @@ pub fn hook_adapters() -> Vec<Box<dyn HookAdapter>> {
         Box::new(claude_style::grok()),
         Box::new(claude_style::cursor()),
         Box::new(claude_style::copilot_cli()),
-        Box::new(claude_style::windsurf()),
         Box::new(antigravity::antigravity()),
         Box::new(kimi_code::kimi_code()),
         Box::new(ZcodeAdapter::new()),

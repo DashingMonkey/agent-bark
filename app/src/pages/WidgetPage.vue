@@ -27,13 +27,12 @@ async function load() {
 
 /**
  * 只落盘，结果用右下角 toast 反馈（与设置页 persist 同一套约定）。
- * save_config 只信我们改的 enabled / auto_hide，widget.x/y/pinned
- * 后端会从当前配置回填——拖动位置 / 右键固定不会被这里的整份保存覆盖。
+ * 只提交刚改的字段；位置、固定状态和其他开关由后端保留当前值。
  */
-async function persist(): Promise<boolean> {
+async function persist(key: "enabled" | "auto_hide"): Promise<boolean> {
   if (!config.value) return false;
   try {
-    await api.saveConfig(config.value);
+    await api.saveConfig({ widget: { [key]: config.value.widget[key] } });
     return true;
   } catch (e) {
     toast(`保存失败：${e}`, "error");
@@ -46,7 +45,7 @@ async function toggle(key: "enabled" | "auto_hide", on: boolean) {
   if (!config.value) return;
   const before = config.value.widget[key];
   config.value.widget[key] = on;
-  if (!(await persist())) {
+  if (!(await persist(key))) {
     config.value.widget[key] = before;
   }
 }

@@ -212,8 +212,8 @@ pub fn write_doc(path: &Path, doc: &Value) -> anyhow::Result<()> {
     write_text_atomic(path, &text)
 }
 
-/// 把路径渲染成「在 cmd / PowerShell / Git Bash 下都能解析」的形式：
-/// 正斜杠 + 双引号。反斜杠路径会被 Git Bash 吞掉（Qoder 系在 Windows 走 bash）。
+/// 正斜杠 + 双引号路径。反斜杠会被 Git Bash 吞掉（Qoder 系在 Windows 走 bash）。
+/// PowerShell 把引号路径当字符串，执行它时调用方还需添加 &。
 pub fn shell_path(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     format!("\"{s}\"")
@@ -237,14 +237,31 @@ pub(crate) const KNOWN_EXE_NAMES: &[&str] = &[
     "agent-bark",
 ];
 
-/// 取 shell 命令的第一个 token：支持双引号包裹的带空格路径。
+/// 取可执行路径：兼容历史双引号命令和 PowerShell 的 & 'path' 调用。
 /// `pub(crate)`：kimi_code 的 TOML 条目（无 JSON Value 外壳）复用同一判定。
-pub(crate) fn first_token(command: &str) -> &str {
-    let s = command.trim_start();
+pub(crate) fn first_token(command: &str) -> std::borrow::Cow<'_, str> {
+    let mut s = command.trim_start();
+    if let Some(rest) = s.strip_prefix('&') {
+        if rest.starts_with(char::is_whitespace) || rest.starts_with(['\'', '"']) {
+            s = rest.trim_start();
+        }
+    }
     if let Some(rest) = s.strip_prefix('"') {
-        rest.split('"').next().unwrap_or("")
+        rest.split('"').next().unwrap_or("").into()
+    } else if let Some(rest) = s.strip_prefix('\'') {
+        let mut chars = rest.char_indices().peekable();
+        while let Some((i, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, c)| *c == '\'') {
+                    chars.next();
+                } else {
+                    return rest[..i].replace("''", "'").into();
+                }
+            }
+        }
+        "".into()
     } else {
-        s.split_whitespace().next().unwrap_or("")
+        s.split_whitespace().next().unwrap_or("").into()
     }
 }
 
@@ -261,7 +278,7 @@ pub fn is_our_entry(entry: &Value) -> bool {
         .and_then(|c| c.as_str())
         .is_some_and(|c| {
             let exe = first_token(c);
-            let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+            let name = exe.rsplit(['/', '\\']).next().unwrap_or(&exe);
             KNOWN_EXE_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         })
 }
@@ -276,7 +293,7 @@ pub fn command_exe_matches(command: &str, exe_path: &str) -> bool {
     if exe.is_empty() {
         return false;
     }
-    norm(exe) == norm(exe_path)
+    norm(&exe) == norm(exe_path)
 }
 
 /// 一组 hook 里是否含 agent-bark 条目
@@ -298,6 +315,21 @@ pub fn group_has_foreign(group: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_call_operator_keeps_precise_hook_ownership() {
+        let command = "& 'D:/Dev O''Brien/$tools/AgentBark.exe' hook --agent trae-code --event Stop";
+        assert!(is_our_entry(&json!({"command":command})));
+        assert!(command_exe_matches(command, "D:/Dev O'Brien/$tools/AgentBark.exe"));
+        for foreign in [
+            "& 'D:/agent-bark-notes/script.ps1' hook",
+            "& 'D:/AgentBark.exe.old' hook",
+            "echo '& D:/AgentBark.exe'",
+            "& 'D:/unterminated/AgentBark.exe",
+        ] {
+            assert!(!is_our_entry(&json!({"command":foreign})), "{foreign}");
+        }
+    }
 
     fn tmp_path(name: &str) -> PathBuf {
         std::env::temp_dir()

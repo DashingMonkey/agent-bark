@@ -114,7 +114,7 @@ pub struct AppState {
     pub config: RwLock<BarkConfig>,
     pub config_path: std::path::PathBuf,
     /// 配置写入的**单写者**语义（§2.1）：所有「读-改-写盘-换内存」的配置保存路径
-    /// （save_config 的整份覆盖、save_widget_position / set_widget_pinned /
+    /// （save_config 的分区合并、save_widget_position / set_widget_pinned /
     /// close_widget 的单字段写）全程持它，保证两个并发保存不会交错成
     /// 「旧快照后落盘」的丢更新。锁序恒为 config_write → config(RwLock)，
     /// 且**在 sync_watchers / glow::sync / widget::sync 等副作用之前释放**——
@@ -122,9 +122,9 @@ pub struct AppState {
     pub config_write: Mutex<()>,
     /// 配置文件损坏时的错误，UI 直接展示（不要静默用默认值顶替）
     pub config_error: Mutex<Option<String>>,
-    /// 启动自检产生的问题（接入自愈失败 / 因配置损坏被置为未启用），UI 以横幅展示。
-    /// 带 agent id：用户修好并重新开启该 agent 后可以精确清掉（见 clear_startup_warnings），
-    /// 否则横幅会一直挂到下次重启，看起来像「修复没生效」。
+    /// 启动自检的故障与操作提醒，UI 分开展示。
+    /// 带 agent id，切换接入后可精确清除（见 clear_startup_warnings）；
+    /// 信息提醒还允许用户在前端确认隐藏，故障警告保留到处理或应用重启。
     pub startup_warnings: Mutex<Vec<StartupWarning>>,
     /// 事件服务器启动失败（端口被占等）的错误，UI 经 diagnostics 展示
     pub server_error: Mutex<Option<String>>,
@@ -278,12 +278,14 @@ impl RecentIds {
     }
 }
 
-/// 启动自检的一条告警：`agent` 是 kind_id（用于用户处理后精确清除），
+/// 启动自检的一条故障或信息提示：`agent` 是 kind_id（用于用户处理后精确清除），
 /// `message` 是给用户看的整句文案（UI 直接展示）。
 #[derive(Debug, Clone)]
 pub struct StartupWarning {
     pub agent: String,
     pub message: String,
+    /// 已成功完成更新后的操作提醒，不表示接入故障。
+    pub informational: bool,
 }
 
 /// 聚合窗内的一条待发通知。
@@ -377,7 +379,7 @@ impl AppState {
         lock(&self.server_error).clone()
     }
 
-    /// 记录启动自检的告警（空列表 = 一切正常）
+    /// 记录启动自检的故障与操作提醒（空列表 = 无待展示信息）
     pub fn set_startup_warnings(&self, warnings: Vec<StartupWarning>) {
         *lock(&self.startup_warnings) = warnings;
     }
@@ -386,6 +388,15 @@ impl AppState {
     pub fn startup_warnings(&self) -> Vec<String> {
         lock(&self.startup_warnings)
             .iter()
+            .filter(|w| !w.informational)
+            .map(|w| w.message.clone())
+            .collect()
+    }
+
+    pub fn startup_notices(&self) -> Vec<String> {
+        lock(&self.startup_warnings)
+            .iter()
+            .filter(|w| w.informational)
             .map(|w| w.message.clone())
             .collect()
     }
@@ -956,6 +967,7 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
                 tracing::warn!(agent = %id, path = %path.display(), "配置无法解析，跳过对齐（保留开关）");
                 warnings.push(StartupWarning {
                     agent: id.clone(),
+                    informational: false,
                     message: format!(
                         "「{}」的配置无法解析（{}：{}），本次未对齐、接入开关保持原样；修好该文件后在 Agents 页点一下开关即可重写",
                         adapter.display_name(),
@@ -964,10 +976,15 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
                     ),
                 });
             }
-            report => match adapter.register(&register_ctx) {
-                Ok(()) => {
+            report => match adapter.register_for_startup(&register_ctx) {
+                Ok(notice) => {
+                    if let Some(message) = notice {
+                        warnings.push(StartupWarning {
+                            agent: id.clone(), message: message.to_string(), informational: true,
+                        });
+                    }
                     if matches!(&report, VerifyReport::Ok) {
-                        tracing::debug!(agent = %id, "启动对齐：接入已刷新（内容无变化）");
+                        tracing::debug!(agent = %id, "启动对齐：接入已刷新");
                     } else {
                         tracing::info!(agent = %id, report = ?report, "启动对齐：接入已就地修复");
                     }
@@ -976,6 +993,7 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
                     tracing::warn!(agent = %id, "启动对齐：接入重写失败：{e:#}");
                     warnings.push(StartupWarning {
                         agent: id.clone(),
+                        informational: false,
                         message: format!(
                             "「{}」的接入已失效且自动重写失败：{e:#}；可在 Agents 页手动重新开启",
                             adapter.display_name()
@@ -1174,9 +1192,10 @@ pub fn sweep_stale_sessions(state: &Arc<AppState>, app: &AppHandle) {
 /// 终态（RunCompleted/RunFailed/RunAborted）移除条目；SessionStart 不建条目（会话建立≠在跑）。
 /// 工具失败（ToolFailed）当心跳：会话留在表里、相位回落 Thinking（工具级失败，
 /// agent 会自行重试——它不是终态）。
-/// 工具收尾（ToolFinished）同款当心跳：相位回落 Thinking。它是**等待状态解除的
+/// 真实工具收尾（ToolFinished 且非 keepalive）令相位回落 Thinking。它是**等待状态解除的
 /// 第一信号**——答完提问 / 批完权限之后到下一个工具开始之间的唯一事件，
 /// 没有它「等待输入/等待确认」会一直卡到下一个 PreToolUse（实测 ZCode）。
+/// keepalive 只更新时间与血缘信息，不改变相位。
 ///
 /// 打断（PermissionRequired/InputRequired）分两种情形：
 /// - 会话有条目 → 回合进行中被打断，置 Waiting 相位；
@@ -1215,6 +1234,15 @@ fn apply_session_event_inner(
     };
     if stale {
         return delta;
+    }
+    // 日志轮询与 hook 投递并行：排队期间可能已经开始下一回合。
+    // 必须持会话锁再次比较原始日志时间，旧中止和无活跃会话的残留都不能驱动流光。
+    if ev.agent == "trae-code" && ev.id.starts_with(crate::trae_abort_watch::EVENT_PREFIX) {
+        let key = session_key(&ev.agent, &ev.session_id);
+        if sessions.get(&key).is_none_or(|s| ev.timestamp < s.last_activity) {
+            delta.suppressed_echo = true;
+            return delta;
+        }
     }
     let pruned = prune_stale(sessions, ev.timestamp);
     delta.changed = pruned.changed;
@@ -1374,7 +1402,9 @@ fn apply_session_event_inner(
             // run_pipeline），音效也不响（sound_key_for 落在通配臂）。
             match sessions.get_mut(&key) {
                 Some(s) => {
-                    s.phase = SessionPhase::Thinking;
+                    if !ev.keepalive {
+                        s.phase = SessionPhase::Thinking;
+                    }
                     s.last_activity = ev.timestamp;
                     // 血缘回填：DSH 的保活心跳走的正是 ToolFinished（见 backfill_lineage）
                     if backfill_lineage(s, ev) {
@@ -1707,6 +1737,31 @@ mod tests {
     }
 
     #[test]
+    fn trae_log_abort_clears_only_the_matching_current_turn() {
+        let (mut sessions, mut finished) = table();
+        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, None, "prompt"));
+        let mut other = ev(EventKind::Activity, 1000, None, "other");
+        other.session_id = "s2".into();
+        apply_session_event(&mut sessions, &mut finished, &other);
+        let mut abort = ev(EventKind::RunAborted, 2000, None, "");
+        abort.id = format!("{}s1:2000", crate::trae_abort_watch::EVENT_PREFIX);
+        let delta = apply_session_event(&mut sessions, &mut finished, &abort);
+        assert!(delta.changed);
+        assert!(!sessions.contains_key("trae-code|s1"));
+        assert!(sessions.contains_key("trae-code|s2"));
+        assert!(apply_session_event(&mut sessions, &mut finished, &abort).suppressed_echo);
+
+        // 同一会话立即重开：旧日志已在队列里也不能清掉新回合。
+        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 3000, None, "next"));
+        assert!(apply_session_event(&mut sessions, &mut finished, &abort).suppressed_echo);
+        assert!(sessions.contains_key("trae-code|s1"));
+        abort.timestamp = 4000;
+        abort.id = format!("{}s1:4000", crate::trae_abort_watch::EVENT_PREFIX);
+        assert!(apply_session_event(&mut sessions, &mut finished, &abort).changed);
+        assert!(!sessions.contains_key("trae-code|s1"));
+    }
+
+    #[test]
     fn sound_key_follows_event_roles() {
         let mut e = ev(EventKind::RunCompleted, 1000, None, "");
         assert_eq!(sound_key_for(&e, false), Some("completed"));
@@ -1952,35 +2007,23 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_heartbeat_clears_waiting_phase() {
-        // 2026-10-10 生产 trace 实测（DSH）：用户答完 `ask_user_question` 之后，daemon 停在
-        // `WaitingInput` 上，**唯一**能把它打回「思考中」的就是插件那条保活心跳
-        // （`tool_finished` + `keepalive:true`）——因为回答落在同一个回合里，没有新的
-        // `turn/start`、也没有工具调用。这条路径一旦失效，用户看到的就是「选完了还卡在
-        // 等待输入，过一会儿直接蹦出已完成」（实际事故是那条心跳被插件的节流窗吃掉，
-        // 见 dsh.rs 的 LIVENESS_MIN_MS / questioned）。
-        // 这里把「保活心跳必须解除等待相位」钉在 daemon 侧，别再靠插件侧的行为假设。
-        let (mut sessions, mut finished) = table();
-        apply_session_event(
-            &mut sessions,
-            &mut finished,
-            &ev(EventKind::Activity, 1000, Some("ask_user_question"), ""),
-        );
-        apply_session_event(
-            &mut sessions,
-            &mut finished,
-            &ev(EventKind::InputRequired, 2000, None, "选择清理范围：第一轮清理执行哪些?"),
-        );
-        assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::WaitingInput);
-
-        // 保活心跳（不带工具名、keepalive=true）：相位必须回落，且算一次真实跃迁（要推快照）
-        let mut beat = ev(EventKind::ToolFinished, 3000, None, "");
-        beat.keepalive = true;
-        let d = apply_session_event(&mut sessions, &mut finished, &beat);
-        assert!(d.changed && d.phase_changed, "保活心跳必须把等待相位打回思考中");
-        assert!(d.urgent, "相位跃迁必须立即推快照（否则悬浮窗要等下一次推送才翻色）");
-        assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::Thinking);
-        assert_eq!(sessions["trae-code|s1"].last_activity, 3000, "同时续命");
+    fn keepalive_preserves_waiting_until_real_tool_result() {
+        for (event, phase) in [
+            (EventKind::InputRequired, SessionPhase::WaitingInput),
+            (EventKind::PermissionRequired, SessionPhase::WaitingPermission),
+        ] {
+            let (mut sessions, mut finished) = table();
+            apply_session_event(&mut sessions, &mut finished, &ev(event, 2000, None, "wait"));
+            let mut beat = ev(EventKind::ToolFinished, 3000, None, "");
+            beat.keepalive = true;
+            let d = apply_session_event(&mut sessions, &mut finished, &beat);
+            assert!(!d.phase_changed);
+            assert_eq!(sessions["trae-code|s1"].phase, phase);
+            assert_eq!(sessions["trae-code|s1"].last_activity, 3000);
+            let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::ToolFinished, 4000, None, ""));
+            assert!(d.phase_changed && d.urgent);
+            assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::Thinking);
+        }
     }
 
     #[test]
@@ -2408,10 +2451,12 @@ mod tests {
     fn startup_warnings_are_cleared_per_agent() {
         let state = AppState::new(BarkConfig::default(), std::path::PathBuf::from("config.json"));
         state.set_startup_warnings(vec![
-            StartupWarning { agent: "qoder".into(), message: "qoder 告警".into() },
-            StartupWarning { agent: "dsh".into(), message: "dsh 告警".into() },
+            StartupWarning { agent: "qoder".into(), message: "qoder 告警".into(), informational: false },
+            StartupWarning { agent: "dsh".into(), message: "dsh 告警".into(), informational: false },
+            StartupWarning { agent: "dsh".into(), message: "重启 dsh 提醒".into(), informational: true },
         ]);
         assert_eq!(state.startup_warnings(), vec!["qoder 告警", "dsh 告警"]);
+        assert_eq!(state.startup_notices(), vec!["重启 dsh 提醒"]);
 
         // 用户处理了 qoder：只清它那条，别的 agent 的告警不该被顺手抹掉
         state.clear_startup_warnings("qoder");
@@ -2420,6 +2465,10 @@ mod tests {
         state.clear_startup_warnings("qoder");
         state.clear_startup_warnings("nope");
         assert_eq!(state.startup_warnings(), vec!["dsh 告警"]);
+        assert_eq!(state.startup_notices(), vec!["重启 dsh 提醒"]);
+        state.clear_startup_warnings("dsh");
+        assert!(state.startup_warnings().is_empty());
+        assert!(state.startup_notices().is_empty());
     }
 
     #[test]

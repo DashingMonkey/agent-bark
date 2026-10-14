@@ -550,6 +550,15 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 
 .hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
 /* 提示框不再自带 margin-top，间距一律由 .mt-* 工具类显式给出 */
+.info-box {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  user-select: text;
+}
 .warn-box {
   background: color-mix(in srgb, var(--warn) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);

@@ -22,7 +22,6 @@
 | Grok CLI（Grok Build） | [Hook](doc/agent-integration.md#14-grok-cligrok-build) |
 | Cursor | [Hook](doc/agent-integration.md#15-cursor) |
 | Copilot CLI | [Hook](doc/agent-integration.md#16-copilot-cli) |
-| Windsurf | [Hook](doc/agent-integration.md#17-windsurf) |
 | Antigravity | [Hook](doc/agent-integration.md#18-antigravity) |
 | Kimi Code | [Hook](doc/agent-integration.md#19-kimi-code) |
 | Kimi Work | [Watch](doc/agent-integration.md#20-kimi-work监控型--非官方) |
@@ -50,6 +49,19 @@ build.bat
 ```
 
 产物为 NSIS 安装器，位于 `target\release\bundle\nsis\`。
+
+构建脚本会先运行前端类型检查、页面保存回归测试、解密探针测试和 Rust 全量测试（含生成插件的模拟测试），任一步失败即停止打包。首次运行会额外编译测试目标，后续可复用编译缓存。
+
+单独运行检查（从仓库根目录）：
+
+```powershell
+cargo test --workspace --all-targets
+pnpm --dir app typecheck
+pnpm --dir app test
+pnpm --dir app test:tools
+```
+
+升级后如果 Agents 页提示 DeepSeek Harness 插件已更新，请重启正在运行的 dsh。磁盘插件更新不会替换其内存中的旧代码；旧插件与新 daemon 混用时，回答提问后可能仍显示等待，直到后续真实活动或回合结束。
 
 手动构建 / 开发模式：
 

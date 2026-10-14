@@ -40,7 +40,7 @@ async function save() {
   if (!config.value) return;
   saving.value = true;
   try {
-    await api.saveConfig(config.value);
+    await api.saveConfig({ channels: config.value.channels });
     savedSnapshot.value = JSON.stringify(config.value.channels); // 基线跟上，「未保存」提示消失
     toast("已保存");
   } catch (e) {

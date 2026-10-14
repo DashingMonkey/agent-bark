@@ -1,4 +1,5 @@
 mod abort_watch;
+mod trae_abort_watch;
 mod commands;
 mod glow;
 mod state;
@@ -133,29 +134,37 @@ pub fn run() {
             // 中途崩溃则残留 draining 文件被下次 drain 重复回放，重复事件由 id 去重吞掉。
             let drained = bark_cli::drain_pending();
             let mut overflow_at = None;
-            for (i, ev) in drained.iter().enumerate() {
+            for (i, ev) in drained.events.iter().enumerate() {
                 if tx.try_send(ev.clone()).is_err() {
                     overflow_at = Some(i);
                     break;
                 }
             }
+            let mut can_ack = true;
             if let Some(i) = overflow_at {
-                tracing::warn!("补投通道已满，{} 条事件写回 pending.jsonl 等待下次启动", drained.len() - i);
-                bark_cli::requeue_pending(&drained[i..]);
+                tracing::warn!("补投通道已满，{} 条事件写回 pending.jsonl 等待下次启动", drained.events.len() - i);
+                if let Err(e) = bark_cli::requeue_pending(&drained.events[i..]) {
+                    tracing::warn!("补投写回失败，保留原始文件供下次重试: {e}");
+                    can_ack = false;
+                }
             }
-            // 无论全部投递成功还是部分 requeue（requeue 已把剩余事件写回 pending.jsonl），
-            // 本轮消费到此全部处置完毕，确认删除 draining 文件
-            bark_cli::ack_drained();
+            // 全部入队或剩余事件成功写回后，只确认本批次读取成功的文件。
+            if can_ack {
+                bark_cli::ack_drained(drained);
+            }
 
             // 启动对齐：已开启的接入一律刷新一遍（并自愈被冲掉/漂移的 hook 与插件），
             // 这样「升级应用 → 重启应用」就能把新版的生成产物（如 DSH 插件）刷到用户机器上；
-            // 只有配置本身读不了才置为未启用，原因交给 UI 展示。
-            // 必须在 sync_watchers 之前：对齐可能改开关（写 config.json），
-            // 让监控型的启停看到的是最终配置。
+            // 配置读不了时保留接入开关，原因交给 UI 展示。
+            // 完成 hook 对齐后，再启动监控型适配器。
             let warnings = state::sync_hook_integrations(&state);
             if !warnings.is_empty() {
                 for w in &warnings {
-                    tracing::warn!("启动对齐[{}]: {}", w.agent, w.message);
+                    if w.informational {
+                        tracing::info!("启动对齐[{}]: {}", w.agent, w.message);
+                    } else {
+                        tracing::warn!("启动对齐[{}]: {}", w.agent, w.message);
+                    }
                 }
             }
             state.set_startup_warnings(warnings);
@@ -164,6 +173,7 @@ pub fn run() {
             // 自己的日志拿秒级信号（中断合成 run_aborted、回合失败合成 run_failed）。
             // 必须在 sync_watchers 之前——那一步会拿走 tx 的所有权。
             abort_watch::spawn(state.clone(), tx.clone());
+            trae_abort_watch::spawn(state.clone(), tx.clone());
 
             // 监控型 adapter
             state::sync_watchers(tx, &state);

@@ -31,25 +31,19 @@ pub enum ConfigPaths {
 /// 两类宿主并存（官方文档逐字核对，见各 adapter 注释）：
 /// - **嵌套**（Claude 系）：`hooks.<Event>[] = { hooks: [entry] }`，
 ///   entry 外还包一层组，组上可带 matcher 等字段；
-/// - **扁平**（Cursor / Copilot CLI / Windsurf）：`hooks.<Event>[] = entry`，
+/// - **扁平**（Cursor / Copilot CLI）：`hooks.<Event>[] = entry`，
 ///   数组元素就是 hook 条目本身。
 #[derive(Clone, Copy)]
 pub enum HookShape {
     Nested,
-    /// `version = Some(true)` 时保证顶层有 `"version": 1` 键（Cursor / Copilot
-    /// 缺它整份 hooks 不生效）；Windsurf 无 version 键，传 `false`。
+    /// `version = true` 时保证顶层有 `"version": 1` 键（Cursor / Copilot
+    /// 缺它整份 hooks 不生效）。
     Flat { version: bool },
 }
 
 /// 标准命令条目：`{ "type": "command", "command": <cmd> }`（嵌套与 Cursor / Copilot 通用）
 fn command_entry(command: &str) -> Value {
     json!({ "type": "command", "command": command })
-}
-
-/// Windsurf 条目：`{ "command": <cmd>, "show_output": false }`（无 type 字段；
-/// show_output=false 不在 Cascade 面板里刷屏，与 AgentPet 实现一致）
-fn windsurf_entry(command: &str) -> Value {
-    json!({ "command": command, "show_output": false })
 }
 
 pub struct ClaudeStyleSpec {
@@ -86,9 +80,13 @@ impl ClaudeStyleAdapter {
 
     /// hook 命令：token/port 不入命令，由子命令从配置文件读取，
     /// 避免 token 散落在各 agent 配置文件中。
-    /// 路径用正斜杠 + 引号：cmd / PowerShell / Git Bash 都能解析。
+    /// TRAE / Codex 在 Windows 使用 PowerShell：引号内路径必须通过 & 调用。
+    /// 其它宿主保留原有命令格式，不能把 PowerShell 语法写进 Bash/cmd 配置。
     fn hook_command(&self, ctx: &RegisterCtx, event: &str) -> String {
         let exe = ctx.exe_path.replace('\\', "/");
+        if cfg!(windows) && matches!(self.spec.kind, AgentKind::TraeCode | AgentKind::Codex) {
+            return format!("& '{}' hook --agent {} --event {}", exe.replace('\'', "''"), self.spec.kind.id(), event);
+        }
         format!("\"{}\" hook --agent {} --event {}", exe, self.spec.kind.id(), event)
     }
 
@@ -127,7 +125,7 @@ fn entry_is_current(entry: &Value, ctx: &RegisterCtx) -> bool {
         .is_some_and(|c| jsonio::command_exe_matches(c, &ctx.exe_path))
 }
 
-/// 扁平形态（Cursor / Copilot CLI / Windsurf）的写入逻辑：`hooks.<Event>[]` 的
+/// 扁平形态（Cursor / Copilot CLI）的写入逻辑：`hooks.<Event>[]` 的
 /// 数组元素就是条目本身，没有组包装。语义与嵌套路径一致：优先就地更新我们的
 /// 条目（修 exe 漂移）、事件级去重（§1.9 同款）、用户条目原样保留、没有则追加。
 /// 顶层 version 键由 `register` 主流程处理（它不在 hooks 子对象里）。
@@ -236,6 +234,18 @@ impl HookAdapter for ClaudeStyleAdapter {
             .map(|(_, kind)| *kind)
     }
 
+    fn register_for_startup(&self, ctx: &RegisterCtx) -> anyhow::Result<Option<&'static str>> {
+        if !matches!(self.spec.kind, AgentKind::Codex | AgentKind::TraeCode) {
+            self.register(ctx)?;
+            return Ok(None);
+        }
+        let paths = self.config_paths_for();
+        let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).ok()).collect();
+        self.register(ctx)?;
+        let changed = paths.iter().zip(before).any(|(p, old)| std::fs::read(p).ok() != old);
+        Ok(if changed { self.spec.trust_hint } else { None })
+    }
+
     fn register(&self, ctx: &RegisterCtx) -> anyhow::Result<()> {
         let mut wrote_any = false;
         let mut last_err: Option<anyhow::Error> = None;
@@ -293,7 +303,7 @@ impl HookAdapter for ClaudeStyleAdapter {
                 continue;
             }
 
-            // 扁平宿主（Cursor / Copilot CLI / Windsurf）：`hooks.<Event>[]` 的元素
+            // 扁平宿主（Cursor / Copilot CLI）：`hooks.<Event>[]` 的元素
             // 就是条目本身，没有组包装，走独立路径——语义与嵌套一致（只增改自己的
             // 条目、用户条目原样保留、事件级去重），落盘口径也相同
             if let HookShape::Flat { .. } = self.spec.shape {
@@ -427,7 +437,7 @@ impl HookAdapter for ClaudeStyleAdapter {
                 continue;
             };
             let mut changed = false;
-            // 扁平宿主（Cursor / Copilot CLI / Windsurf）：数组元素即条目，独立清理
+            // 扁平宿主（Cursor / Copilot CLI）：数组元素即条目，独立清理
             // 路径——摘掉我们的条目，因此清空的事件键一并移除（与嵌套同口径）
             if let HookShape::Flat { .. } = self.spec.shape {
                 let event_names: Vec<String> = hooks.keys().cloned().collect();
@@ -571,7 +581,35 @@ impl HookAdapter for ClaudeStyleAdapter {
     }
 
     fn normalize(&self, event_name: &str, raw: &Value) -> Option<NormalizedEvent> {
-        let kind = self.event_kind(event_name)?;
+        // TRAE 明确用 idle_prompt 表示已完成，不能把异步的完成通知当成等待输入。
+        // 完成由 Stop 上报；忽略这条回声，也避免它晚于 daemon 宽限窗到达时重开等待态。
+        if self.spec.kind == AgentKind::TraeCode && event_name == "Notification"
+            && raw.get("notification_type").and_then(Value::as_str) == Some("idle_prompt") {
+            return None;
+        }
+        let kind = match (self.spec.kind, event_name) {
+            // Cursor 的 stop 是回合结束，不能仅凭事件名断言成功。
+            // https://cursor.com/docs/agent/hooks（2026-10-14 核对）
+            (AgentKind::Cursor, "stop") => match raw.get("status").and_then(Value::as_str) {
+                Some("aborted") => EventKind::RunAborted,
+                Some("error") => EventKind::RunFailed,
+                Some("completed") | None => EventKind::RunCompleted,
+                Some(_) => return None, // 新的未知状态不得谎报完成。
+            },
+            (AgentKind::Cursor, "sessionEnd") => match raw.get("reason").and_then(Value::as_str) {
+                Some("completed") => EventKind::RunCompleted,
+                Some("error") => EventKind::RunFailed,
+                _ => EventKind::RunAborted, // aborted / window_close / user_close：释放会话。
+            },
+            // Copilot sessionEnd 同时覆盖正常结束、取消与失败，reason 是官方枚举。
+            // https://docs.github.com/en/copilot/reference/hooks-configuration
+            (AgentKind::CopilotCli, "sessionEnd") => match raw.get("reason").and_then(Value::as_str) {
+                Some("complete") => EventKind::RunCompleted,
+                Some("error" | "timeout") => EventKind::RunFailed,
+                _ => EventKind::RunAborted, // abort / user_exit：释放会话。
+            },
+            _ => self.event_kind(event_name)?,
+        };
         // 通知类事件里显式声明「这是权限请求」时按 PermissionRequired 归一。
         // 依据 2026-09 实测：Qoder（桌面应用 v0.2.3 / IDE / CLI 三个入口一致）的
         // 「等你授权」走 Notification + notification_type="permission_prompt"
@@ -800,8 +838,8 @@ pub fn claude_code() -> ClaudeStyleAdapter {
 /// 官方事件表就这 6 个（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse /
 /// Stop / Notification），**没有 SessionEnd，也没有任何中断事件**；Stop 只在
 /// 「智能体完成输出、准备结束当前查询时」触发。所以中断的回合收不到任何事件，
-/// 只能等下一条事件（继续对话的 UserPromptSubmit 会刷新会话）或 10 分钟判死——
-/// 这是官方事件表的能力边界，不是遗漏；若后续版本加了 SessionEnd 再补映射。
+/// GUI 通过 renderer.log 的 DoneHandler canceled 记录补充 RunAborted；
+/// 日志不可用时仍退回 10 分钟判死，不注册宿主不支持的事件。
 pub fn trae_code() -> ClaudeStyleAdapter {
     const MAP: &[(&str, EventKind)] = &[
         ("SessionStart", EventKind::SessionStart),
@@ -827,7 +865,7 @@ pub fn trae_code() -> ClaudeStyleAdapter {
         }),
         event_map: MAP,
         // TraeCode 需在 IDE 设置 > Hooks 中确认外部修改已启用（无程序化绕过）
-        trust_hint: Some("TraeCode 首次使用需在 设置 > Hooks 中确认配置已启用（安全警示面板点击启用）"),
+        trust_hint: Some("TRAE（原 TraeCode）接入后，请在 设置 > Hooks 启用全局配置，并将「运行方式」从默认的「沙箱运行」改为「本地自动运行」，否则无法生效；执行失败可在同页查看 Agent Hooks 日志"),
         shape: HookShape::Nested,
         entry: command_entry,
         create_parent_dir: false,
@@ -957,25 +995,21 @@ pub fn qoder() -> ClaudeStyleAdapter {
     })
 }
 
-/// Codex：~/.codex/hooks.json
-/// 已确认的事件只有 SessionStart / Stop / PermissionRequest；写入后需在 /hooks 里信任。
-///
-/// **手动中止无信号**（2026-09 核对官方与社区资料）：Codex 的 hooks 仍是 beta，
-/// 事件表只有 `SessionStart` / `Stop` / `agent-turn-complete` 三个（另有旧的
-/// `notify` 机制），没有 SessionEnd、没有带结束原因的载荷、也没有中断事件；
-/// 社区还报过 hooks 在交互式会话里不触发的问题（openai/codex#17532）。
-/// 中断的回合同样只能靠下一条事件或判死；官方补事件后再接。
+/// Codex：~/.codex/hooks.json。
+/// 事件与信任契约按 2026-10-14 官方文档核对：https://learn.chatgpt.com/docs/hooks
+/// UserPromptSubmit / PreToolUse 提供运行态；PostToolUse 解除工具/审批等待；
+/// Stop 表示回合完成，Interrupt / SessionEnd 释放中断或结束的主会话。
+/// agent-turn-complete 属于旧 notify 协议，不是 hooks.json 的事件名。
+/// 新增或修改钩子后必须由用户在 /hooks 重新审阅信任（不能沿用旧定义的 hash）。
 pub fn codex() -> ClaudeStyleAdapter {
-    // TODO（探针待钉死，审查 §2.13 / 待确认 #1）：Codex 真实回调究竟是 `Stop` 还是
-    // `agent-turn-complete` 尚未实机确认——上面的注释自述真实事件表是
-    // SessionStart / Stop / agent-turn-complete，而社区反馈 hooks 在交互式会话里
-    // 可能不触发（openai/codex#17532）。若真实回调是 `agent-turn-complete`，这里
-    // 注册的 Stop 永远收不到、回合只能挂到 10 分钟判死。按「待确认不改行为」处理：
-    // 本 MAP 暂不动，用 doc/agent-integration.md §13 的探针验证法拿到实机样本后
-    // 钉死这张表（届时再决定是否把 Stop 换成/加上 agent-turn-complete）。
     const MAP: &[(&str, EventKind)] = &[
         ("SessionStart", EventKind::SessionStart),
+        ("UserPromptSubmit", EventKind::Activity),
+        ("PreToolUse", EventKind::Activity),
+        ("PostToolUse", EventKind::ToolFinished),
         ("Stop", EventKind::RunCompleted),
+        ("Interrupt", EventKind::RunAborted),
+        ("SessionEnd", EventKind::RunAborted),
         ("PermissionRequest", EventKind::PermissionRequired),
     ];
     ClaudeStyleAdapter::new(ClaudeStyleSpec {
@@ -983,7 +1017,7 @@ pub fn codex() -> ClaudeStyleAdapter {
         install_markers: vec![dirs::home_dir().unwrap_or_default().join(".codex")],
         config_paths: ConfigPaths::FromHome(|env| vec![home(env).join(".codex").join("hooks.json")]),
         event_map: MAP,
-        trust_hint: Some("Codex 首次注册后需在会话内运行 /hooks 完成信任确认"),
+        trust_hint: Some("Codex 首次接入或钩子更新后，需在 CLI 的 /hooks 中审阅并信任新增或变更的钩子；未信任的钩子不会执行"),
         shape: HookShape::Nested,
         entry: command_entry,
         create_parent_dir: false,
@@ -1148,8 +1182,8 @@ pub fn grok() -> ClaudeStyleAdapter {
 /// 官方 18 个 agent 事件里取子集（**未实测**）：
 /// - `beforeSubmitPrompt` → Activity（回合开始）；`preToolUse` → Activity。
 /// - `postToolUse` → ToolFinished（等待解除的唯一信号，§1.11）。
-/// - `stop` → RunCompleted；`sessionEnd` → RunAborted（会话级释放，
-///   stop 后紧跟的 sessionEnd 由终态回声抑制吞掉）。
+/// - `stop` 按 status 区分 completed / aborted / error；`sessionEnd` 按 reason
+///   区分 completed / error / aborted 或窗口关闭，后续终态回声由状态机抑制。
 /// - 没注册：sessionStart（空操作）、subagentStart / subagentStop（子代理噪音）、
 ///   beforeShellExecution 等细分事件（preToolUse 已覆盖，多注册只多空转进程）。
 /// - payload 用 `conversation_id` + `workspace_roots`（数组），由 from_raw 别名兜底。
@@ -1187,7 +1221,7 @@ pub fn cursor() -> ClaudeStyleAdapter {
 /// - `userPromptSubmitted` → Activity；`postToolUse` → ToolFinished；
 ///   `postToolUseFailure` → ToolFailed。
 /// - `notification` → InputRequired；`permissionRequest` → PermissionRequired。
-/// - `agentStop` → RunCompleted；`sessionEnd` → RunAborted（会话级释放）。
+/// - `agentStop` → RunCompleted；`sessionEnd` 按 reason 区分 complete、error/timeout、abort/user_exit。
 /// - **故意不注册 preToolUse**：Copilot 的 command hook 是 fail-closed（hook 出错
 ///   会阻塞用户工具），少一个高风险挂载点（AgentPet 同样省略，注释同因）；
 ///   本子命令虽恒退出 0，但纵深防御。camelCase 事件的 payload 是 camelCase
@@ -1213,39 +1247,6 @@ pub fn copilot_cli() -> ClaudeStyleAdapter {
         shape: HookShape::Flat { version: true },
         entry: command_entry,
         create_parent_dir: true,
-    })
-}
-
-/// Windsurf：~/.codeium/windsurf/hooks.json（扁平结构，**无** version 键，
-/// 官方文档 docs.windsurf.com/windsurf/cascade/hooks，12 个事件）。
-///
-/// 只注册官方事件表里的两个会话级事件（**未实测**；AgentPet 实现一致）：
-/// - `pre_user_prompt` → Activity（回合开始）。
-/// - `post_cascade_response` / `post_cascade_response_with_transcript` →
-///   RunCompleted（Cascade 回答结束的两个变体，官方都列；同时触发时同 kind
-///   事件会被聚合窗口合并，不会双通知）。
-/// - 工具级事件（pre_write_code / pre_run_command 等）全是**阻塞型** pre-hook，
-///   不注册：运行中相位靠 pre_user_prompt 心跳 + 判死兜底足够。
-/// - **没有等待类事件**（官方无 Notification 钩子）——Windsurf 只有运行/完成两态。
-/// - payload 用 `trajectory_id` + `agent_action_name`（from_raw 别名兜底），
-///   项目目录字段缺失时通知正文不带项目名，属能力边界。
-pub fn windsurf() -> ClaudeStyleAdapter {
-    const MAP: &[(&str, EventKind)] = &[
-        ("pre_user_prompt", EventKind::Activity),
-        ("post_cascade_response", EventKind::RunCompleted),
-        ("post_cascade_response_with_transcript", EventKind::RunCompleted),
-    ];
-    ClaudeStyleAdapter::new(ClaudeStyleSpec {
-        kind: AgentKind::Windsurf,
-        install_markers: vec![dirs::home_dir().unwrap_or_default().join(".codeium/windsurf")],
-        config_paths: ConfigPaths::FromHome(|env| {
-            vec![home(env).join(".codeium").join("windsurf").join("hooks.json")]
-        }),
-        event_map: MAP,
-        trust_hint: Some("Windsurf 工作区处于受限模式（Restricted Mode）时 hooks 不会加载"),
-        shape: HookShape::Flat { version: false },
-        entry: windsurf_entry,
-        create_parent_dir: false,
     })
 }
 
@@ -1285,6 +1286,83 @@ mod tests {
         let d = std::env::temp_dir().join(format!("agent-bark-claude-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn codex_upgrade_adds_lifecycle_hooks_without_rewriting_existing_trust_definitions() {
+        let dir = tmpdir();
+        let cfg = dir.join("hooks.json");
+        let mut adapter = codex();
+        adapter.spec.config_paths = ConfigPaths::Fixed(vec![cfg.clone()]);
+        let old_stop = command_entry(&adapter.hook_command(&ctx(), "Stop"));
+        jsonio::write_doc(&cfg, &json!({"hooks":{"Stop":[{"hooks":[old_stop.clone()]}]}})).unwrap();
+        assert!(adapter.register_for_startup(&ctx()).unwrap().is_some());
+        let doc = jsonio::read_doc(&cfg).unwrap();
+        assert_eq!(doc["hooks"]["Stop"][0]["hooks"][0], old_stop);
+        for event in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Interrupt", "SessionEnd"] {
+            assert!(doc["hooks"][event].is_array(), "缺少 {event}");
+        }
+        let first = std::fs::read(&cfg).unwrap();
+        assert!(adapter.register_for_startup(&ctx()).unwrap().is_none());
+        assert_eq!(std::fs::read(&cfg).unwrap(), first);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_migration_is_idempotent_and_uninstalls_only_our_hooks() {
+        for mut adapter in [trae_code(), codex()] {
+            let dir = tmpdir();
+            let cfg = dir.join("hooks.json");
+            adapter.spec.config_paths = ConfigPaths::Fixed(vec![cfg.clone()]);
+            let foreign = json!({"type":"command", "command":"& 'D:/user-tools/run.ps1'"});
+            jsonio::write_doc(&cfg, &json!({"hooks":{"Stop":[{"hooks":[
+                command_entry(&format!("\"D:/old/AgentBark.exe\" hook --agent {} --event Stop", adapter.kind().id())), foreign.clone()
+            ]}]}})).unwrap();
+            let mut context = ctx();
+            context.exe_path = "D:/Dev O'Brien/$tools/AgentBark.exe".into();
+            assert!(adapter.register_for_startup(&context).unwrap().is_some());
+            let doc = jsonio::read_doc(&cfg).unwrap();
+            assert_eq!(doc["hooks"]["Stop"][0]["hooks"][1], foreign);
+            assert!(doc["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap().starts_with("& '"));
+            assert!(matches!(adapter.verify(&context), VerifyReport::Ok));
+            let first = std::fs::read(&cfg).unwrap();
+            assert!(adapter.register_for_startup(&context).unwrap().is_none());
+            assert_eq!(std::fs::read(&cfg).unwrap(), first);
+            adapter.unregister(&mut InstallCtx { exe_path: context.exe_path, dry_run: false, backup: false }).unwrap();
+            let doc = jsonio::read_doc(&cfg).unwrap();
+            assert_eq!(doc["hooks"]["Stop"][0]["hooks"], json!([foreign]));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_generated_commands_run_in_powershell_and_preserve_stdin_and_args() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let dir = tmpdir();
+        let special = dir.join("space $tools O'Brien & 中文");
+        std::fs::create_dir_all(&special).unwrap();
+        let probe = special.join("probe.ps1");
+        std::fs::write(&probe, "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)\n[ordered]@{argv=@($args);stdin=[Console]::In.ReadToEnd()} | ConvertTo-Json -Compress\n").unwrap();
+        let mut context = ctx();
+        context.exe_path = probe.to_string_lossy().into_owned();
+        for adapter in [trae_code(), codex()] {
+            let command = adapter.hook_command(&context, "UserPromptSubmit");
+            let mut child = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            let payload = r#"{"session_id":"probe","prompt":"test"}"#;
+            child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["stdin"], payload);
+            assert_eq!(result["argv"], json!(["hook", "--agent", adapter.kind().id(), "--event", "UserPromptSubmit"]));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn count_foreign(doc: &Value) -> usize {
@@ -1559,7 +1637,7 @@ mod tests {
             .normalize("SessionEnd", &json!({ "session_id": "s", "reason": "other" }))
             .expect("两版实测都支持 SessionEnd");
         assert_eq!(ev.kind, EventKind::RunAborted);
-        assert_eq!(ev.kind.default_title(), "已中止");
+        assert_eq!(ev.kind.default_title(), "已终止");
         assert!(!ev.kind.should_notify(), "自己按的停止不通知");
 
         // 合并后的表只留两版交集：SessionStart（空操作）与 PermissionRequest（实测不触发）不注册
@@ -1891,16 +1969,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Codex MAP 属「待确认」（§2.13）：行为不改，映射原样钉死——
-    /// 等探针拿到实机样本再决定是否换成 agent-turn-complete
     #[test]
-    fn codex_map_stays_unchanged_pending_probe() {
+    fn codex_lifecycle_matches_official_hooks_contract() {
         let adapter = codex();
-        assert_eq!(adapter.event_kind("Stop"), Some(EventKind::RunCompleted));
-        assert_eq!(adapter.event_kind("PermissionRequest"), Some(EventKind::PermissionRequired));
-        assert_eq!(adapter.event_kind("SessionStart"), Some(EventKind::SessionStart));
-        // 待确认期间不加不减：agent-turn-complete 没有实机样本，不能瞎接
-        assert_eq!(adapter.event_kind("agent-turn-complete"), None);
+        for (name, kind) in [
+            ("SessionStart", EventKind::SessionStart),
+            ("UserPromptSubmit", EventKind::Activity),
+            ("PreToolUse", EventKind::Activity),
+            ("PostToolUse", EventKind::ToolFinished),
+            ("PermissionRequest", EventKind::PermissionRequired),
+            ("Stop", EventKind::RunCompleted),
+            ("Interrupt", EventKind::RunAborted),
+            ("SessionEnd", EventKind::RunAborted),
+        ] {
+            let ev = adapter.normalize(name, &json!({
+                "session_id":"session-1", "turn_id":"turn-1", "cwd":"D:/demo",
+                "hook_event_name":name,
+            })).unwrap();
+            assert_eq!(ev.kind, kind);
+            assert_eq!(ev.session_id, "session-1");
+        }
+        let prompt = adapter.normalize("UserPromptSubmit", &json!({"session_id":"s", "prompt":"fix bug"})).unwrap();
+        assert_eq!(prompt.message, "fix bug");
+        let tool = adapter.normalize("PreToolUse", &json!({"session_id":"s", "tool_name":"Bash"})).unwrap();
+        assert_eq!(tool.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(adapter.hook_events().len(), 8);
+        assert!(adapter.normalize("agent-turn-complete", &json!({})).is_none());
+    }
+
+    #[test]
+    fn terminal_payload_distinguishes_success_cancel_and_error() {
+        for (adapter, event, field, cases) in [
+            (cursor(), "stop", "status", vec![("completed", EventKind::RunCompleted), ("aborted", EventKind::RunAborted), ("error", EventKind::RunFailed)]),
+            (cursor(), "sessionEnd", "reason", vec![("completed", EventKind::RunCompleted), ("aborted", EventKind::RunAborted), ("error", EventKind::RunFailed), ("window_close", EventKind::RunAborted), ("user_close", EventKind::RunAborted)]),
+            (copilot_cli(), "sessionEnd", "reason", vec![("complete", EventKind::RunCompleted), ("abort", EventKind::RunAborted), ("error", EventKind::RunFailed), ("timeout", EventKind::RunFailed), ("user_exit", EventKind::RunAborted)]),
+        ] {
+            for (value, expected) in cases {
+                let mut raw = json!({"session_id":"s1", "cwd":"D:/demo", "message":"ordinary reply"});
+                raw[field] = json!(value);
+                let event = adapter.normalize(event, &raw).unwrap();
+                assert_eq!(event.kind, expected, "{} {field}={value}", adapter.kind().id());
+                assert_eq!(event.session_id, "s1");
+                assert_eq!(event.kind.should_notify(), expected != EventKind::RunAborted);
+            }
+        }
+        assert!(cursor().normalize("stop", &json!({"status":"unknown"})).is_none());
+        assert_eq!(cursor().normalize("stop", &json!({"message":"aborted"})).unwrap().kind, EventKind::RunCompleted);
+        // 宿主字段不能跨协议套用：Claude Stop 的普通正文包含 aborted 不等于取消。
+        assert_eq!(claude_code().normalize("Stop", &json!({"status":"aborted"})).unwrap().kind, EventKind::RunCompleted);
+    }
+
+    #[test]
+    fn trae_notification_distinguishes_completion_from_waiting() {
+        let adapter = trae_code();
+        assert!(adapter.normalize("Notification", &json!({"notification_type":"idle_prompt"})).is_none());
+        for (notification_type, expected) in [
+            ("permission_prompt", EventKind::PermissionRequired),
+            ("ask_user_question", EventKind::InputRequired),
+            ("document_review", EventKind::InputRequired),
+            ("browser_interaction", EventKind::InputRequired),
+        ] {
+            assert_eq!(adapter.normalize("Notification", &json!({"notification_type":notification_type})).unwrap().kind, expected);
+        }
     }
 
     // ---- 2026-09 广度扩展：事件表 ⊆ 官方事件表（未知事件名有让整份 hooks
@@ -1941,12 +2071,6 @@ mod tests {
             "postToolUseFailure", "preCompact", "preToolUse", "sessionEnd", "sessionStart",
             "subagentStart", "subagentStop", "userPromptSubmitted", "userPromptTransformed",
         ];
-        const WINDSURF: [&str; 12] = [
-            "pre_read_code", "post_read_code", "pre_write_code", "post_write_code",
-            "pre_run_command", "post_run_command", "pre_mcp_tool_use", "post_mcp_tool_use",
-            "pre_user_prompt", "post_cascade_response", "post_cascade_response_with_transcript",
-            "post_setup_worktree",
-        ];
         let pairs: Vec<(ClaudeStyleAdapter, &[&str])> = vec![
             (gemini_cli(), &GEMINI),
             (qwen_code(), &QWEN),
@@ -1954,7 +2078,6 @@ mod tests {
             (grok(), &GROK),
             (cursor(), &CURSOR),
             (copilot_cli(), &COPILOT),
-            (windsurf(), &WINDSURF),
         ];
         for (adapter, official) in pairs {
             for event in adapter.hook_events() {
@@ -1969,7 +2092,7 @@ mod tests {
 
     /// 关键归一化口径钉死（防止后续重构漂移）：
     /// - Grok 的 StopCancelled 是显式用户取消 → 中止（多数宿主没有的干净信号）
-    /// - Cursor / Windsurf 没有等待类事件 → 没有 Notification 映射
+    /// - Cursor 没有等待类事件 → 没有 Notification 映射
     /// - Copilot 用官方 camelCase 事件名（agentStop，不是 Stop）
     #[test]
     fn new_agent_key_normalizations_are_wired() {
@@ -1979,8 +2102,6 @@ mod tests {
         let cursor = cursor();
         assert_eq!(cursor.event_kind("notification"), None, "Cursor 官方没有等待类钩子");
         assert_eq!(cursor.event_kind("stop"), Some(EventKind::RunCompleted));
-        let windsurf = windsurf();
-        assert_eq!(windsurf.event_kind("post_cascade_response"), Some(EventKind::RunCompleted));
         let copilot = copilot_cli();
         assert_eq!(copilot.event_kind("agentStop"), Some(EventKind::RunCompleted), "Copilot 官方事件是 agentStop");
         assert_eq!(copilot.event_kind("Stop"), None, "PascalCase 的 Stop 不是 CLI 官方事件名");
@@ -2099,30 +2220,6 @@ mod tests {
             ours[0]["command"].as_str().unwrap().contains("C:/Program Files/AgentBark"),
             "保留的就地修复为当前路径"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Windsurf：无 version 键、条目是 {command, show_output:false} 形态
-    #[test]
-    fn windsurf_flat_shape_has_no_version_and_show_output_false() {
-        let dir = tmpdir();
-        let cfg = dir.join("hooks.json");
-        let adapter = ClaudeStyleAdapter::new(ClaudeStyleSpec {
-            kind: AgentKind::Windsurf,
-            install_markers: vec![],
-            config_paths: ConfigPaths::Fixed(vec![cfg.clone()]),
-            event_map: &[("pre_user_prompt", EventKind::Activity)],
-            trust_hint: None,
-            shape: HookShape::Flat { version: false },
-            entry: windsurf_entry,
-            create_parent_dir: false,
-        });
-        adapter.register(&ctx()).unwrap();
-        let doc = jsonio::read_doc(&cfg).unwrap();
-        assert!(doc.get("version").is_none(), "Windsurf 的 hooks 文件不能带 version 键");
-        let entry = &doc["hooks"]["pre_user_prompt"][0];
-        assert_eq!(entry["show_output"], false, "show_output=false 不在 Cascade 面板刷屏");
-        assert!(entry.get("type").is_none(), "Windsurf 条目没有 type 字段");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

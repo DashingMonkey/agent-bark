@@ -21,7 +21,6 @@ import iconKimi from "./assets/agents/kimi.svg?raw";
 import iconDoubao from "./assets/agents/doubao-color.svg?raw";
 import iconCursor from "./assets/agents/cursor.svg?raw";
 import iconCopilot from "./assets/agents/copilot-color.svg?raw";
-import iconWindsurf from "./assets/agents/windsurf.svg?raw";
 import iconGrok from "./assets/agents/grok.svg?raw";
 import iconAntigravity from "./assets/agents/antigravity-color.svg?raw";
 import iconGeneric from "./assets/agents/generic.svg?raw";
@@ -45,7 +44,6 @@ const AGENT_ICONS: Record<string, string> = {
   "doubao-work": iconDoubao,
   cursor: iconCursor,
   "copilot-cli": iconCopilot,
-  windsurf: iconWindsurf,
   grok: iconGrok,
   antigravity: iconAntigravity,
 };
@@ -320,8 +318,10 @@ export interface Diagnostics {
   server_error: string | null;
   /** 配置里的端口/token 与运行中的服务器不一致 → 需重启才生效 */
   restart_required: boolean;
-  /** 启动自检发现的问题（接入自愈失败 / 因配置损坏被置为未启用） */
+  /** 启动自检发现的接入故障（自愈失败 / 配置无法解析） */
   startup_warnings: string[];
+  /** 更新成功后的操作提醒，不表示接入故障。 */
+  startup_notices: string[];
 }
 
 /** 「关于」页检查更新的结果（对应后端 update::UpdateInfo） */
@@ -527,7 +527,9 @@ export const api = {
   setAgentEnabled: (kind: string, enabled: boolean) =>
     invoke<string | null>("set_agent_enabled", { kind, enabled }),
   getConfig: () => invoke<BarkConfig>("get_config"),
-  saveConfig: (config: BarkConfig) => invoke<void>("save_config", { config }),
+  saveConfig: (config: Partial<Pick<BarkConfig, "channels" | "rules" | "notify" | "glow">> & {
+    widget?: Partial<Pick<BarkConfig["widget"], "enabled" | "auto_hide">>;
+  }) => invoke<void>("save_config", { config }),
   listEvents: (limit?: number) => invoke<NormalizedEvent[]>("list_events", { limit }),
   /// 清空后端事件历史（事件流页的「清空显示」）：不传 kind 清空全部，否则只清该类型。
   /// 必须清后端——页面重挂载会补拉历史，只删前端副本的话被清掉的事件会复活。
@@ -612,7 +614,7 @@ export const EVENT_LABELS: Record<EventKind, string> = {
   input_required: "等待输入",
   run_completed: "任务完成",
   run_failed: "任务失败",
-  run_aborted: "已中止",
+  run_aborted: "已终止",
 };
 
 /**

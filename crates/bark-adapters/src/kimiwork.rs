@@ -31,12 +31,15 @@
 //! 的（内含 Daimon 权限规则、设备元数据，随应用启动重写），写入的 `[[hooks]]`
 //! 活不过一次 Kimi Work 重启；Watch 型零写盘，不受托管重写影响。
 //!
-//! 已知边界（运行态未实测，靠判死兜底）：
+//! 已知边界（运行态未实测）：
+//! - 历史缺失终态不代表仍在运行：仅回看最近 2 分钟更新的日志；持续 10 分钟无新增
+//!   则按中止收场。纯日志监控无法区分超长静默任务与已经退出的宿主，后续新记录可恢复。
 //! - 只看 `agents/main/wire.jsonl`（主 agent）；Agent Swarm 子智能体不出事件
 //! - 协议 1.3 只有审批**解决**记录（`permission.record_approval_result`），没有
 //!   审批**请求**记录——「等待确认」相位推不出来，表现为执行工具直到审批完成
 //! - 通知正文用 `state.json` 的会话标题（content.part 是流式分片，不拼装正文）
 
+use crate::jsonl::{bootstrap_sample, read_bootstrap, split_complete_lines};
 use crate::watch::{emit, sleep_interruptible, WatchAdapter};
 use bark_core::{now_millis, truncate_chars, AgentKind, EventKind, NormalizedEvent};
 use serde_json::Value;
@@ -129,12 +132,16 @@ pub(crate) fn classify(r: &Value) -> Option<(EventKind, Option<String>, String)>
 
 /// 单会话的轮询状态
 struct SessionTracker {
-    /// wire.jsonl 已消费到的字节偏移（只推进到换行边界，保证 UTF-8 读取安全）
+    /// wire.jsonl 已读取的字节偏移（未完成的行保存在 pending）
     offset: u64,
-    /// 是否有回合在跑（turn.prompt 置位，end_turn / turn.cancel 复位）
+    /// 是否有回合在跑（真实任务活动置位，终态或长期无日志增长复位）
     running: bool,
+    /// 已收到真实终态；迟到的分片/工具结果不能重开，只接受下一条 turn.prompt。
+    finished: bool,
     /// 最近一次发事件的时间（运行态心跳节流用）
     last_emit_ms: i64,
+    /// 最后一次真实日志增长的时间，不能被合成心跳刷新。
+    last_growth_ms: i64,
     /// 最近一次回合任务文案（心跳正文的兜底）
     last_prompt: String,
     /// 跨轮不完整的尾行
@@ -142,27 +149,14 @@ struct SessionTracker {
     last_seen_round: u64,
 }
 
-/// 从一段文本里切出完整行；无换行结尾的残行存回 `pending`。
-/// 返回 (完整行列表, 完整部分消耗的字节数——即 pending 里被消费掉的字节数)。
-fn split_complete_lines(chunk: &str, pending: &mut String) -> (Vec<String>, usize) {
-    pending.push_str(chunk);
-    let split = pending.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let complete: String = pending.drain(..split).collect();
-    let lines = complete
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
-        .collect();
-    (lines, split)
-}
-
 /// 启动回看：从 wire.jsonl 尾部样本推导「是否有回合正在跑」。
-/// 返回 (要发的事件, 是否运行中)。样本里最后一个回合级信号决定状态：
-/// turn.prompt / tool.call 之后没有 end_turn / turn.cancel 就是在跑。
+/// 返回 (要发的事件, 是否运行中, 是否已有真实终态)。样本里最后一个回合级信号决定状态：
+/// turn.prompt / tool.call 后缺少终态仅表示「日志中尚未收尾」，调用方必须校验新鲜度。
 /// 首见不发历史终态（与 WorkBuddy 的 `first` 播种同口径）：
 /// 否则 daemon 启动会把全部历史完成会话重放成通知（启动风暴）。
-fn bootstrap_tail(tail: &str) -> (Vec<(EventKind, Option<String>, String)>, bool) {
+fn bootstrap_tail(tail: &str) -> (Vec<(EventKind, Option<String>, String)>, bool, bool) {
     let mut running = false;
+    let mut finished = false;
     let mut last_prompt = String::new();
     for line in tail.lines() {
         let Ok(r) = serde_json::from_str::<Value>(line.trim()) else {
@@ -172,6 +166,7 @@ fn bootstrap_tail(tail: &str) -> (Vec<(EventKind, Option<String>, String)>, bool
         match ty {
             "turn.prompt" => {
                 running = true;
+                finished = false;
                 if let Some((_, _, msg)) = classify(&r) {
                     last_prompt = msg;
                 }
@@ -179,26 +174,30 @@ fn bootstrap_tail(tail: &str) -> (Vec<(EventKind, Option<String>, String)>, bool
             "context.append_loop_event" => {
                 if let Some(e) = r.get("event") {
                     match e.get("type").and_then(|v| v.as_str()) {
-                        Some("tool.call") => running = true,
+                        Some("tool.call") if !finished => running = true,
                         // tool.result / step.end(tool_use) 只是步骤推进，
                         // 只有 end_turn 才是回合完成
                         Some("step.end")
                             if e.get("finishReason").and_then(|v| v.as_str()) == Some("end_turn") =>
                         {
-                            running = false
+                            running = false;
+                            finished = true;
                         }
                         _ => {}
                     }
                 }
             }
-            "turn.cancel" => running = false,
+            "turn.cancel" => {
+                running = false;
+                finished = true;
+            }
             _ => {}
         }
     }
     let events = running
         .then(|| vec![(EventKind::Activity, None, last_prompt)])
         .unwrap_or_default();
-    (events, running)
+    (events, running, finished)
 }
 
 /// 会话的 state.json 标题（终态通知正文用）；读不到就空着
@@ -212,9 +211,10 @@ fn session_title(session_dir: &Path) -> String {
 
 /// 轮询周期与节流常量
 const POLL_SECS: u64 = 3;
-/// 运行态无新记录时的心跳重发间隔：60s 远小于 daemon 侧 10 分钟判死线
-/// （纯思考的长回合没有 tool.call，靠它保活）
+/// 短时静默保活；只允许在真实日志增长后的有限窗口内重发。
 const HEARTBEAT_MS: i64 = 60_000;
+const BOOTSTRAP_FRESH_MS: i64 = 2 * 60_000;
+const STALL_ABORT_MS: i64 = 10 * 60_000;
 /// 首见会话时的回看窗口（字节）
 const BOOTSTRAP_TAIL: u64 = 64 * 1024;
 /// 跨轮残行缓冲上限：单条 wire 记录不应超过；超限视为异常，放弃本行
@@ -280,6 +280,7 @@ impl WatchAdapter for KimiWorkWatch {
                     &index_path,
                     &mut trackers,
                     round,
+                    now_millis(),
                 ) {
                     Ok(()) => fail_count = 0,
                     Err(e) => {
@@ -310,6 +311,7 @@ fn poll_round(
     index_path: &Path,
     trackers: &mut HashMap<String, SessionTracker>,
     round: u64,
+    now: i64,
 ) -> anyhow::Result<()> {
     // 会话 id → workDir（索引是追加写的小文件，整读无压力）
     let mut cwd_by_id: HashMap<String, String> = HashMap::new();
@@ -342,7 +344,6 @@ fn poll_round(
         }
     }
 
-    let now = now_millis();
     for (sid, wire_path) in wires {
         let session_dir = wire_path
             .parent()
@@ -350,32 +351,51 @@ fn poll_round(
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let cwd = cwd_by_id.get(&sid).cloned().unwrap_or_default();
-        let size = match std::fs::metadata(&wire_path) {
-            Ok(m) => m.len(),
+        let metadata = match std::fs::metadata(&wire_path) {
+            Ok(m) => m,
             Err(_) => continue,
         };
+        let size = metadata.len();
+        let modified_ms = metadata.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        let initial = if !trackers.contains_key(&sid) {
+            match read_bootstrap(&wire_path, size) {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    tracing::debug!("读取 Kimi Work 初始日志失败（{}）：{e}", wire_path.display());
+                    continue;
+                }
+            }
+        } else { None };
         let tracker = trackers.entry(sid.clone()).or_insert_with(|| {
-            // 首见：回看尾部判断是否正有回合在跑，偏移直接推到 EOF
-            // （历史终态不重放，避免启动风暴；运行中的会话立即点亮）
-            let (events, running) = std::fs::read_to_string(&wire_path)
-                .map(|full| {
-                    let skip = full.len().saturating_sub(BOOTSTRAP_TAIL as usize);
-                    let tail_start = full[skip..]
-                        .find('\n')
-                        .map(|p| skip + p + 1)
-                        .unwrap_or(skip);
-                    bootstrap_tail(&full[tail_start..])
-                })
-                .unwrap_or((Vec::new(), false));
+            // 首见只从新鲜日志恢复运行态：几个月前未收尾的记录不能变成当前活动。
+            // 跳过旧记录仍保留偏移，之后真实新增的任务照常处理。
+            let (full, offset) = initial.expect("新会话必须先成功读取初始快照");
+            let tail = bootstrap_sample(&full, BOOTSTRAP_TAIL as usize);
+            // 复制/触碰旧文件会刷新 mtime，wire 自带时间戳也必须是新鲜的。
+            // 缺少可识别时间戳时保守跳过，后续新增记录仍照常处理。
+            let latest = tail.lines().filter_map(|line| {
+                serde_json::from_str::<Value>(line).ok()?.get("time")?.as_i64()
+            }).max();
+            let (mut events, mut running, finished) = bootstrap_tail(tail);
+            if !modified_ms.is_some_and(|t| is_recent(t, now, BOOTSTRAP_FRESH_MS))
+                || !latest.is_some_and(|t| is_recent(t, now, BOOTSTRAP_FRESH_MS)) {
+                events.clear();
+                running = false;
+            }
             let last_emit_ms = if events.is_empty() { 0 } else { now };
+            let last_prompt = events.first().map(|(_, _, msg)| msg.clone()).unwrap_or_default();
             for (ev, tool, msg) in events {
                 emit(stop, tx, kind, ev, &sid, &cwd, &msg, tool.as_deref());
             }
             SessionTracker {
-                offset: size,
+                offset,
                 running,
+                finished,
                 last_emit_ms,
-                last_prompt: String::new(),
+                last_growth_ms: modified_ms.unwrap_or(now),
+                last_prompt,
                 pending: String::new(),
                 last_seen_round: round,
             }
@@ -390,11 +410,17 @@ fn poll_round(
         if size > tracker.offset {
             match read_increment(&wire_path, tracker.offset) {
                 Ok(chunk) => {
+                    if !chunk.is_empty() {
+                        tracker.last_growth_ms = now;
+                    }
                     let (lines, consumed) = split_complete_lines(&chunk, &mut tracker.pending);
                     for line in lines {
                         let Ok(r) = serde_json::from_str::<Value>(&line) else {
                             continue;
                         };
+                        if tracker.finished && r.get("type").and_then(|v| v.as_str()) != Some("turn.prompt") {
+                            continue;
+                        }
                         if let Some((ev, tool, msg)) = classify(&r) {
                             let msg = if ev == EventKind::RunCompleted || ev == EventKind::RunAborted {
                                 session_title(&session_dir)
@@ -407,6 +433,7 @@ fn poll_round(
                         match r.get("type").and_then(|v| v.as_str()) {
                             Some("turn.prompt") => {
                                 tracker.running = true;
+                                tracker.finished = false;
                                 tracker.last_prompt = r
                                     .get("input")
                                     .and_then(|i| i.as_array())
@@ -414,13 +441,22 @@ fn poll_round(
                                     .unwrap_or("")
                                     .to_string();
                             }
-                            Some("turn.cancel") => tracker.running = false,
+                            Some("turn.cancel") => {
+                                tracker.running = false;
+                                tracker.finished = true;
+                            }
                             Some("context.append_loop_event") => {
                                 if let Some(e) = r.get("event") {
+                                    // 旧会话重新有真实步骤/流式输出时允许恢复，不要求重发 prompt。
+                                    if matches!(e.get("type").and_then(|v| v.as_str()),
+                                        Some("step.begin" | "tool.call" | "content.part")) {
+                                        tracker.running = true;
+                                    }
                                     if e.get("type").and_then(|v| v.as_str()) == Some("step.end")
                                         && e.get("finishReason").and_then(|v| v.as_str()) == Some("end_turn")
                                     {
                                         tracker.running = false;
+                                        tracker.finished = true;
                                     }
                                 }
                             }
@@ -439,7 +475,14 @@ fn poll_round(
             tracker.pending.clear();
             tracker.offset = size;
         }
-        // 运行态心跳：纯思考的长回合没有任何 tool.call，靠它保活到判死线之外
+        // 合成心跳不是宿主存活证据；无真实增长到期后静默收场，避免无限续命。
+        if tracker.running && now.saturating_sub(tracker.last_growth_ms) >= STALL_ABORT_MS {
+            tracker.running = false;
+            emit(stop, tx, kind, EventKind::RunAborted, &sid, &cwd,
+                "会话日志持续未更新，停止推断运行状态", None);
+            tracker.last_emit_ms = now;
+        }
+        // 短时静默可以保活，但不更新 last_growth_ms。
         if tracker.running && now - tracker.last_emit_ms > HEARTBEAT_MS {
             emit(
                 stop,
@@ -470,7 +513,11 @@ fn poll_round(
     Ok(())
 }
 
-/// 从指定字节偏移读到 EOF（偏移恒在换行边界上，UTF-8 读取安全）
+fn is_recent(timestamp: i64, now: i64, max_age: i64) -> bool {
+    timestamp <= now && now.saturating_sub(timestamp) <= max_age
+}
+
+/// 从指定字节偏移读到 EOF；遇到未写完的 UTF-8 字符时不推进偏移，下轮重试。
 fn read_increment(path: &Path, offset: u64) -> anyhow::Result<String> {
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -505,6 +552,147 @@ mod tests {
             "event": e,
             "time": 1781079396444i64
         })
+    }
+
+    struct PollFixture {
+        root: PathBuf,
+        wire: PathBuf,
+        trackers: HashMap<String, SessionTracker>,
+        tx: mpsc::Sender<NormalizedEvent>,
+        rx: mpsc::Receiver<NormalizedEvent>,
+        round: u64,
+    }
+
+    impl PollFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("bark-kimi-poll-{}", uuid::Uuid::new_v4()));
+            let wire = root.join("sessions/wd/session/agents/main/wire.jsonl");
+            std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+            let (tx, rx) = mpsc::channel(64);
+            Self { root, wire, trackers: HashMap::new(), tx, rx, round: 0 }
+        }
+
+        fn append(&self, mut record: Value, time: i64) {
+            use std::io::Write;
+            record["time"] = json!(time);
+            let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&self.wire).unwrap();
+            writeln!(f, "{record}").unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(time as u64),
+            )).unwrap();
+        }
+
+        fn poll(&mut self, now: i64) -> Vec<EventKind> {
+            self.round += 1;
+            poll_round(&AtomicBool::new(false), &self.tx, AgentKind::KimiWork,
+                &self.root.join("sessions"), &self.root.join("session_index.jsonl"),
+                &mut self.trackers, self.round, now).unwrap();
+            let mut events = Vec::new();
+            while let Ok(event) = self.rx.try_recv() { events.push(event.kind); }
+            events
+        }
+    }
+
+    impl Drop for PollFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+    }
+
+    #[test]
+    fn poll_does_not_revive_historical_unfinished_turns() {
+        let mut f = PollFixture::new();
+        let now = now_millis();
+        let old = now - 120 * 24 * 60 * 60_000;
+        f.append(turn_prompt("unfinished historical task"), old);
+        assert!(f.poll(now).is_empty());
+        assert!(f.poll(now + 2 * HEARTBEAT_MS).is_empty());
+        assert!(!f.trackers["session"].running);
+
+        // 触碰/复制旧文件不能把历史事件时间变成当前活动。
+        std::fs::File::options().write(true).open(&f.wire).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now())).unwrap();
+        f.trackers.clear();
+        assert!(f.poll(now_millis()).is_empty());
+    }
+
+    #[test]
+    fn poll_bounds_synthetic_heartbeats_and_resumes_on_real_growth() {
+        let mut f = PollFixture::new();
+        let start = now_millis();
+        f.append(turn_prompt("live task"), start);
+        assert_eq!(f.poll(start), vec![EventKind::Activity]);
+        assert_eq!(f.poll(start + HEARTBEAT_MS + 1), vec![EventKind::Activity]);
+        assert_eq!(f.poll(start + STALL_ABORT_MS), vec![EventKind::RunAborted]);
+        assert!(f.poll(start + 2 * STALL_ABORT_MS).is_empty());
+        assert!(!f.trackers["session"].running);
+
+        let resumed = start + 2 * STALL_ABORT_MS + 1;
+        f.append(loop_event("tool.call", json!({"name": "Bash"})), resumed);
+        assert_eq!(f.poll(resumed), vec![EventKind::Activity]);
+        assert!(f.trackers["session"].running);
+        assert_eq!(f.trackers["session"].last_growth_ms, resumed);
+        f.append(loop_event("step.end", json!({"finishReason": "end_turn"})), resumed + 1);
+        assert_eq!(f.poll(resumed + 1), vec![EventKind::RunCompleted]);
+        assert!(f.poll(resumed + STALL_ABORT_MS).is_empty());
+    }
+
+    #[test]
+    fn poll_real_stream_growth_keeps_long_tasks_alive() {
+        let mut f = PollFixture::new();
+        let start = now_millis();
+        f.append(turn_prompt("streaming task"), start);
+        assert_eq!(f.poll(start), vec![EventKind::Activity]);
+        for step in 1..=4 {
+            let now = start + step * (STALL_ABORT_MS - 1);
+            f.append(loop_event("content.part", json!({"part": {"type": "think"}})), now);
+            assert_eq!(f.poll(now), vec![EventKind::Activity]);
+            assert!(f.trackers["session"].running);
+        }
+    }
+
+    #[test]
+    fn poll_old_session_can_start_a_new_turn() {
+        let mut f = PollFixture::new();
+        let now = now_millis();
+        f.append(turn_prompt("old"), now - STALL_ABORT_MS);
+        assert!(f.poll(now).is_empty());
+        f.append(turn_prompt("new"), now + 1);
+        assert_eq!(f.poll(now + 1), vec![EventKind::Activity]);
+        f.append(json!({"type": "turn.cancel"}), now + 2);
+        assert_eq!(f.poll(now + 2), vec![EventKind::RunAborted]);
+        assert!(f.poll(now + STALL_ABORT_MS).is_empty());
+    }
+
+    #[test]
+    fn poll_bootstrap_during_partial_utf8_record_recovers() {
+        use std::io::Write;
+        let mut f = PollFixture::new();
+        let now = now_millis();
+        let record = format!("{}\n", json!({"type": "turn.prompt", "time": now,
+            "input": [{"text": "中文任务"}]}));
+        let split = record.find('中').unwrap() + 1;
+        std::fs::write(&f.wire, &record.as_bytes()[..split]).unwrap();
+        assert!(f.poll(now).is_empty());
+        std::fs::OpenOptions::new().append(true).open(&f.wire).unwrap()
+            .write_all(&record.as_bytes()[split..]).unwrap();
+        assert_eq!(f.poll(now + 1), vec![EventKind::Activity]);
+        assert!(f.poll(now + 2).is_empty(), "补齐的记录只处理一次");
+    }
+
+    #[test]
+    fn poll_terminal_blocks_late_stream_until_new_prompt() {
+        let mut f = PollFixture::new();
+        let now = now_millis();
+        f.append(turn_prompt("task"), now);
+        assert_eq!(f.poll(now), vec![EventKind::Activity]);
+        f.append(loop_event("step.end", json!({"finishReason": "end_turn"})), now + 1);
+        assert_eq!(f.poll(now + 1), vec![EventKind::RunCompleted]);
+        f.append(loop_event("content.part", json!({"part": {"type": "text"}})), now + 2);
+        assert!(f.poll(now + 2).is_empty());
+        assert!(f.poll(now + HEARTBEAT_MS + 2).is_empty(), "终态后的迟到分片不能复活心跳");
+        f.append(loop_event("tool.result", json!({})), now + HEARTBEAT_MS + 3);
+        assert!(f.poll(now + HEARTBEAT_MS + 3).is_empty());
+        f.append(turn_prompt("next task"), now + HEARTBEAT_MS + 4);
+        assert_eq!(f.poll(now + HEARTBEAT_MS + 4), vec![EventKind::Activity]);
     }
 
     /// 真实样本的映射钉死（记录形状取自本机 wire.jsonl，协议 1.3）
@@ -571,7 +759,7 @@ mod tests {
             json!(loop_event("tool.call", json!({ "name": "Bash" }))),
             json!(loop_event("step.end", json!({ "finishReason": "tool_use" })))
         );
-        let (events, running_flag) = bootstrap_tail(&running);
+        let (events, running_flag, _) = bootstrap_tail(&running);
         assert!(running_flag, "尾部无终态信号 → 回合在跑");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, EventKind::Activity);
@@ -582,12 +770,14 @@ mod tests {
             json!(turn_prompt("已完成的事")),
             json!(loop_event("step.end", json!({ "finishReason": "end_turn" })))
         );
-        let (events, running_flag) = bootstrap_tail(&finished);
+        let (events, running_flag, terminal) = bootstrap_tail(&finished);
+        assert!(terminal);
         assert!(!running_flag);
         assert!(events.is_empty(), "历史完成不得重放");
 
         let cancelled = format!("{}\n{}\n", json!(turn_prompt("x")), json!({ "type": "turn.cancel", "turnId": 0 }));
-        let (events, running_flag) = bootstrap_tail(&cancelled);
+        let (events, running_flag, terminal) = bootstrap_tail(&cancelled);
+        assert!(terminal);
         assert!(!running_flag);
         assert!(events.is_empty(), "历史中止不得重放");
     }
@@ -597,11 +787,12 @@ mod tests {
     fn split_complete_lines_buffers_partial_tail() {
         let mut pending = String::new();
         let (lines, consumed) = split_complete_lines("{\"type\":\"turn.ca", &mut pending);
-        assert!(lines.is_empty() && consumed == 0, "半行不产出也不消耗");
+        assert!(lines.is_empty());
+        assert_eq!(consumed, pending.len(), "残行已读入缓冲区，文件偏移也必须推进");
 
         let (lines, consumed) = split_complete_lines("ncel\"}\n{\"type\":\"usage.record\"}\n{partial", &mut pending);
         assert_eq!(lines.len(), 2);
-        assert_eq!(consumed, "{\"type\":\"turn.cancel\"}\n{\"type\":\"usage.record\"}\n".len());
+        assert_eq!(consumed, "ncel\"}\n{\"type\":\"usage.record\"}\n{partial".len());
         assert_eq!(pending, "{partial", "尾部残行暂存");
 
         let (lines, _) = split_complete_lines("_rest\"}\n", &mut pending);
@@ -658,7 +849,7 @@ mod tests {
     #[test]
     fn steady_state_event_order() {
         // 首见：文件已有「在跑」的尾部
-        let (events, running) = bootstrap_tail(&format!(
+        let (events, running, _) = bootstrap_tail(&format!(
             "{}\n{}\n",
             json!(turn_prompt("清理任务")),
             json!(loop_event("tool.call", json!({ "name": "Bash" })))

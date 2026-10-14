@@ -164,7 +164,7 @@ function isValidHhmm(s: string): boolean {
 async function persist(): Promise<boolean> {
   if (!config.value) return false;
   try {
-    await api.saveConfig(config.value);
+    await api.saveConfig({ rules: config.value.rules });
     return true;
   } catch (e) {
     toast(`保存失败：${e}`, "error");

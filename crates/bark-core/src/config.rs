@@ -564,6 +564,8 @@ impl BarkConfig {
     /// 不迁移的话，只装了国内版的用户升级后会看到开关莫名其妙变关——hook 其实还在，
     /// 只是合并后的 id 没被标记为开启。
     fn migrate_agent_ids(&mut self) {
+        // 已下线接入不再保留启用开关，避免旧配置继续显示或恢复它。
+        self.agents.retain(|a| a.kind != "windsurf");
         if let Some(pos) = self.agents.iter().position(|a| a.kind == "qoder-cn") {
             let legacy_enabled = self.agents.remove(pos).enabled;
             match self.agents.iter_mut().find(|a| a.kind == "qoder") {

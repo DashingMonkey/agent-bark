@@ -14,7 +14,7 @@
 //! └── memory/MEMORY.md
 //! ```
 //!
-//! **两个数据源，各管一半生命周期**：
+//! **三个只读数据源，合并生命周期信号**：
 //!
 //! 1. trajectory.jsonl —— 只记录**循环内部**的消息：`role=user`（每条用户输入，
 //!    含排队连发）、assistant 带 `tool_calls`（工具运行；`interaction.ask` 是向
@@ -30,33 +30,42 @@
 //!    逐点核对过：运行中非空、结束后为 `{}`）。`agent_task_param.workspace`
 //!    还带着项目目录，通知由此能带项目名。
 //!
+//! 3. `sdk_storage/log/saman_*.log` 的 `sdk.message.break.request`：
+//!    `break_reason_name=click_break_button` 且 `result=success` 是明确的用户停止；
+//!    用 conversation_id + message_id 与 IndexedDB 运行条目关联，旧回合不能关闭新回合。
+//!
 //! | 信号 | 统一事件 |
 //! | --- | --- |
 //! | trajectory `role=user` | activity（回合开始 / 排队消息，content 为任务文案） |
 //! | trajectory `tool_calls[]` | activity（工具运行，带工具名） |
 //! | trajectory `interaction.ask` | **input_required**（向用户提问，带问题文案） |
 //! | trajectory `role=tool` | tool_finished（工具收尾 / 提问被回答的解除信号） |
-//! | **IndexedDB 条目清除** | **run_completed**（回合完成；提问挂起时延迟 60s 判定，防「回答即清除」误报） |
+//! | SDK 确认用户停止，且消息 ID 匹配 | **run_aborted**（已终止） |
+//! | **IndexedDB 条目清除** | **run_completed**（等待 6s 补齐取消日志；提问挂起时延迟 60s 判定） |
 //! | trajectory 无 `tool_calls` 的 assistant 行 | run_completed（兜底，见上） |
 //!
-//! IndexedDB 读取方式：**只增量尾随当前 `.log`**（LevelDB 的 memtable 日志，
-//! 追加写、无压缩、新写入必先落这里），按「最近前驱 `conversation_id`」就近
-//! 配对出会话；轮转（compaction 换新 .log）时从头重扫新日志。 不做完整 LevelDB
-//! reader——那条路的复杂度（block/前缀压缩/SST 合并）配不上本适配器的定位。
+//! IndexedDB 读取方式：只读扫描 WAL（`.log`）与 SST（`.ldb`），按 LevelDB sequence
+//! 合并同一记录的新旧版本；校验物理块、重组分段、解开 Snappy 与 V8 单/双字节字符串，
+//! 再解析 `extra` JSON。缓存未变化文件，轮转后旧状态不能覆盖新状态，不持锁、不写宿主文件。
 //!
 //! 为什么不做 Hook 型：豆包工作没有 hooks / CLI 扩展点；Watch 型零写盘。
 //!
 //! 已知边界：
-//! - **失败 / 中止不可见**——运行时崩溃、用户停止在两个数据源里都不留记录。
-//!   IndexedDB 条目清除统一映射为完成，失败的任务会误报「任务完成」；
+//! - **失败原因仍不可见**；取消日志缺失/格式漂移，或未观测到对应运行消息 ID 时，
+//!   IndexedDB 条目清除仍回退为完成，失败或停止的任务可能误报「任务完成」；
 //!   数据源失效时退化为事件静止 + 10 分钟判死（不误报）
 //! - 只看主 agent（`assignment.md` 头部 `Role: main`）；子智能体的 trajectory
 //!   不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）
 //! - IndexedDB 不可读时（目录缺失 / schema 漂移）降级为 trajectory 单源：
 //!   完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场（不亮失败色），
 //!   下次活动自动恢复——不会永远卡思考色
-//! - 数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效
+//! - 已确认完成后停止心跳并屏蔽迟到工具记录；IndexedDB 已确认空闲的会话，
+//!   需等下一次运行跃迁再开启，避免迟落盘的旧 user 消息复活已结束回合。
+//! - 数据布局按 2026-10 版本校准（2.32.3 存储；2.32.6 取消日志），应用大版本升级可能失效
 
+use crate::doubaowork_idb::IdbLogTail;
+use crate::doubaowork_log::CancelLog;
+use crate::jsonl::{bootstrap_sample, read_bootstrap, split_complete_lines};
 use crate::watch::{emit, emit_lost_row, sleep_interruptible, WatchAdapter};
 use bark_core::{now_millis, truncate_chars, AgentKind, EventKind, NormalizedEvent};
 use serde_json::Value;
@@ -132,214 +141,13 @@ pub(crate) struct IdbUpdate {
     pub conv: String,
     /// running_messages 非空 = 有回合在跑
     pub running: bool,
+    pub message_ids: Vec<String>,
     /// agent_task_param.workspace（项目目录；拿不到为空串）
     pub workspace: String,
 }
 
 /// 全部 IndexedDB 库的增量游标集合（跨轮复用，放互斥锁里轮询）
 type IdbTails = std::sync::Mutex<IdbLogTail>;
-
-/// 一个 IndexedDB 库目录的增量游标：只尾随**编号最大**的 `.log`（memtable 日志，
-/// 新写入必先落这里；compaction 换新日志时重置游标从头重扫）。
-struct IdbLogTail {
-    dir: PathBuf,
-    /// 当前尾随的日志文件名（编号最大者）
-    log: Option<PathBuf>,
-    offset: u64,
-}
-
-impl IdbLogTail {
-    fn new(dir: PathBuf) -> Self {
-        Self { dir, log: None, offset: 0 }
-    }
-
-    /// 一轮扫描：返回本轮新读到全会话状态（同会话重复出现以后者为准——日志是
-    /// 追加写，靠后即更新）。失败返回空（调用方按连续失败计数告警）。
-    fn scan(&mut self) -> Vec<IdbUpdate> {
-        let Some(cur) = current_log(&self.dir) else {
-            self.log = None;
-            self.offset = 0;
-            return Vec::new();
-        };
-        if self.log.as_deref() != Some(cur.as_path()) {
-            // 轮转：新日志从头扫（本轮可能拿到全量状态，与既有状态合并无害）
-            self.log = Some(cur.clone());
-            self.offset = 0;
-        }
-        let len = match std::fs::metadata(&cur) {
-            Ok(m) => m.len(),
-            Err(_) => return Vec::new(),
-        };
-        if len <= self.offset {
-            return Vec::new();
-        }
-        let chunk = match read_bytes_from(&cur, self.offset) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        self.offset = len;
-        extract_idb_states(&chunk)
-    }
-}
-
-/// 目录里编号最大的 `.log`（LevelDB 当前 memtable 日志；文件名形如 `000054.log`）。
-/// 目录里还有 CURRENT / LOCK / LOG / MANIFEST-* 等无关文件，不匹配的跳过而不是
-/// 提前返回——否则永远扫不到任何状态。
-fn current_log(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(num) = name.to_string_lossy().strip_suffix(".log").and_then(|n| n.parse::<u64>().ok()) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(n, _)| num > *n) {
-            best = Some((num, entry.path()));
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-fn read_bytes_from(path: &Path, offset: u64) -> anyhow::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// 子切片查找（不引入 regex 依赖）
-fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() || from > hay.len() - needle.len() {
-        return None;
-    }
-    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-/// 从一段日志字节里抽取会话状态（纯函数，便于测试）。
-///
-/// 记录形状（v8 序列化的明文片段，2026-10 实测）：会话条目内 `conversation_id`
-/// 在前、`extra` JSON 在后，同一条目相距约 1.6-2KB；`extra` 内
-/// `"running_messages":"{...}"` 与 `"workspace":"D:\\..."`（agent_task_param 的
-/// 二层转义 JSON 里）。配对规则：每个 `running_messages` 就近向前找最近的
-/// `conversation_id`——会话条目按序排列，最近前驱就是本条目的会话。
-pub(crate) fn extract_idb_states(chunk: &[u8]) -> Vec<IdbUpdate> {
-    const ID_TO_EXTRA_MAX: usize = 4096;
-    let mut out: Vec<IdbUpdate> = Vec::new();
-    let mut pos = 0;
-    while let Some(p) = find(chunk, b"running_messages", pos) {
-        pos = p + 1;
-        // 值：`running_messages":"` 之后的配对大括号 JSON（内容只有 id 与数字键，
-        // 引号内不会出现大括号，直接计数即可）
-        let Some(vq) = find(chunk, b":\"", p).map(|i| i + 2) else { continue };
-        if vq >= chunk.len() || chunk[vq] != b'{' {
-            continue;
-        }
-        let Some((value, vend)) = braced_json(chunk, vq) else { continue };
-        let running = value != b"{}";
-        // 最近前驱 conversation_id。锚点用 v8 键字符串的完整形状
-        // `\x22（tag）+ \x0f（长度 15）+ conversation_id + \x22`：记录里还有
-        // `local_conversation_id`（其内部 `conversation_id` 前面是 `_`，长度也对不上），
-        // 不用完整形状会把它的本地 id 当锚点配错会话
-        let window_start = p.saturating_sub(ID_TO_EXTRA_MAX);
-        let Some(id_off) = rfind(chunk, b"\x22\x0fconversation_id\x22", window_start, p) else {
-            continue;
-        };
-        let Some(conv) = digits_after(chunk, id_off + b"\x22\x0fconversation_id\x22".len(), 15, 25) else {
-            continue;
-        };
-        // workspace（同条目内最后一处 `workspace\":\"`；agent_task_param 是二层
-        // 转义的 JSON 字符串，`\\` 要还原到没有为止）
-        let workspace = rfind(chunk, b"workspace\\\":\\\"", id_off, vend)
-            .map(|w| {
-                let start = w + b"workspace\\\":\\\"".len();
-                let end = find(chunk, b"\\\"", start).unwrap_or(start);
-                unescape_backslashes(&chunk[start..end.min(chunk.len())])
-            })
-            .unwrap_or_default();
-        out.push(IdbUpdate { conv, running, workspace });
-    }
-    out
-}
-
-/// 从 `from` 起向后（不含 `upto`）找 needle 的最后一次出现
-fn rfind(hay: &[u8], needle: &[u8], from: usize, upto: usize) -> Option<usize> {
-    if needle.is_empty() || from >= upto || upto > hay.len() {
-        return None;
-    }
-    (from..=upto.saturating_sub(needle.len())).rev().find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-/// 配对大括号 JSON：从 `{` 起计数到匹配的 `}`（引号内的大括号跳过）
-fn braced_json(chunk: &[u8], open: usize) -> Option<(&[u8], usize)> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, &b) in chunk[open..].iter().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match b {
-            b'\\' if in_string => escaped = true,
-            b'"' if !escaped => in_string = !in_string,
-            b'{' if !in_string => depth += 1,
-            b'}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&chunk[open..=open + i], open + i + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// 跳过非数字字节后取 15-25 位十进制数（v8 字符串值前的长度字节是二进制）
-fn digits_after(chunk: &[u8], from: usize, min: usize, max: usize) -> Option<String> {
-    let mut i = from;
-    while i < chunk.len() && !chunk[i].is_ascii_digit() {
-        i += 1;
-        if i - from > 16 {
-            return None;
-        }
-    }
-    let start = i;
-    while i < chunk.len() && chunk[i].is_ascii_digit() && i - start < max {
-        i += 1;
-    }
-    let n = i - start;
-    (min <= n && n <= max).then(|| String::from_utf8_lossy(&chunk[start..i]).into_owned())
-}
-
-/// `\\` → `\`（路径的 JSON 转义还原；agent_task_param 在 extra JSON 里是二层
-/// 转义字符串，还原到不再有 `\\` 为止）
-fn unescape_backslashes(raw: &[u8]) -> String {
-    let mut cur = raw.to_vec();
-    for _ in 0..3 {
-        if !cur.contains(&b'\\') {
-            break;
-        }
-        let mut out = Vec::with_capacity(cur.len());
-        let mut iter = cur.iter().copied();
-        while let Some(b) = iter.next() {
-            if b == b'\\' {
-                match iter.next() {
-                    Some(b'\\') => out.push(b'\\'),
-                    Some(other) => {
-                        out.push(b'\\');
-                        out.push(other);
-                    }
-                    None => out.push(b'\\'),
-                }
-            } else {
-                out.push(b);
-            }
-        }
-        cur = out;
-    }
-    String::from_utf8_lossy(&cur).into_owned()
-}
 
 // ---------------------------------------------------------------------------
 // trajectory 分类与轮询
@@ -435,8 +243,12 @@ fn is_main_agent(agent_dir: &Path) -> bool {
 struct SessionTracker {
     /// 会话 id（.sessions/<会话id> 目录名；闭环「文件消失」与 IndexedDB 关联时用）
     sid: String,
-    /// trajectory.jsonl 已消费到的字节偏移（只推进到换行边界，保证 UTF-8 读取安全）
+    message_ids: Vec<String>,
+    aborted: bool,
+    /// trajectory.jsonl 已读取的字节偏移（未完成的行保存在 pending）
     offset: u64,
+    /// 已确认收场；缓存的运行状态与迟到工具记录不能重新开启回合。
+    settled: bool,
     /// trajectory 视角的「有回合在跑」（user/工具行置位；IndexedDB 可用时以它为准）
     running: bool,
     /// 卡在 interaction.ask 等用户回答（提问期间不发心跳——心跳会把 daemon 侧
@@ -459,28 +271,14 @@ struct SessionTracker {
     last_seen_round: u64,
 }
 
-/// 从一段文本里切出完整行；无换行结尾的残行存回 `pending`。
-/// 返回 (完整行列表, 完整部分消耗的字节数)。
-fn split_complete_lines(chunk: &str, pending: &mut String) -> (Vec<String>, usize) {
-    pending.push_str(chunk);
-    let split = pending.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let complete: String = pending.drain(..split).collect();
-    let lines = complete
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
-        .collect();
-    (lines, split)
-}
-
 /// 启动回看：从 trajectory.jsonl 尾部样本推导「是否有回合正在跑/等回答」。
-/// 返回 (要发的事件, trajectory 是否在跑, 是否等回答)。最后一个回合级信号决定：
+/// 返回 (要发的事件, trajectory 是否在跑, 是否等回答, 是否已确认完成)。最后一个回合级信号决定：
 /// - user / 工具运行 / 工具收尾 → 运行中（发 Activity 点亮）
 /// - `interaction.ask` → 等回答（也点亮一次，但 running=false——等待态不心跳）
 /// - 最终回答 → 已结束（不发历史终态，避免启动风暴）
 ///
-/// 回看产出：(要发的事件, trajectory 是否在跑, 是否等回答)
-type BootstrapTail = (Vec<(EventKind, Option<String>, String)>, bool, bool);
+/// 空日志表示尚无信号，不能与明确完成混为一谈（云端任务可能只有 IndexedDB 在跑）。
+type BootstrapTail = (Vec<(EventKind, Option<String>, String)>, bool, bool, bool);
 
 fn bootstrap_tail(tail: &str) -> BootstrapTail {
     let mut active: Option<bool> = None;
@@ -509,7 +307,10 @@ fn bootstrap_tail(tail: &str) -> BootstrapTail {
                     last_prompt = msg;
                 }
             }
-            _ => active = Some(false),
+            _ => {
+                active = Some(false);
+                waiting = false;
+            }
         }
     }
     let events = match active {
@@ -518,7 +319,7 @@ fn bootstrap_tail(tail: &str) -> BootstrapTail {
         Some(false) if waiting => vec![(EventKind::Activity, None, last_prompt)],
         _ => Vec::new(),
     };
-    (events, active == Some(true), waiting)
+    (events, active == Some(true), waiting, active == Some(false) && !waiting)
 }
 
 /// 轮询周期与节流常量
@@ -537,6 +338,8 @@ const WARN_EVERY_ROUNDS: u32 = 20;
 /// 提问挂起时条目被清除的判定延迟：回答若会清除条目，trajectory 的 tool 结果行
 /// 会在这之前到达（本机实测提问-回答间隔秒级到分钟级都远小于它）
 const ASK_CLEAR_GRACE_MS: i64 = 60_000;
+// 数据库空闲可能先于取消确认日志到达，留两个轮询周期供日志补齐。
+const COMPLETE_GRACE_MS: i64 = 6_000;
 /// 降级模式（IndexedDB 不可读）的停摆判定：轨迹停止增长这么久按「中止」收场
 /// （RunAborted 不通知不亮失败色；下次活动自动恢复）。长云端静默阶段在降级模式下
 /// 会被误收场，但降级本身已无完成信号，两害取其轻。
@@ -591,7 +394,9 @@ impl WatchAdapter for DoubaoWorkWatch {
             .collect();
             // tracker 键 = trajectory.jsonl 绝对路径（跨 profile 天然不冲突）
             let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
+            let mut cancel_log = CancelLog::new(user_data_root().unwrap_or_default().join("sdk_storage/log"));
             let mut ctx = ScanCtx {
+                cancel_log: &mut cancel_log,
                 roots: &roots,
                 idb_tails: &idb_tails,
                 // IndexedDB 会话状态表（跨轮持久），种子供建档时压制已完成会话
@@ -623,12 +428,13 @@ impl WatchAdapter for DoubaoWorkWatch {
 
 /// 一轮轮询的扫描上下文（会话根、IndexedDB 游标与状态表）
 struct ScanCtx<'a> {
+    cancel_log: &'a mut CancelLog,
     roots: &'a [PathBuf],
     idb_tails: &'a [IdbTails],
     /// IndexedDB 会话状态表（跨轮持久）：首轮扫描先于建档，种子必须留到
     /// tracker 建档时用——否则重启后已完成会话会被 trajectory 引导点亮，
     /// 10 分钟后被判死误亮失败色
-    idb_state: &'a mut HashMap<String, (bool, String)>,
+    idb_state: &'a mut HashMap<String, (bool, String, Vec<String>)>,
 }
 
 /// 一轮轮询：IndexedDB 状态增量 → trajectory 增量 → 终态/心跳 → 闭环 → 淘汰。
@@ -649,7 +455,7 @@ fn poll_round(
         }
     }
     for u in updates {
-        ctx.idb_state.insert(u.conv.clone(), (u.running, u.workspace));
+        ctx.idb_state.insert(u.conv.clone(), (u.running, u.workspace, u.message_ids));
     }
     // 状态表防无界增长：只保留有 tracker 的会话（状态只在跃迁时写入，
     // 轮转重扫可能带回大量历史会话条目）
@@ -657,7 +463,8 @@ fn poll_round(
         ctx.idb_state.retain(|conv, _| trackers.values().any(|t| t.sid == *conv));
     }
     // 2) 状态跃迁（完成信号的主源）——只对已建档的会话生效
-    apply_idb_state(stop, tx, kind, trackers, ctx.idb_state, now_millis());
+    ctx.cancel_log.poll();
+    apply_idb_state(stop, tx, kind, trackers, ctx.idb_state, ctx.cancel_log, now_millis());
 
     // 2) 枚举全部主 agent 的 trajectory.jsonl，消费增量
     let mut wires: Vec<(String, PathBuf)> = Vec::new();
@@ -677,8 +484,11 @@ fn poll_round(
                     continue;
                 }
                 let wire = agent.path().join("system").join("trajectory.jsonl");
-                if wire.is_file() {
-                    let sid = session.file_name().to_string_lossy().into_owned();
+                let sid = session.file_name().to_string_lossy().into_owned();
+                let awaiting_trajectory = ctx.idb_state.contains_key(&sid)
+                    && agent.path().join("system/assignment.md").is_file()
+                    && trackers.get(&wire.display().to_string()).is_none_or(|t| t.offset == 0);
+                if wire.is_file() || awaiting_trajectory {
                     wires.push((sid, wire));
                 }
             }
@@ -697,49 +507,52 @@ fn poll_round(
                     .and_then(|t| t.elapsed().ok())
                     .map(|d| d.as_millis() as i64),
             ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
             Err(_) => continue,
         };
-        let tracker = trackers.entry(wire_path.display().to_string()).or_insert_with(|| {
-            // 首见：回看尾部判断是否正有回合在跑/等回答，偏移直接推到 EOF
+        let key = wire_path.display().to_string();
+        let initial = if !trackers.contains_key(&key) {
+            match if size == 0 { Ok((String::new(), 0)) } else { read_bootstrap(&wire_path, size) } {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    tracing::debug!("读取豆包工作初始日志失败（{}）：{e}", wire_path.display());
+                    continue;
+                }
+            }
+        } else { None };
+        let tracker = trackers.entry(key).or_insert_with(|| {
+            // 首见：回看尾部判断是否正有回合在跑/等回答，偏移只推进到完整行末尾
             // （历史终态不重放，避免启动风暴；运行中的会话立即点亮）
-            let (events, running, waiting) = std::fs::read_to_string(&wire_path)
-                .map(|full| {
-                    let skip = full.len().saturating_sub(BOOTSTRAP_TAIL as usize);
-                    // skip=0 时文件起点本来就是行边界，不能再跳过第一行；
-                    // 只有窗口起点切在行中间时才需要找它后面的换行对齐
-                    let tail_start = if skip == 0 {
-                        0
-                    } else {
-                        full[skip..]
-                            .find('\n')
-                            .map(|p| skip + p + 1)
-                            .unwrap_or(full.len())
-                    };
-                    bootstrap_tail(&full[tail_start..])
-                })
-                .unwrap_or((Vec::new(), false, false));
-            let last_emit_ms = if events.is_empty() { 0 } else { now };
+            let (full, offset) = initial.expect("新会话必须先成功读取初始快照");
+            let (mut events, mut running, waiting, completed) =
+                bootstrap_tail(bootstrap_sample(&full, BOOTSTRAP_TAIL as usize));
             // IndexedDB 种子：会话已结束（条目空）时不发引导点亮——否则重启后
             // 全部历史会话被点亮一轮、10 分钟后被判死误亮失败色。等回答态同理
             // （条目保留才是在等；条目已清说明早不是活会话）。
             let seeded = ctx.idb_state.get(&sid).cloned();
-            let idb_running = seeded.as_ref().map(|(r, _)| *r);
-            // 无种子的兜底：种子只覆盖当前 .log 里出现过的会话，compaction 会把
-            // 老会话的最新状态挪进 .ldb（做完整 LevelDB reader 不值得）。老会话的
-            // trajectory 尾行几乎总停在 user 消息上（最终回复不落盘），不按文件
-            // 停摆时长看，每次重启都会把全部历史会话重新点亮一遍。真正在跑的
-            // 会话（工具产物 / board / 轨迹追加）文件几乎总有新鲜 mtime。
+            let idb_running = seeded.as_ref().map(|(r, _, _)| *r);
+            // 云端任务可能直到结束才落 trajectory；运行信号不应等待第一条 user。
+            if idb_running == Some(true) && events.is_empty() && !completed {
+                events.push((EventKind::Activity, None, String::new()));
+                running = true;
+            }
+            let last_emit_ms = if events.is_empty() { 0 } else { now };
+            // 数据库不可读或尚未记录此会话时，按轨迹新鲜度兜底，避免历史消息重放。
             let stale_idle = seeded.is_none()
                 && mtime_age_ms.is_some_and(|age| age > BOOTSTRAP_IDLE_AFTER_MS);
             let suppressed = idb_running == Some(false) || stale_idle;
+            let last_prompt = events.first().map(|(_, _, msg)| msg.clone()).unwrap_or_default();
             if !suppressed {
                 for (ev, tool, msg) in events {
                     emit(stop, tx, kind, ev, &sid, "", &msg, tool.as_deref());
                 }
             }
             SessionTracker {
+                aborted: false,
                 sid: sid.clone(),
-                offset: size,
+                message_ids: seeded.as_ref().map(|(_, _, ids)| ids.clone()).unwrap_or_default(),
+                offset,
+                settled: suppressed || completed,
                 running: running && !suppressed,
                 waiting_ask: waiting && !suppressed,
                 // 停摆判定只压点亮，不写 idb_running（保持 None = 降级心跳口径，
@@ -748,8 +561,8 @@ fn poll_round(
                 pending_complete_at: None,
                 last_emit_ms: if suppressed { 0 } else { last_emit_ms },
                 last_growth_ms: now,
-                last_prompt: String::new(),
-                workspace: seeded.map(|(_, w)| w).unwrap_or_default(),
+                last_prompt,
+                workspace: seeded.map(|(_, w, _)| w).unwrap_or_default(),
                 pending: String::new(),
                 last_seen_round: round,
             }
@@ -770,7 +583,29 @@ fn poll_round(
                         let Ok(r) = serde_json::from_str::<Value>(&line) else {
                             continue;
                         };
+                        let role = r.get("role").and_then(|v| v.as_str());
+                        if role == Some("user") {
+                            let text = content_text(&r);
+                            if !text.trim().is_empty() {
+                                tracker.last_prompt = truncate_chars(text.trim(), 200);
+                            }
+                        }
+                        // 数据库已确认空闲时，轨迹可能只是迟到/重写的旧消息。
+                        // 仍记住新文案，待数据库 false→true 再开启下一轮。
+                        // 提问清除的宽限期例外：真实回答必须仍能解除等待。
+                        if (tracker.idb_running == Some(false) && (tracker.settled || (tracker.pending_complete_at.is_some() && !tracker.waiting_ask)))
+                            || (tracker.idb_running.is_some() && tracker.aborted) {
+                            continue;
+                        }
+                        if tracker.settled && role != Some("user") {
+                            continue;
+                        }
                         if let Some((ev, tool, msg)) = classify(&r) {
+                            if ev == EventKind::RunCompleted {
+                                tracker.settled = true;
+                                tracker.waiting_ask = false;
+                                tracker.pending_complete_at = None;
+                            }
                             // 终态正文用本回合的任务文案（「任务完成」下面直接看到是哪件事）
                             let msg = if ev == EventKind::RunCompleted {
                                 tracker.last_prompt.clone()
@@ -783,11 +618,10 @@ fn poll_round(
                         // trajectory 视角状态推进（与 classify 同源判定，见模块头映射表）
                         match r.get("role").and_then(|v| v.as_str()) {
                             Some("user") => {
+                                tracker.settled = false;
                                 tracker.running = true;
-                                let text = content_text(&r);
-                                if !text.trim().is_empty() {
-                                    tracker.last_prompt = truncate_chars(text.trim(), 200);
-                                }
+                                tracker.waiting_ask = false;
+                                tracker.pending_complete_at = None;
                             }
                             Some("tool") => {
                                 tracker.running = true;
@@ -834,6 +668,7 @@ fn poll_round(
         if let Some(deadline) = tracker.pending_complete_at {
             if now >= deadline {
                 tracker.pending_complete_at = None;
+                tracker.settled = true;
                 tracker.running = false;
                 tracker.waiting_ask = false;
                 emit(
@@ -857,7 +692,7 @@ fn poll_round(
             Some(r) => r && !tracker.waiting_ask,
             None => tracker.running && !tracker.waiting_ask,
         };
-        if heartbeats && now - tracker.last_emit_ms > HEARTBEAT_MS {
+        if !tracker.settled && heartbeats && now - tracker.last_emit_ms > HEARTBEAT_MS {
             emit(
                 stop,
                 tx,
@@ -879,6 +714,7 @@ fn poll_round(
             && now - tracker.last_growth_ms > STALL_ABORT_MS
         {
             tracker.running = false;
+            tracker.settled = true;
             emit(
                 stop,
                 tx,
@@ -922,22 +758,23 @@ fn poll_round(
 }
 
 /// 应用 IndexedDB 状态表到已建档的会话：跃迁产出终态事件，workspace 非空即回填。
-/// - `true→false`：回合完成（**主完成信号**——最终回复不落盘，会话目录里也没有
+/// - `true→false`（或轨迹已活动后首次读到 false）：回合完成（**主完成信号**——最终回复不落盘，会话目录里也没有
 ///   完成标记，条目清除是唯一的结束标志）；提问挂起时转延迟判定
-/// - `false→true` / 首次播种（None→?）：不产事件（回合开始由 trajectory 的 user 行
-///   点亮；已完成会话的引导点亮在建档处按种子压制）
-/// - 只作用于已建档（有 trajectory）的会话：豆包普通聊天也有 running_messages，
+/// - `false→true`：确认下一轮开始，允许重开已收场会话；trajectory 可能先于它落盘。
+/// - 首次播种：空闲且未活动的会话不产事件；引导点亮在建档处按种子压制。
+/// - 只作用于已建档（有主 agent 轨迹或 assignment）的会话：豆包普通聊天也有 running_messages，
 ///   但那不是 agent 任务
 fn apply_idb_state(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
     kind: AgentKind,
     trackers: &mut HashMap<String, SessionTracker>,
-    idb_state: &HashMap<String, (bool, String)>,
+    idb_state: &HashMap<String, (bool, String, Vec<String>)>,
+    cancel_log: &CancelLog,
     now: i64,
 ) {
     for tracker in trackers.values_mut() {
-        let Some(&(running, ref workspace)) = idb_state.get(&tracker.sid) else {
+        let Some(&(running, ref workspace, ref messages)) = idb_state.get(&tracker.sid) else {
             continue;
         };
         let prev = tracker.idb_running;
@@ -945,23 +782,44 @@ fn apply_idb_state(
         if tracker.workspace.is_empty() && !workspace.is_empty() {
             tracker.workspace = workspace.clone();
         }
-        if prev == Some(true) && !running && tracker.pending_complete_at.is_none() {
+        let new_messages = running && !messages.is_empty() && *messages != tracker.message_ids;
+        if running && (new_messages || prev == Some(false) || (prev.is_none() && tracker.settled)) {
+            tracker.message_ids = messages.clone();
+            tracker.aborted = false;
+            tracker.pending_complete_at = None;
+            tracker.settled = false;
+            tracker.running = !tracker.waiting_ask;
+            if !tracker.waiting_ask {
+                emit(stop, tx, kind, EventKind::Activity, &tracker.sid,
+                    &tracker.workspace, &tracker.last_prompt, None);
+                tracker.last_emit_ms = now;
+            }
+        }
+        if !tracker.settled && cancel_log.matches(&tracker.sid, &tracker.message_ids) {
+            tracker.settled = true;
+            tracker.aborted = true;
+            tracker.running = false;
+            tracker.waiting_ask = false;
+            tracker.pending_complete_at = None;
+            emit(stop, tx, kind, EventKind::RunAborted, &tracker.sid, &tracker.workspace, "回合被手动终止", None);
+            tracker.last_emit_ms = now;
+        }
+        let became_idle = !running && prev != Some(false)
+            && (prev == Some(true) || tracker.running || tracker.waiting_ask);
+        if became_idle && !tracker.settled && tracker.pending_complete_at.is_none() {
             if tracker.waiting_ask {
                 // 提问挂起时条目被清除：可能是「回答即清除」的另一种实现，
                 // 等 trajectory 的 tool 结果行（宽限内到达则撤销）
                 tracker.pending_complete_at = Some(now + ASK_CLEAR_GRACE_MS);
             } else {
                 tracker.running = false;
-                let msg = tracker.last_prompt.clone();
-                let cwd = tracker.workspace.clone();
-                emit(stop, tx, kind, EventKind::RunCompleted, &tracker.sid, &cwd, &msg, None);
-                tracker.last_emit_ms = now;
+                tracker.pending_complete_at = Some(now + COMPLETE_GRACE_MS);
             }
         }
     }
 }
 
-/// 从指定字节偏移读到 EOF（偏移恒在换行边界上，UTF-8 读取安全）
+/// 从指定字节偏移读到 EOF；未写完的 UTF-8 字符留到下轮重试。
 fn read_increment(path: &Path, offset: u64) -> anyhow::Result<String> {
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -974,6 +832,316 @@ fn read_increment(path: &Path, offset: u64) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct PollFixture {
+        dir: PathBuf,
+        wire: PathBuf,
+        trackers: HashMap<String, SessionTracker>,
+        idb_state: HashMap<String, (bool, String, Vec<String>)>,
+        idb_tails: Vec<IdbTails>,
+        tx: mpsc::Sender<NormalizedEvent>,
+        rx: mpsc::Receiver<NormalizedEvent>,
+        round: u64,
+        cancel_log: CancelLog,
+    }
+
+    impl PollFixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("bark-doubao-poll-{}", uuid::Uuid::new_v4()));
+            let wire = dir.join("sessions/1001/agents/main/system/trajectory.jsonl");
+            std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+            std::fs::write(&wire, "").unwrap();
+            let (tx, rx) = mpsc::channel(64);
+            Self { cancel_log: CancelLog::new(dir.join("logs")), dir, wire, trackers: HashMap::new(), idb_state: HashMap::new(), idb_tails: Vec::new(), tx, rx, round: 0 }
+        }
+
+        fn append(&self, record: Value) {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&self.wire).unwrap();
+            writeln!(file, "{record}").unwrap();
+        }
+
+        fn idb(&mut self, running: bool) {
+            self.idb_state.insert("1001".into(), (running, String::new(), if running { vec!["123".into()] } else { Vec::new() }));
+        }
+
+        fn cancel(&self, message: &str) {
+            use std::io::Write;
+            let root = self.dir.join("logs");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut file = std::fs::OpenOptions::new().create(true).append(true)
+                .open(root.join("saman_2026.1014.0.log")).unwrap();
+            file.write_all(crate::doubaowork_log::tests::line("1001", message).as_bytes()).unwrap();
+        }
+
+        fn poll(&mut self) -> Vec<EventKind> {
+            self.round += 1;
+            let mut ctx = ScanCtx {
+                cancel_log: &mut self.cancel_log, roots: &[self.dir.join("sessions")], idb_tails: &self.idb_tails, idb_state: &mut self.idb_state,
+            };
+            poll_round(&AtomicBool::new(false), &self.tx, AgentKind::DoubaoWork,
+                &mut ctx, &mut self.trackers, self.round).unwrap();
+            let mut events = Vec::new();
+            while let Ok(event) = self.rx.try_recv() { events.push(event.kind); }
+            events
+        }
+
+        fn finish(&mut self) -> Vec<EventKind> {
+            let events = self.poll();
+            if !events.is_empty() { return events; }
+            assert!(self.trackers.values().any(|t| t.pending_complete_at.is_some()));
+            for t in self.trackers.values_mut() {
+                if t.pending_complete_at.is_some() { t.pending_complete_at = Some(0); }
+            }
+            self.poll()
+        }
+
+        fn make_heartbeat_due(&mut self) {
+            for tracker in self.trackers.values_mut() {
+                tracker.last_emit_ms = now_millis() - HEARTBEAT_MS - 1;
+            }
+        }
+    }
+
+    impl Drop for PollFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+    }
+
+    #[test]
+    fn user_cancel_precedes_idle_and_blocks_late_trajectory_and_heartbeats() {
+        let mut f = PollFixture::new();
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.cancel("123");
+        assert_eq!(f.poll(), vec![EventKind::RunAborted]);
+        f.append(json!({"role":"user", "content":"late prompt"}));
+        f.append(json!({"role":"tool", "content":"late tool result"}));
+        f.cancel("123");
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty(), "重复取消/晚到轨迹/缓存运行状态都不能复活任务");
+        f.idb(false);
+        assert!(f.poll().is_empty(), "随后的数据库清空不能再报完成");
+        f.idb_state.insert("1001".into(), (true, String::new(), vec!["456".into()]));
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.cancel("123");
+        assert!(f.poll().is_empty(), "上一轮取消不影响新消息");
+        f.cancel("456");
+        assert_eq!(f.poll(), vec![EventKind::RunAborted], "连续两轮取消都有效");
+    }
+
+    #[test]
+    fn idle_before_cancel_waits_for_log_and_new_messages_can_skip_idle_snapshot() {
+        let mut f = PollFixture::new();
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.idb(false);
+        assert!(f.poll().is_empty(), "空闲先到，暂不报完成");
+        f.cancel("123");
+        assert_eq!(f.poll(), vec![EventKind::RunAborted]);
+        f.idb_state.insert("1001".into(), (true, String::new(), vec!["456".into()]));
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.cancel("456");
+        assert_eq!(f.poll(), vec![EventKind::RunAborted]);
+        // 快速追问时两次轮询之间可能错过 false；真实消息 ID 的变化仍能开启下一轮。
+        f.idb_state.insert("1001".into(), (true, String::new(), vec!["789".into()]));
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.cancel("456");
+        assert!(f.poll().is_empty());
+        f.idb(false);
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+    }
+
+    #[test]
+    fn cancellation_ends_waiting_for_input_without_waiting_for_ask_grace() {
+        let mut f = PollFixture::new();
+        f.idb(true);
+        f.poll();
+        f.append(json!({"role":"assistant", "tool_calls":[{"function":{"name":"interaction.ask"}}]}));
+        assert_eq!(f.poll(), vec![EventKind::InputRequired]);
+        f.idb(false);
+        assert!(f.poll().is_empty());
+        f.cancel("123");
+        assert_eq!(f.poll(), vec![EventKind::RunAborted]);
+        assert!(f.trackers.values().all(|t| !t.waiting_ask && t.pending_complete_at.is_none()));
+    }
+
+    #[test]
+    fn poll_real_storage_format_starts_before_trajectory_and_stays_finished() {
+        use crate::doubaowork_idb::fixtures::{table, value, wal};
+        let mut f = PollFixture::new();
+        std::fs::remove_file(&f.wire).unwrap();
+        std::fs::write(f.wire.with_file_name("assignment.md"), "- Role: main\n").unwrap();
+        let db = f.dir.join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        f.idb_tails.push(IdbTails::new(IdbLogTail::new(db.clone())));
+        assert!(f.poll().is_empty());
+
+        // 对应实测顺序：19:51:09 数据库开始运行，trajectory 此时还没写入。
+        let running = value("1001", true, true, true);
+        std::fs::write(db.join("000001.log"), wal(10, &[(b"session", Some(running.clone()))])).unwrap();
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.make_heartbeat_due();
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+
+        // 到完成时才追加 user，数据库完成必须压过这条迟到的“开始”。
+        std::fs::write(&f.wire, "").unwrap();
+        f.append(json!({"role":"user", "content":"late task prompt"}));
+        let done = value("1001", false, true, true);
+        std::fs::write(db.join("000002.log"), wal(20, &[(b"session", Some(done.clone()))])).unwrap();
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+
+        // compaction 留下包含旧运行状态的表，也不能复活任务。
+        std::fs::write(db.join("000003.ldb"), table(&[(10, b"session".to_vec(), Some(running))], true)).unwrap();
+        std::fs::write(db.join("000004.ldb"), table(&[(20, b"session".to_vec(), Some(done))], true)).unwrap();
+        std::fs::remove_file(db.join("000001.log")).unwrap();
+        std::fs::remove_file(db.join("000002.log")).unwrap();
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+
+        // 模拟重启监控，完成种子只剩 SST，不能按 user 尾行重放活动。
+        f.trackers.clear(); f.idb_state.clear();
+        f.idb_tails = vec![IdbTails::new(IdbLogTail::new(db.clone()))];
+        assert!(f.poll().is_empty());
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+
+        std::fs::write(db.join("000005.log"), wal(30, &[(b"session", Some(value("1001", true, true, true)))])).unwrap();
+        assert_eq!(f.poll(), vec![EventKind::Activity], "下一轮真实运行仍可重新点亮");
+        std::fs::write(db.join("000006.log"), wal(40, &[(b"session", Some(value("1001", false, true, true)))])).unwrap();
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+    }
+
+    #[test]
+    fn poll_completion_wins_over_late_trajectory_and_allows_next_turn() {
+        let mut f = PollFixture::new();
+        f.append(json!({"role": "user", "content": "old task"}));
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+
+        // 同一轮先读到数据库完成，再读到迟落盘的 user，最终必须保持完成。
+        f.idb(false);
+        f.append(json!({"role": "user", "content": "old task"}));
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.append(json!({"role": "tool", "content": "late result"}));
+        assert!(f.poll().is_empty());
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+
+        // 新任务的轨迹可能先于数据库到达；等运行信号到达后仍能恢复，不吞下一轮。
+        f.append(json!({"role": "user", "content": "next task"}));
+        assert!(f.poll().is_empty());
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        assert_eq!(f.trackers.values().next().unwrap().last_prompt, "next task");
+        f.idb(false);
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+    }
+
+    #[test]
+    fn poll_trajectory_terminal_blocks_cached_running_heartbeat() {
+        let mut f = PollFixture::new();
+        f.append(json!({"role": "user", "content": "task"}));
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.append(json!({"role": "assistant", "content": "done"}));
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty(), "缓存的 running=true 不能复活已完成回合");
+        f.append(json!({"role": "tool", "content": "late result"}));
+        assert!(f.poll().is_empty());
+        // 数据库尚未清除旧状态，但用户确实发起下一轮时仍可恢复。
+        f.append(json!({"role": "user", "content": "new task"}));
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.append(json!({"role": "assistant", "content": "new task done"}));
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.idb(false);
+        assert!(f.poll().is_empty(), "两个来源的完成信号只收场一次");
+    }
+
+    #[test]
+    fn poll_idle_seed_blocks_late_records_but_ask_answer_still_resumes() {
+        let mut f = PollFixture::new();
+        f.append(json!({"role": "user", "content": "old"}));
+        f.idb(false);
+        assert!(f.poll().is_empty());
+        f.append(json!({"role": "tool", "content": "old result"}));
+        assert!(f.poll().is_empty());
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.append(json!({"role": "assistant", "tool_calls": [
+            {"function": {"name": "interaction.ask", "arguments": {"question": "choose"}}}
+        ]}));
+        assert_eq!(f.poll(), vec![EventKind::InputRequired]);
+        f.idb(false);
+        f.append(json!({"role": "tool", "content": "answer"}));
+        assert_eq!(f.poll(), vec![EventKind::ToolFinished]);
+        assert!(f.trackers.values().next().unwrap().pending_complete_at.is_none());
+        assert!(!f.trackers.values().next().unwrap().waiting_ask);
+        f.append(json!({"role": "assistant", "tool_calls": [
+            {"function": {"name": "shell.run", "arguments": {}}}
+        ]}));
+        assert_eq!(f.poll(), vec![EventKind::Activity], "回答后的工具执行仍属于当前回合");
+    }
+
+    #[test]
+    fn poll_bootstrap_terminal_does_not_heartbeat_and_log_only_turns_reopen() {
+        for seeded in [true, false] {
+            let mut f = PollFixture::new();
+            f.append(json!({"role": "user", "content": "old task"}));
+            f.append(json!({"role": "assistant", "content": "done"}));
+            if seeded { f.idb(true); }
+            assert!(f.poll().is_empty());
+            f.make_heartbeat_due();
+            assert!(f.poll().is_empty());
+            f.append(json!({"role": "user", "content": "next task"}));
+            assert_eq!(f.poll(), vec![EventKind::Activity]);
+            f.append(json!({"role": "assistant", "content": "done"}));
+            assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+            f.make_heartbeat_due();
+            assert!(f.poll().is_empty());
+        }
+    }
+
+    #[test]
+    fn poll_cloud_task_with_empty_trajectory_can_run_and_finish() {
+        let mut f = PollFixture::new();
+        f.idb(true);
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.make_heartbeat_due();
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.idb(false);
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+    }
+
+    #[test]
+    fn poll_first_idle_observation_closes_log_only_activity() {
+        let mut f = PollFixture::new();
+        f.append(json!({"role": "user", "content": "task"}));
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        f.idb(false);
+        f.append(json!({"role": "user", "content": "late task record"}));
+        assert_eq!(f.finish(), vec![EventKind::RunCompleted]);
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty());
+    }
+
+    #[test]
+    fn poll_bootstrap_during_partial_utf8_record_recovers() {
+        use std::io::Write;
+        let mut f = PollFixture::new();
+        let record = format!("{}\n", json!({"role": "user", "content": "中文任务"}));
+        let split = record.find('中').unwrap() + 1;
+        std::fs::write(&f.wire, &record.as_bytes()[..split]).unwrap();
+        assert!(f.poll().is_empty());
+        std::fs::OpenOptions::new().append(true).open(&f.wire).unwrap()
+            .write_all(&record.as_bytes()[split..]).unwrap();
+        assert_eq!(f.poll(), vec![EventKind::Activity]);
+        assert!(f.poll().is_empty());
+    }
 
     /// 真实样本的映射钉死（记录形状取自本机 trajectory.jsonl，2026-10-10）
     #[test]
@@ -1053,111 +1221,6 @@ mod tests {
         assert!(msg.ends_with('…'));
     }
 
-    /// IndexedDB 状态提取：id→extra 就近配对、running 判定、workspace 还原。
-    /// 字节形状照本机 000054.log 实录（v8 字符串带长度前缀字节 0x12/0xFB 等）。
-    #[test]
-    fn extract_idb_states_pairs_conversation_records() {
-        let extra_running = concat!(
-            "\"extra\"\u{c}{\"inner_samantha_web\":\"true\",",
-            "\"agent_task_param\":\"{\\\"runtime_type\\\":2,\\\"device_name\\\":\\\"HONOR\\\",",
-            "\\\"workspace\\\":\\\"D:\\\\\\\\MySpace\\\\\\\\others\\\\\\\\Octop\\\"}\",",
-            "\"running_messages\":\"{\\\"58110308132766978\\\":{\\\"started_at_ms\\\":1791636860147}}\"}"
-        );
-        let extra_done = "\"extra\"\u{fb}{\"is_loading\":\"0\",\"running_messages\":\"{}\"}";
-        let mut chunk: Vec<u8> = Vec::new();
-        chunk.extend_from_slice(b"noise\r\n\x10");
-        chunk.extend_from_slice(b"\"\x0fconversation_id\"\x12");
-        chunk.extend_from_slice(b"38446427804012034");
-        chunk.extend_from_slice(b"\"conversation_typeI\"\x02");
-        chunk.extend_from_slice(format!("\"{extra_running}\"").as_bytes());
-        chunk.extend_from_slice(b"\x0c");
-        chunk.extend_from_slice(b"\"\x0fconversation_id\"\x1238446394258425858");
-        chunk.extend_from_slice(format!("\"{extra_done}\"").as_bytes());
-        chunk.extend_from_slice(b"trailing\r\n\r\n");
-
-        let states = extract_idb_states(&chunk);
-        assert_eq!(states.len(), 2, "两个 running_messages 各配对一条: {states:?}");
-        assert_eq!(states[0].conv, "38446427804012034");
-        assert!(states[0].running, "非空 running_messages = 运行中");
-        assert_eq!(states[0].workspace, r"D:\MySpace\others\Octop", "双层转义要还原成真实路径");
-        assert_eq!(states[1].conv, "38446394258425858");
-        assert!(!states[1].running, "空 running_messages = 已结束");
-    }
-
-    /// 配对口径：条目间穿插其它记录（图片 URL、其他 id）不能带偏最近前驱
-    #[test]
-    fn extract_idb_states_nearest_preceding_id_wins() {
-        // A 的 id 与 extra 之间塞了 3KB 无关内容 → 超出 4096 窗口仍能配对，
-        // 但窗口内若混入 B 的 id（更近），必须配到 B
-        let filler = "x".repeat(1000);
-        let mut chunk: Vec<u8> = Vec::new();
-        chunk.extend_from_slice(b"\"\x0fconversation_id\"\x12");
-        chunk.extend_from_slice(b"111111111111111111"); // A 的 id（18 位）
-        chunk.extend_from_slice(filler.as_bytes());
-        chunk.extend_from_slice(b"\"\x0fconversation_id\"\x12");
-        chunk.extend_from_slice(b"222222222222222222"); // B 的 id（紧邻其 extra）
-        chunk.extend_from_slice(b"\"extra\"\x0c{\"running_messages\":\"{}\"}");
-        let states = extract_idb_states(&chunk);
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].conv, "222222222222222222", "最近前驱 id 获胜");
-        assert!(!states[0].running);
-    }
-
-    /// 配对口径：`local_conversation_id`（含 conversation_id 子串）不能当锚点——
-    /// 它的值是 local_ 前缀的本地 id，与会话目录名无关。锚点必须带前引号。
-    #[test]
-    fn extract_idb_states_ignores_local_conversation_id() {
-        let mut chunk: Vec<u8> = Vec::new();
-        // 记录里只有 local_conversation_id（在 extra 内、晚于真锚点出现）
-        chunk.extend_from_slice(b"\"\x0fconversation_id\"\x12");
-        chunk.extend_from_slice(b"38446427804012034");
-        chunk.extend_from_slice(
-            b"\"extra\"\x0c{\"local_conversation_id\":\"local_8011710141104443\",\"running_messages\":\"{}\"}",
-        );
-        let states = extract_idb_states(&chunk);
-        assert_eq!(states.len(), 1);
-        assert_eq!(
-            states[0].conv, "38446427804012034",
-            "local_conversation_id 不得抢配对"
-        );
-    }
-
-    /// 日志轮转：换新 .log 后游标从头重扫；同会话重复出现以后者为准
-    #[test]
-    fn idb_log_tail_resets_on_rotation() {
-        let dir = std::env::temp_dir().join(format!("ab-dbw-idb-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("000001.log");
-        std::fs::write(
-            &log,
-            format!(
-                "\"\x0fconversation_id\"\x12384464278800000000\"extra\"\u{c}{{\"running_messages\":\"{{}}\"}}"
-            ),
-        )
-        .unwrap();
-        let mut tail = IdbLogTail::new(dir.clone());
-        let states = tail.scan();
-        assert_eq!(states.len(), 1);
-        assert!(!states[0].running);
-        // 无新写入：不再产出
-        assert!(tail.scan().is_empty());
-
-        // 轮转：新编号日志（旧日志已被 compaction 删除）
-        let log2 = dir.join("000002.log");
-        std::fs::remove_file(&log).unwrap();
-        std::fs::write(
-            &log2,
-            format!(
-                "\"\x0fconversation_id\"\x12384464278800000000\"extra\"\u{c}{{\"running_messages\":\"{{\\\"581\\\":{{\\\"started_at_ms\\\":1791636860147}}}}\"}}"
-            ),
-        )
-        .unwrap();
-        let states = tail.scan();
-        assert_eq!(states.len(), 1, "轮转后重扫新日志");
-        assert!(states[0].running, "同一会话的新状态覆盖旧状态");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 完成跃迁（主信号）：IndexedDB 条目 true→false → RunCompleted（正文=任务文案，
     /// cwd=workspace）；启动播种 None→false 不产事件；普通聊天（无 trajectory）不产事件
     #[test]
@@ -1168,8 +1231,11 @@ mod tests {
         trackers.insert(
             "w1".into(),
             SessionTracker {
+                aborted: false,
                 sid: "1001".into(),
+                message_ids: Vec::new(),
                 offset: 0,
+                settled: false,
                 running: true,
                 waiting_ask: false,
                 idb_running: None,
@@ -1183,24 +1249,21 @@ mod tests {
             },
         );
         // 播种：None→true（回合在跑）不产事件；顺带回填 workspace
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        idb_state.insert("1001".into(), (true, r"D:\proj".into()));
-        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, 1000);
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        idb_state.insert("1001".into(), (true, r"D:\proj".into(), Vec::new()));
+        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, &CancelLog::default(), 1000);
         assert!(rx.try_recv().is_err());
         assert_eq!(trackers.get("w1").unwrap().workspace, r"D:\proj");
 
         // true→false：完成（正文=最近任务文案，cwd=workspace）
-        idb_state.insert("1001".into(), (false, r"D:\proj".into()));
-        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, 2000);
-        let ev = rx.try_recv().expect("条目清除必须发完成事件");
-        assert_eq!(ev.kind, EventKind::RunCompleted);
-        assert_eq!(ev.session_id, "1001");
-        assert_eq!(ev.cwd, r"D:\proj", "通知带项目目录");
-        assert_eq!(ev.message, "改 Logo 的任务");
+        idb_state.insert("1001".into(), (false, r"D:\proj".into(), Vec::new()));
+        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, &CancelLog::default(), 2000);
+        assert!(rx.try_recv().is_err(), "等待取消日志补齐后再报完成");
+        assert_eq!(trackers["w1"].pending_complete_at, Some(2000 + COMPLETE_GRACE_MS));
         assert!(!trackers.get("w1").unwrap().running);
         // 重复 false：不再发
-        idb_state.insert("1001".into(), (false, String::new()));
-        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, 3000);
+        idb_state.insert("1001".into(), (false, String::new(), Vec::new()));
+        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, &CancelLog::default(), 3000);
         assert!(rx.try_recv().is_err());
     }
 
@@ -1213,8 +1276,11 @@ mod tests {
         trackers.insert(
             "w1".into(),
             SessionTracker {
+                aborted: false,
                 sid: "1001".into(),
+                message_ids: Vec::new(),
                 offset: 0,
+                settled: false,
                 running: false,
                 waiting_ask: true,
                 idb_running: Some(true),
@@ -1228,8 +1294,8 @@ mod tests {
             },
         );
         // 提问挂起时清除 → 不立即完成，转延迟
-        let idb_state = HashMap::from([("1001".to_string(), (false, String::new()))]);
-        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, 1000);
+        let idb_state = HashMap::from([("1001".to_string(), (false, String::new(), Vec::new()))]);
+        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, &CancelLog::default(), 1000);
         assert!(rx.try_recv().is_err(), "宽限期内不发完成");
         assert_eq!(
             trackers.get("w1").unwrap().pending_complete_at,
@@ -1244,8 +1310,8 @@ mod tests {
     }
 
     /// 无 IndexedDB 种子时按 trajectory 文件停摆判定：老会话（文件久无动静，
-    /// 尾行停在 user 消息上）首见不点亮——否则每次重启都会把 compaction 出 .log
-    /// 的历史会话重新点亮一遍；新鲜文件照常点亮（现有 grace 测试即此路径）。
+    /// 尾行停在 user 消息上）首见不点亮——否则数据库不可读时，每次重启都会把
+    /// 历史会话重新点亮一遍；新鲜文件照常点亮（现有 grace 测试即此路径）。
     #[test]
     fn poll_round_suppresses_stale_idle_session_without_seed() {
         let dir = std::env::temp_dir().join(format!("ab-dbw-stale-{}", uuid::Uuid::new_v4().simple()));
@@ -1277,7 +1343,8 @@ mod tests {
         let idb: Vec<IdbTails> = Vec::new();
         let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
 
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 1).unwrap();
         assert!(
             rx.try_recv().is_err(),
@@ -1295,7 +1362,7 @@ mod tests {
             .unwrap()
             .write_all(format!("{}\n", json!({ "role": "user", "content": "新任务" })).as_bytes())
             .unwrap();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 2).unwrap();
         let ev = rx.try_recv().expect("新消息必须点亮");
         assert_eq!(ev.kind, EventKind::Activity);
@@ -1331,8 +1398,8 @@ mod tests {
         let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
 
         // 首见：user 行点亮
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 1).unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.kind, EventKind::Activity);
@@ -1343,9 +1410,9 @@ mod tests {
             tracker.waiting_ask = true;
             tracker.idb_running = Some(true);
         }
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        idb_state.insert("1001".into(), (false, String::new()));
-        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, now_millis());
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        idb_state.insert("1001".into(), (false, String::new(), Vec::new()));
+        apply_idb_state(&stop, &tx, AgentKind::DoubaoWork, &mut trackers, &idb_state, &CancelLog::default(), now_millis());
         assert!(rx.try_recv().is_err());
 
         // 把宽限期拨到已过期，再跑一轮 → 完成事件
@@ -1353,8 +1420,8 @@ mod tests {
             let tracker = trackers.values_mut().next().unwrap();
             tracker.pending_complete_at = Some(now_millis() - 1);
         }
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 2).unwrap();
         let ev = rx.try_recv().expect("宽限到期必须发完成");
         assert_eq!(ev.kind, EventKind::RunCompleted);
@@ -1399,7 +1466,7 @@ mod tests {
             ]}),
             json!({ "role": "tool", "content": "ok" })
         );
-        let (events, running_flag, waiting) = bootstrap_tail(&running);
+        let (events, running_flag, waiting, _) = bootstrap_tail(&running);
         assert!(running_flag, "尾部无终态信号 → 回合在跑");
         assert!(!waiting);
         assert_eq!(events.len(), 1);
@@ -1413,7 +1480,7 @@ mod tests {
                 { "function": { "name": "interaction.ask", "arguments": { "questions": [] } } }
             ]})
         );
-        let (events, running_flag, waiting) = bootstrap_tail(&ask_pending);
+        let (events, running_flag, waiting, _) = bootstrap_tail(&ask_pending);
         assert!(!running_flag, "提问后回合挂起等回答");
         assert!(waiting);
         assert_eq!(events.len(), 1, "等待态也要点亮一次（蓝色，不重放等待通知）");
@@ -1424,7 +1491,8 @@ mod tests {
             json!({ "role": "user", "content": "已完成的事" }),
             json!({ "role": "assistant", "content": "做完了" })
         );
-        let (events, running_flag, waiting) = bootstrap_tail(&finished);
+        let (events, running_flag, waiting, completed) = bootstrap_tail(&finished);
+        assert!(completed);
         assert!(!running_flag && !waiting);
         assert!(events.is_empty(), "历史完成不得重放");
     }
@@ -1434,14 +1502,15 @@ mod tests {
     fn split_complete_lines_buffers_partial_tail() {
         let mut pending = String::new();
         let (lines, consumed) = split_complete_lines("{\"role\":\"use", &mut pending);
-        assert!(lines.is_empty() && consumed == 0, "半行不产出也不消耗");
+        assert!(lines.is_empty());
+        assert_eq!(consumed, pending.len(), "残行已读入缓冲区，文件偏移也必须推进");
 
         let (lines, consumed) = split_complete_lines(
             "r\",\"content\":\"hi\"}\n{\"role\":\"tool\"}\n{partial",
             &mut pending,
         );
         assert_eq!(lines.len(), 2);
-        assert_eq!(consumed, "{\"role\":\"user\",\"content\":\"hi\"}\n{\"role\":\"tool\"}\n".len());
+        assert_eq!(consumed, "r\",\"content\":\"hi\"}\n{\"role\":\"tool\"}\n{partial".len());
         assert_eq!(pending, "{partial", "尾部残行暂存");
     }
 
@@ -1519,22 +1588,22 @@ mod tests {
         let idb: Vec<std::sync::Mutex<IdbLogTail>> = Vec::new();
         let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
 
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 1).unwrap();
         assert_eq!(trackers.len(), 1);
         assert!(trackers.values().next().unwrap().running, "尾部停在工具运行 → 运行中");
         let ev = rx.try_recv().expect("首见运行中会话应发引导心跳");
         assert_eq!(ev.kind, EventKind::Activity);
 
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 2).unwrap();
         assert!(rx.try_recv().is_err());
 
         std::fs::remove_file(&wire).unwrap();
-        let mut idb_state: HashMap<String, (bool, String)> = HashMap::new();
-        let mut ctx = ScanCtx { roots: &roots, idb_tails: &idb, idb_state: &mut HashMap::new() };
+        let mut idb_state: HashMap<String, (bool, String, Vec<String>)> = HashMap::new();
+        let mut ctx = ScanCtx { cancel_log: &mut CancelLog::default(), roots: &roots, idb_tails: &idb, idb_state: &mut idb_state };
         poll_round(&stop, &tx, AgentKind::DoubaoWork, &mut ctx, &mut trackers, 3).unwrap();
         assert!(trackers.is_empty(), "消失的会话不应继续占用跟踪表");
         let ev = rx.try_recv().expect("运行中会话被删必须闭环");
@@ -1550,7 +1619,7 @@ mod tests {
     /// 随后的增量按序产出事件、终态正文回填任务文案
     #[test]
     fn steady_state_event_order() {
-        let (events, running, _) = bootstrap_tail(&format!(
+        let (events, running, _, _) = bootstrap_tail(&format!(
             "{}\n{}\n",
             json!({ "role": "user", "content": "改 Logo" }),
             json!({ "role": "tool", "content": "ok" })
@@ -1604,22 +1673,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let stop = Arc::new(AtomicBool::new(false));
         let handle = watch.spawn(stop.clone(), tx).expect("watcher 应能启动");
+        let mut count = 0;
         for sec in 0..10 {
             std::thread::sleep(std::time::Duration::from_secs(1));
             while let Ok(ev) = rx.try_recv() {
-                eprintln!(
-                    "[{:>2}s] {:?} session={} cwd={:?} tool={:?} msg={}",
-                    sec + 1,
-                    ev.kind,
-                    &ev.session_id[..ev.session_id.len().min(12)],
-                    ev.cwd,
-                    ev.tool_name,
-                    truncate_chars(&ev.message, 60)
-                );
+                count += 1;
+                eprintln!("[{:>2}s] {:?} session={}", sec + 1, ev.kind, ev.session_id);
             }
         }
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
+        eprintln!("10 秒只读监控共收到 {count} 个事件");
     }
 
     /// 端到端冒烟：读**真实**豆包工作会话目录并解析（本机装了豆包工作时手动跑：
@@ -1656,12 +1720,12 @@ mod tests {
         }
         assert!(found > 0, "应能找到至少一个主 agent 的 trajectory");
 
-        // IndexedDB 实测：全量扫当前日志，应能配出会话状态（运行中或已结束）
+        // IndexedDB 实测：合并 WAL 与 SST，应能配出会话状态（运行中或已结束）
         let mut updates = Vec::new();
         for dir in indexeddb_dirs_under(&user_data_root().unwrap()) {
-            let data = std::fs::read(current_log(&dir).unwrap_or(dir.join("none.log"))).unwrap_or_default();
-            updates.extend(extract_idb_states(&data));
+            updates.extend(IdbLogTail::new(dir).scan());
         }
-        eprintln!("IndexedDB 会话状态: {updates:?}");
+        assert!(!updates.is_empty(), "实际数据库必须能解出状态");
+        for update in updates { eprintln!("会话 {}: running={}", update.conv, update.running); }
     }
 }

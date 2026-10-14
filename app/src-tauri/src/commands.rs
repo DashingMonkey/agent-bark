@@ -7,7 +7,7 @@ use bark_adapters::{AgentStatus, InstallCtx, RegisterCtx};
 use bark_channels::{BarkChannel, Channel, Notification, WebhookChannel};
 use bark_core::config::BarkChannelConfig;
 use bark_core::{BarkConfig, ChannelsConfig, EventKind, NormalizedEvent, WebhookChannelConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 use tokio::sync::mpsc;
@@ -61,8 +61,10 @@ pub struct Diagnostics {
     pub server_error: Option<String>,
     /// 配置里的 port/token 与运行中的事件服务器不一致 → 需重启才生效
     pub restart_required: bool,
-    /// 启动自检产生的问题（接入自愈失败 / 因配置损坏被置为未启用）
+    /// 启动自检产生的接入故障（自愈失败 / 配置无法解析）
     pub startup_warnings: Vec<String>,
+    /// 更新成功后的操作提醒，与接入故障分开展示。
+    pub startup_notices: Vec<String>,
 }
 
 /// 所有 agent 的检测状态
@@ -125,6 +127,7 @@ pub async fn diagnostics(state: State<'_, Arc<AppState>>) -> Result<Diagnostics,
         server_error: state.server_error(),
         restart_required: state.restart_required(),
         startup_warnings: state.startup_warnings(),
+        startup_notices: state.startup_notices(),
     })
 }
 
@@ -229,8 +232,8 @@ fn set_agent_enabled_blocking(
     }
 
     // 监控型：只写开关，sync_watchers 负责启停。
-    // 整个「读-改-写盘」持 config_write（§2.1 单写者语义）：与 save_config 的整份
-    // 覆盖、悬浮窗的单字段写串行，防并发保存交错丢更新（同类写路径一并纳入）。
+    // 整个「读-改-写盘」持 config_write（§2.1 单写者语义）：与 save_config 的分区
+    // 合并、悬浮窗的单字段写串行，防并发保存交错丢更新（同类写路径一并纳入）。
     // 锁在 sync_watchers 等副作用之前释放（见 AppState::config_write 的注释）。
     {
         let _write_guard = crate::state::lock(&state.config_write);
@@ -281,13 +284,57 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<BarkConfig, S
     Ok(crate::state::read(&state.config).clone())
 }
 
-/// 保存配置（前端提交完整配置）
+/// 页面只提交自己负责的分区；接入开关由 set_agent_enabled 管理。
+/// server 有意不开放：当前 UI 只展示端口/token，修改需手工编辑配置并重启。
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigPatch {
+    channels: Option<ChannelsConfig>,
+    rules: Option<bark_core::RulesConfig>,
+    notify: Option<bark_core::NotifyConfig>,
+    glow: Option<bark_core::GlowConfig>,
+    widget: Option<WidgetPatch>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WidgetPatch {
+    enabled: Option<bool>,
+    auto_hide: Option<bool>,
+}
+
+impl ConfigPatch {
+    fn apply(self, current: &mut BarkConfig) {
+        if let Some(value) = self.channels {
+            current.channels = value;
+        }
+        if let Some(value) = self.rules {
+            current.rules = value;
+        }
+        if let Some(value) = self.notify {
+            current.notify = value;
+        }
+        if let Some(value) = self.glow {
+            current.glow = value;
+        }
+        if let Some(value) = self.widget {
+            if let Some(enabled) = value.enabled {
+                current.widget.enabled = enabled;
+            }
+            if let Some(auto_hide) = value.auto_hide {
+                current.widget.auto_hide = auto_hide;
+            }
+        }
+    }
+}
+
+/// 在写锁内将页面修改合并进最新配置。
 #[tauri::command]
 pub async fn save_config(
     webview: Webview,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    config: BarkConfig,
+    config: ConfigPatch,
     tx: State<'_, mpsc::Sender<NormalizedEvent>>,
 ) -> Result<(), String> {
     require_window(&webview, MAIN)?;
@@ -300,32 +347,11 @@ pub async fn save_config(
         // 让用户先修复文件（AgentsPage 已提示「修复文件后重启应用」）。
         ensure_config_writable(&state)?;
 
-        let mut incoming = config;
-        // 端口/token 由用户手改时不再静默回退成启动值（那会让 UI 保存看起来「没生效」）：
-        // 保存用户提交的值，运行中的服务器继续用启动值，UI 通过 diagnostics.restart_required
-        // 提示「需重启生效」。空值视为未填写，保留运行值以免把 token 清掉。
-        if incoming.server.token.trim().is_empty() {
-            incoming.server.token = state.server_token.clone();
-        }
-        if incoming.server.port == 0 {
-            incoming.server.port = state.server_port;
-        }
-        if incoming.server.port != state.server_port || incoming.server.token != state.server_token {
-            tracing::warn!(
-                "server.port/token 已保存，但运行中的事件服务器仍使用启动值（127.0.0.1:{}），重启后生效",
-                state.server_port
-            );
-        }
-
-        // 「读-改-写盘-换内存」全程持 config_write（§2.1 单写者语义）：
-        // 与 save_widget_position / set_widget_pinned / close_widget 的单字段写盘
-        // 串行——否则刚拖的悬浮窗位置会被这份旧快照整份覆盖回去（丢更新）。
-        // 悬浮窗的几何记忆（x/y/pinned）保留逻辑紧贴落盘、同在锁内：
-        // 前端提交的是打开页面时的快照，以**窗口侧实时上报**的那份为准；
-        // 开关（enabled）仍以页面为准。锁在副作用（sync_watchers 等）之前释放。
+        // 与接入开关、悬浮窗位置等写盘串行，锁在副作用之前释放。
         {
             let _write_guard = crate::state::lock(&state.config_write);
-            preserve_widget_geometry(&mut incoming, &crate::state::read(&state.config));
+            let mut incoming = crate::state::read(&state.config).clone();
+            config.apply(&mut incoming);
             // 先落盘（不持配置读写锁本体），再原子替换内存值：
             // save() 内部有 fsync，持 RwLock 写锁会阻塞 run_pipeline 的读锁
             incoming.save(&state.config_path).map_err(|e| format!("配置保存失败: {e:#}"))?;
@@ -343,17 +369,9 @@ pub async fn save_config(
     .map_err(|e| e.to_string())?
 }
 
-/// 整份保存时保留悬浮窗几何记忆（x/y/pinned）：以窗口侧实时上报的那份为准。
-/// 抽成纯函数钉死「整份覆盖不得回退刚拖到的位置」（§2.1 回归）。
-fn preserve_widget_geometry(incoming: &mut BarkConfig, current: &BarkConfig) {
-    incoming.widget.x = current.widget.x;
-    incoming.widget.y = current.widget.y;
-    incoming.widget.pinned = current.widget.pinned;
-}
-
 /// 悬浮窗位置记忆（拖动松手后上报，低频）。
 ///
-/// 只写 widget 段、不走整份 save_config：位置上报与用户在主窗口的编辑并发，
+/// 只写 widget 段、不走页面分区保存：位置上报与用户在主窗口的编辑并发，
 /// 整份落盘会互相覆盖。口径见 widget.rs 模块注释（x/y = 卡片左上角，逻辑像素）。
 #[tauri::command]
 pub async fn save_widget_position(webview: Webview, state: State<'_, Arc<AppState>>, x: f64, y: f64) -> Result<(), String> {
@@ -361,7 +379,7 @@ pub async fn save_widget_position(webview: Webview, state: State<'_, Arc<AppStat
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         ensure_config_writable(&state)?;
-        // 单写者（§2.1）：与 save_config 的整份覆盖串行，「读-改-写盘」全程持锁
+        // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
         let _write_guard = crate::state::lock(&state.config_write);
         let mut cfg = crate::state::write(&state.config);
         cfg.widget.x = x;
@@ -381,7 +399,7 @@ pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         ensure_config_writable(&state)?;
-        // 单写者（§2.1）：与 save_config 的整份覆盖串行，「读-改-写盘」全程持锁
+        // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
         let _write_guard = crate::state::lock(&state.config_write);
         let mut cfg = crate::state::write(&state.config);
         cfg.widget.pinned = pinned;
@@ -402,7 +420,7 @@ pub async fn close_widget(webview: Webview, app: AppHandle, state: State<'_, Arc
     let cfg_state = state.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         ensure_config_writable(&cfg_state)?;
-        // 单写者（§2.1）：与 save_config 的整份覆盖串行，「读-改-写盘」全程持锁
+        // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
         let _write_guard = crate::state::lock(&cfg_state.config_write);
         let mut cfg = crate::state::write(&cfg_state.config);
         cfg.widget.enabled = false;
@@ -788,23 +806,33 @@ mod tests {
         assert!(resolve_test_target("nope", &saved, None, None).is_err(), "未知渠道报错");
     }
 
-    /// §2.1 回归：整份保存必须保留悬浮窗几何记忆（窗口侧实时上报的 x/y/pinned 为准），
-    /// 否则用户保存设置前拖过悬浮窗会被旧快照回退
     #[test]
-    fn whole_config_save_keeps_live_widget_geometry() {
+    fn section_saves_preserve_other_pages_and_live_widget_fields() {
         let mut current = BarkConfig::default();
         current.widget.x = -1920.0;
         current.widget.y = 60.0;
         current.widget.pinned = true;
-        let mut incoming = BarkConfig::default();
-        incoming.widget.x = 10.0;
-        incoming.widget.y = 20.0;
-        incoming.widget.pinned = false;
-        incoming.widget.enabled = false; // 开关仍以页面为准
-        preserve_widget_geometry(&mut incoming, &current);
-        assert_eq!(incoming.widget.x, -1920.0, "刚拖到副屏的位置不得被旧快照覆盖");
-        assert_eq!(incoming.widget.y, 60.0);
-        assert!(incoming.widget.pinned);
-        assert!(!incoming.widget.enabled, "开关不受几何保留逻辑影响");
+        current.set_agent_enabled("kimi-code", true);
+        let token = current.server.token.clone();
+        let patches = [
+            serde_json::json!({"widget": {"enabled": false}}),
+            serde_json::json!({"channels": {"bark": {"enabled": true, "url": "https://example.com"}}}),
+            serde_json::json!({"rules": {"aggregate_window_ms": 2000}}),
+            serde_json::json!({"notify": {"enabled": false}, "glow": {"enabled": false}}),
+        ];
+        for patch in patches {
+            serde_json::from_value::<ConfigPatch>(patch).unwrap().apply(&mut current);
+        }
+        assert!(!current.widget.enabled);
+        assert_eq!(current.widget.x, -1920.0);
+        assert_eq!(current.widget.y, 60.0);
+        assert!(current.widget.pinned);
+        assert!(current.agent_enabled("kimi-code"));
+        assert_eq!(current.server.token, token);
+        assert_eq!(current.channels.bark.unwrap().url, "https://example.com");
+        assert_eq!(current.rules.aggregate_window_ms, 2000);
+        assert!(!current.notify.enabled);
+        assert!(!current.glow.enabled);
+        assert!(serde_json::from_value::<ConfigPatch>(serde_json::json!({"agents": []})).is_err());
     }
 }

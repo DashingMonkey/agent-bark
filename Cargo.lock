@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agent-bark-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bark-adapters",
@@ -385,12 +385,13 @@ dependencies = [
 
 [[package]]
 name = "bark-adapters"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes",
  "anyhow",
  "bark-core",
  "cbc",
+ "crc32c",
  "dirs 7.0.0",
  "hmac",
  "pbkdf2",
@@ -399,6 +400,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "snap",
  "tokio",
  "toml 1.1.5+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
@@ -408,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "bark-channels"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bark-core",
@@ -420,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "bark-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bark-adapters",
  "bark-core",
@@ -434,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "bark-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -446,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "bark-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "bark-core",
@@ -904,6 +906,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -4042,6 +4053,12 @@ name = "smallvec"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"

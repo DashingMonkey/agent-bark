@@ -22,7 +22,7 @@
 //! 中止检测（手动 Esc 取消回合）：官方事件页没有 abort 语义文档，但社区插件
 //! （opencode-auto-resume）实证 Esc 取消走 `session.error` 且错误名为
 //! `MessageAbortedError`——归一成 `run_aborted`（不亮失败色不通知），并压制
-//! 其后 10s 内的 `session.idle`（否则中止紧跟一条绿色「完成」，谎报跑完）。
+//! 其后的 `session.idle`，直到明确开始下一回合（否则中止紧跟绿色「完成」，谎报跑完）。
 //! 判定是防御式字符串匹配：匹配不上回落 `run_failed`，最坏情况 = 无中止检测的旧行为。
 //!
 //! 会话元数据：运行中的事件只带 sessionID，cwd 唯一来源是 session.created/updated
@@ -124,7 +124,7 @@ const turnOpen = new Set();
 // 已发过执行中心跳的工具部件 id：state 会 pending→running→completed 逐态各推
 // 一条事件，不合并的话一次工具调用 tool_calls 就双计
 const toolPosted = new Set();
-// sessionID → 最近一次中止时刻：压制其后 10s 内的 session.idle
+// sessionID → 最近一次中止时刻：压制后续 session.idle，新 busy 回合清除。
 const recentAbort = new Map();
 // (事件名, 会话) → 最近一次放行时刻：双通道分发去抖（见 isDuplicateDispatch）
 const recentDispatch = new Map();
@@ -206,9 +206,7 @@ async function handle(eventName, payload) {{
       const now = Date.now();
       if (sid) {{
         recentAbort.set(sid, now);
-        for (const [k, t] of recentAbort) {{
-          if (now - t > 60000) recentAbort.delete(k);
-        }}
+        capBounded(recentAbort, 500);
       }}
       await post("run_aborted", {{ sessionID: sid, cwd, is_subagent: sub }});
       return;
@@ -220,7 +218,7 @@ async function handle(eventName, payload) {{
   // 不压制的话中止（已中止）会紧跟一条绿色「任务完成」，谎报跑完
   if (eventName === "session.idle") {{
     turnOpen.delete(sid);
-    if (sid && Date.now() - (recentAbort.get(sid) ?? 0) < 10000) {{
+    if (sid && recentAbort.has(sid)) {{
       return;
     }}
     await post("run_completed", {{ sessionID: sid, cwd, is_subagent: sub }});
@@ -234,6 +232,9 @@ async function handle(eventName, payload) {{
       turnOpen.delete(sid);
     }} else if (st === "busy") {{
       if (!turnOpen.has(sid)) {{
+        // 明确开始新回合才解除取消标记：既压住迟到 idle，也不吞下轮正常完成。
+        recentAbort.delete(sid);
+        recentDispatch.delete(`session.idle\u0000${{sid}}`);
         turnOpen.add(sid);
         capBounded(turnOpen, 500);
         await post("activity", {{ sessionID: sid, cwd, is_subagent: sub }});
@@ -584,11 +585,23 @@ mod tests {
     #[test]
     fn generated_plugin_detects_abort() {
         // 中止链路：session.error(MessageAbortedError) → run_aborted（不亮失败色），
-        // 其后的 session.idle 在 10s 内压制（否则中止会紧跟一条绿色「完成」）
+        // 其后的 session.idle 压制到下一回合开始（否则中止会紧跟绿色「完成」）
         let js = plugin_js(1234, "tok");
         assert!(js.contains("MessageAbortedError"), "中止判定必须覆盖 MessageAbortedError");
         assert!(js.contains("recentAbort"), "必须记录中止时刻以压制随后的 idle");
         assert!(js.contains("run_aborted"), "中止必须归一为 run_aborted");
+    }
+
+    #[test]
+    fn generated_plugin_cancellation_lifecycle() {
+        let path = std::env::temp_dir().join(format!("bark-opencode-{}.js", uuid::Uuid::new_v4()));
+        std::fs::write(&path, plugin_js(1234, "test")).unwrap();
+        let result = std::process::Command::new("node")
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opencode_terminal_sim.mjs"))
+            .arg(&path).output();
+        let _ = std::fs::remove_file(path);
+        let output = result.expect("需要 Node 运行生成插件的取消行为测试");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]

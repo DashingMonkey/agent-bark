@@ -21,6 +21,7 @@ import { listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import {
   api,
+  EVENT_LABELS,
   agentIcon,
   agentName,
   agentShortName,
@@ -234,11 +235,9 @@ const abortedRows = new Map<string, number>();
  */
 const ABORT_HOLD_MS = 5000;
 /**
- * 手动终止的文案。主面板事件流的 `EVENT_LABELS.run_aborted` 是「已中止」，这里刻意不同：
- * 卡片上的行要回答「这行怎么了」，而 `run_aborted` 只会由用户自己按停止产生，
- * 写「手动终止」比「已中止」更没有歧义（说清楚是谁中止的）。
+ * 终止文案与主面板共用统一事件标签，各 agent 不单独决定展示名称。
  */
-const ABORT_LABEL = "手动终止";
+const ABORT_LABEL = EVENT_LABELS.run_aborted;
 /**
  * 父会话被手动终止、但它的子代理还在跑时，**子代理行**的文案。
  *
@@ -281,8 +280,8 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
     return;
   }
   const map: Partial<Record<NormalizedEvent["type"], [StateColor, string]>> = {
-    run_completed: ["completed", "任务完成"],
-    run_failed: ["failed", "任务失败"],
+    run_completed: ["completed", EVENT_LABELS.run_completed],
+    run_failed: ["failed", EVENT_LABELS.run_failed],
     run_aborted: ["failed", ABORT_LABEL],
   };
   const hit = map[ev.type];

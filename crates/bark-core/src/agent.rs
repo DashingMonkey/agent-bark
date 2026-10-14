@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 /// - `qoder-cn`：Qoder CN 国内版已与国际版**合并**成一条 adapter（id 仍是 `qoder`，
 ///   同时写 `~/.qoder/settings.json` 与 `~/.qoder-cn/settings.json`，与 TraeCode 同样式）。
 ///   老配置里的 `qoder-cn` 开关会在加载时并到 `qoder` 上（见 `BarkConfig::load`）
-pub const RETIRED_AGENT_IDS: [&str; 3] = ["qoder-work", "qoder-cn-cli", "qoder-cn"];
+/// - `windsurf`：已移除检测和接入。
+pub const RETIRED_AGENT_IDS: [&str; 4] = ["qoder-work", "qoder-cn-cli", "qoder-cn", "windsurf"];
 
 /// 已知的 agent 种类（hook 型 + 监控型统一枚举）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,8 +40,6 @@ pub enum AgentKind {
     Cursor,
     /// GitHub Copilot CLI（~/.copilot/hooks/agent-bark.json 专用文件，官方事件为 camelCase）
     CopilotCli,
-    /// Windsurf（~/.codeium/windsurf/hooks.json，扁平结构无 version，仅 2-3 个事件）
-    Windsurf,
     /// Google Antigravity（~/.gemini/config/hooks.json 命名组，payload 无事件名字段）
     Antigravity,
     /// Kimi Code（Moonshot，~/.kimi-code/config.toml 的 [[hooks]]——唯一的 TOML 宿主；
@@ -69,7 +68,7 @@ impl AgentKind {
     /// 前两者没人用或被官方除名，后者并入了 Qoder。都不再注册 adapter，用户配置里
     /// 残留的旧 id 字符串无害——agents 段存的是 String，bark-cli 遇到未知 id 也只
     /// 打印一行并 exit 0）
-    pub const ALL: [AgentKind; 21] = [
+    pub const ALL: [AgentKind; 20] = [
         AgentKind::ClaudeCode,
         AgentKind::TraeCode,
         AgentKind::CodeBuddy,
@@ -86,7 +85,6 @@ impl AgentKind {
         AgentKind::Grok,
         AgentKind::Cursor,
         AgentKind::CopilotCli,
-        AgentKind::Windsurf,
         AgentKind::Antigravity,
         AgentKind::KimiCode,
         AgentKind::KimiWork,
@@ -111,7 +109,6 @@ impl AgentKind {
             AgentKind::Grok => "grok",
             AgentKind::Cursor => "cursor",
             AgentKind::CopilotCli => "copilot-cli",
-            AgentKind::Windsurf => "windsurf",
             AgentKind::Antigravity => "antigravity",
             AgentKind::KimiCode => "kimi-code",
             AgentKind::KimiWork => "kimi-work",
@@ -140,7 +137,6 @@ impl AgentKind {
             AgentKind::Grok => "Grok CLI",
             AgentKind::Cursor => "Cursor",
             AgentKind::CopilotCli => "Copilot CLI",
-            AgentKind::Windsurf => "Windsurf",
             AgentKind::Antigravity => "Antigravity",
             AgentKind::KimiCode => "Kimi Code",
             AgentKind::KimiWork => "Kimi Work",

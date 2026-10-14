@@ -55,8 +55,14 @@ rem so later checks only see results of their own commands
 ver >nul
 
 echo.
-echo [3/5] Type-checking frontend...
+echo [3/5] Type-checking frontend and running Node + Rust tests...
 call pnpm typecheck
+if errorlevel 1 goto :fail
+call pnpm test
+if errorlevel 1 goto :fail
+call pnpm test:tools
+if errorlevel 1 goto :fail
+cargo test --manifest-path "%~dp0Cargo.toml" --workspace --all-targets
 if errorlevel 1 goto :fail
 
 echo.

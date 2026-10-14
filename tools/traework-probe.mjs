@@ -26,8 +26,9 @@
  * 不抛裸异常栈；HMAC 校验失败 exit 1（运行结果性失败）；HMAC 比较恒定时间；
  * 输出逐页写盘（不全量驻留拼接）；DLL 扫描窗口式读（不整文件 readFileSync）。
  */
-import { openSync, readSync, writeSync, closeSync, statSync, readFileSync, ftruncateSync } from "node:fs";
-import { createHmac, pbkdf2Sync, createDecipheriv, timingSafeEqual } from "node:crypto";
+import { openSync, readSync, writeSync, closeSync, statSync, readFileSync, ftruncateSync, fstatSync, fsyncSync, renameSync, unlinkSync } from "node:fs";
+import { createHmac, pbkdf2Sync, createDecipheriv, timingSafeEqual, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 const PAGE_SZ = 4096, SALT_SZ = 16, IV_SZ = 16, HMAC_SZ = 64, RESERVE_SZ = 80;
 const WAL_HDR_SZ = 32, WAL_FRAME_HDR_SZ = 24;
@@ -254,32 +255,50 @@ function cmdDecrypt(args) {
   // 先取页 1 的盐派生 mac_key（全库相同），随后**逐页验 HMAC 再解密**（§2.19）：
   // 一把读全库撞上 WAL checkpoint 会得到新旧混合世代页，混代页可能解出
   // 「能查但值错乱」的行——任一页失配就拒绝整库（当轮 bail，下轮自愈）
-  readPage(fd, 1, page);
-  const macKey = deriveMacKey(key, page.subarray(0, SALT_SZ));
   let outFd;
+  let temporary;
   try {
-    outFd = openSync(args.out, "w");
-  } catch (e) {
-    closeSync(fd);
-    throw new Error(`无法写输出文件 ${args.out}（${e.message}）`);
-  }
-  try {
+    // 输出也不能覆盖源库的 WAL/SHM/journal；它们属于源数据库，而不是解密产物。
+    const source = fstatSync(fd, { bigint: true });
+    let destination;
+    try { destination = statSync(args.out, { bigint: true }); }
+    catch (e) { if (e.code !== "ENOENT") throw e; }
+    const pathKey = (path) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      const protectedPath = db + suffix;
+      let protectedStat = suffix === "" ? source : undefined;
+      if (suffix) {
+        try { protectedStat = statSync(protectedPath, { bigint: true }); }
+        catch (e) { if (e.code !== "ENOENT") throw e; }
+      }
+      if (pathKey(args.out) === pathKey(protectedPath) || (destination && protectedStat &&
+          protectedStat.dev === destination.dev && protectedStat.ino === destination.ino)) {
+        throw new Error("输出文件不能覆盖源数据库及其 WAL/SHM/journal（包括链接）");
+      }
+    }
+    readPage(fd, 1, page);
+    const macKey = deriveMacKey(key, page.subarray(0, SALT_SZ));
+    const candidate = `${args.out}.${randomUUID()}.tmp`;
+    outFd = openSync(candidate, "wx");
+    temporary = candidate;
     for (let pgno = 1; pgno <= total; pgno++) {
       readPage(fd, pgno, page);
       if (!verifyPage(page, pgno, macKey)) {
-        closeSync(fd);
-        closeSync(outFd);
-        console.error(`HMAC 校验失败：第 ${pgno} 页（撕裂快照/混合世代页，或密钥不对），拒绝输出`);
-        process.exit(1);
+        throw Object.assign(new Error(`HMAC 校验失败：第 ${pgno} 页，拒绝输出`), { exitCode: 1 });
       }
       decryptPage(key, page, pgno, outPage);
-      // 逐页写盘（§4.17）：75MB 库不再全量驻留 + concat 二次拷贝
       writeSync(outFd, outPage, 0, PAGE_SZ, (pgno - 1) * PAGE_SZ);
     }
     walNote = applyWalOverlay(outFd, db, key, macKey);
+    fsyncSync(outFd);
+    closeSync(outFd);
+    outFd = undefined;
+    renameSync(temporary, args.out);
+    temporary = undefined;
   } finally {
     closeSync(fd);
-    closeSync(outFd);
+    if (outFd !== undefined) closeSync(outFd);
+    if (temporary !== undefined) unlinkSync(temporary);
   }
   console.log(`解密完成: ${args.out}（${size} 字节入，${total} 页逐页验过 HMAC；${walNote}）`);
 }
@@ -415,6 +434,6 @@ try {
   await main();
 } catch (e) {
   console.error(`错误: ${(e && e.message) || e}`);
-  usage();
-  process.exit(2);
+  if (e.exitCode !== 1) usage();
+  process.exit(e.exitCode === 1 ? 1 : 2);
 }
