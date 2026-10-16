@@ -186,7 +186,11 @@
 
 [官方 Hooks 文档](https://learn.chatgpt.com/docs/hooks)（2026-10-14 核对；本机 CLI `0.162.0-alpha.17.2`）已包含回合、工具与中断事件。此前仅注册 SessionStart / Stop / PermissionRequest，缺少 activity 来源：SessionStart 只表示会话建立，本程序不会据此显示思考中。现在使用实际回合与工具事件推进状态。
 
-`agent-turn-complete` 属于旧 `notify` 机制，不注册进 `hooks.json`。`Interrupt` 用于主会话的活动回合中断，`SessionEnd` 用于主会话结束；两者按中止收场，不冒充成功。未提供独立失败事件的路径不推测为失败。
+`agent-turn-complete` 属于旧 `notify` 机制，不注册进 `hooks.json`。`Interrupt` 用于主会话的活动回合中断，`SessionEnd` 用于主会话结束；两者按中止收场，不冒充成功。
+
+2026-10-15 本机确认额度耗尽时只留下 `task_complete.error.codex_error_info = "usage_limit_exceeded"`，没有结束 hook。daemon 每秒增量读取已跟踪会话的 transcript，将带明确 `error` 的 `task_complete` 补为 `run_failed`，额度不足显示「额度已用完」。日志路径优先取 hook 的 `transcript_path`，缺失时只读查询 `CODEX_HOME`（默认 `~/.codex`）下 `state_5.sqlite` 的对应会话。只匹配当前 `turn_id`，不重放历史错误；普通工具错误和可重试错误不触发回合失败。失败事件进入原有历史、通知、流光和音效管道。
+
+桌面端 `composer_predictions` 会自动请求下一句输入建议，也会触发 hooks。按已验证的内部 prompt 前缀标记并过滤该回合的后续事件，避免生成额外「思考中」行。已结束回合按 `turn_id` 拦截迟到工具事件，不再只依赖 10 秒回声窗口；用户的新回合正常接入。上述日志格式、数据库和内部 prompt 都是非官方补充信号，格式变化、缺少回合标识或日志不可读时仍由原有超时机制兜底。
 
 Windows PowerShell 下命令使用 `& 'D:/path/AgentBark.exe' hook ...`。2026-10-14 本机复现旧双引号路径写法报 `Unexpected token 'hook'`；启动对齐会修正旧命令，保留用户其他 hooks。
 

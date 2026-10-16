@@ -1,4 +1,5 @@
 mod abort_watch;
+mod codex_watch;
 mod trae_abort_watch;
 mod commands;
 mod glow;
@@ -173,6 +174,7 @@ pub fn run() {
             // 自己的日志拿秒级信号（中断合成 run_aborted、回合失败合成 run_failed）。
             // 必须在 sync_watchers 之前——那一步会拿走 tx 的所有权。
             abort_watch::spawn(state.clone(), tx.clone());
+            codex_watch::spawn(state.clone(), tx.clone());
             trae_abort_watch::spawn(state.clone(), tx.clone());
 
             // 监控型 adapter

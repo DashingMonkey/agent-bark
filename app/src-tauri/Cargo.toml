@@ -29,6 +29,7 @@ tauri-plugin-autostart = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }

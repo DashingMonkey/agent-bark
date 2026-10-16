@@ -139,6 +139,7 @@ pub struct AppState {
     /// 仅当移除时条目真实存在才记录（= 该 agent 会发心跳）——据此把「回合刚结束
     /// 的空闲回声」与「无心跳 agent 的真等待」区分开（见 apply_session_event）
     pub recent_finished: Mutex<HashMap<String, i64>>,
+    pub codex_turns: Mutex<crate::codex_watch::Turns>,
     /// 监控型 adapter 的运行线程（kind_id → 停止标志 + 线程句柄）
     pub watchers: Mutex<HashMap<String, WatcherHandle>>,
     /// 全局静音（托盘开关，仅暂停推送，事件仍入历史；重启后恢复）
@@ -321,6 +322,7 @@ impl AppState {
             history: Mutex::new(VecDeque::with_capacity(HISTORY_CAP)),
             active_sessions: Mutex::new(HashMap::new()),
             recent_finished: Mutex::new(HashMap::new()),
+            codex_turns: Mutex::new(crate::codex_watch::Turns::default()),
             watchers: Mutex::new(HashMap::new()),
             muted: std::sync::atomic::AtomicBool::new(false),
             glow: Mutex::new(GlowState::Idle),
@@ -487,6 +489,17 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         if skips_state_machine(&event) {
             tracing::debug!(agent = %event.agent, "empty session_id, publish only");
             publish_event(&state, &app, &event);
+            continue;
+        }
+
+        // Codex 内部建议请求与已结束回合的迟到 hook 不得建档或触发通知。
+        // 必须在整个事件管道前过滤，而不只是抑制状态跃迁。
+        if event.agent == "codex" && !lock(&state.codex_turns).accept(&event) {
+            continue;
+        }
+        if event.agent == "codex" && event.id.starts_with(crate::codex_watch::EVENT_PREFIX)
+            && !lock(&state.active_sessions).contains_key(&session_key("codex", &event.session_id)) {
+            // 排队期间已超时/被用户清理的会话不补发失败通知；回合封口仍保留。
             continue;
         }
 
@@ -1728,12 +1741,50 @@ mod tests {
             tool_name: tool.map(str::to_string),
             parent_session_id: None,
             keepalive: false,
+            codex: None,
         }
     }
 
     /// (活跃表, 终态记录表) 组合，测试用
     fn table() -> (HashMap<String, SessionStatus>, HashMap<String, i64>) {
         (HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn codex_failure_removes_running_session_without_late_hook_resurrection() {
+        use bark_adapters::HookAdapter;
+        let adapter = bark_adapters::claude_style::codex();
+        let mut turns = crate::codex_watch::Turns::default();
+        let (mut sessions, mut finished) = table();
+        let mut prompt = adapter.normalize("UserPromptSubmit", &serde_json::json!({
+            "session_id":"s1", "turn_id":"t1", "prompt":"work"
+        })).unwrap();
+        prompt.timestamp = 1000;
+        assert!(turns.accept(&prompt));
+        apply_session_event(&mut sessions, &mut finished, &prompt);
+        assert_eq!(sessions.len(), 1);
+        let mut failure = prompt.clone();
+        failure.kind = EventKind::RunFailed;
+        failure.id = format!("{}s1:t1", crate::codex_watch::EVENT_PREFIX);
+        failure.codex.as_mut().unwrap().is_user_prompt = false;
+        failure.timestamp = 2000;
+        assert!(turns.accept(&failure));
+        apply_session_event(&mut sessions, &mut finished, &failure);
+        assert!(sessions.is_empty());
+        assert_eq!(sound_key_for(&failure, false), Some("failed"));
+        let mut late = adapter.normalize("PostToolUse", &serde_json::json!({
+            "session_id":"s1", "turn_id":"t1"
+        })).unwrap();
+        late.timestamp = 27000;
+        assert!(!turns.accept(&late));
+        assert!(sessions.is_empty());
+        prompt.timestamp = 30000;
+        prompt.codex.as_mut().unwrap().turn_id = Some("t2".into());
+        assert!(turns.accept(&prompt));
+        apply_session_event(&mut sessions, &mut finished, &prompt);
+        assert_eq!(sessions["codex|s1"].phase, SessionPhase::Thinking);
+        assert!(!turns.accept(&failure));
+        assert_eq!(sessions["codex|s1"].started_at, 30000);
     }
 
     #[test]

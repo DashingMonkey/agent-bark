@@ -173,6 +173,7 @@ mod tests {
             tool_name: None,
             parent_session_id: None,
             keepalive: false,
+            codex: None,
         }
     }
 

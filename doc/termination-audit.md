@@ -10,7 +10,7 @@
 | TraeCode | Stop 完成；renderer.log DoneHandler canceled → 终止 | 本机取消日志样本和尾读/状态机测试；日志格式变化时降级为超时 |
 | CodeBuddy | Stop 完成、StopFailure 失败、SessionEnd 释放 | 代码映射及测试；未验证本版每次按停止都发 SessionEnd |
 | Qoder（含 CN） | Stop 完成、SessionEnd → 终止 | 仓库已有本机停止样本及归一化测试；正常 Stop 后的 SessionEnd 由回声规则抑制 |
-| Codex | Stop 完成、Interrupt/SessionEnd → 终止 | 当前代码已有显式 Interrupt 映射及生命周期测试；仍需宿主信任 hooks，本轮未现场操作 |
+| Codex | Stop 完成、Interrupt/SessionEnd → 终止；transcript 的 task_complete.error → 失败 | 2026-10-15 补充：本机额度耗尽样本确认没有结束 hook，按回合 ID 补偿失败；过滤内部输入建议回合与迟到工具事件。日志格式变化时降级超时，仍需信任 hooks |
 | ZCode | Stop 完成；本地 turn.failed/status=cancelled 等日志 → 终止；failed → 失败 | 已有本机样本、日志解析测试；中断 Hook 进程常被宿主取消，依赖日志补充 |
 | OpenCode | MessageAbortedError → 终止；session.idle → 完成 | 本轮修正取消后的 idle 抑制范围：持续到新 busy 回合，覆盖迟到 idle 和快速重开；执行生成 JS 的行为测试通过，未现场操作宿主 |
 | DeepseekHarness（DSH） | turn/end 的 aborted/interrupted → 终止；completed → 完成；error/blocked → 失败 | 已有结束原因分支、生成插件行为测试；max-tokens 仍以完成事件携带「达到输出上限」说明，不能视作用户取消 |

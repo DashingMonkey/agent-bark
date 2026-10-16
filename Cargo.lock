@@ -31,6 +31,7 @@ dependencies = [
  "bark-server",
  "chrono",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

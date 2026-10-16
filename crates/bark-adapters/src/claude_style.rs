@@ -623,7 +623,23 @@ impl HookAdapter for ClaudeStyleAdapter {
         } else {
             kind
         };
-        Some(NormalizedEvent::from_raw(self.spec.kind.id(), kind, raw))
+        let mut event = NormalizedEvent::from_raw(self.spec.kind.id(), kind, raw);
+        if self.spec.kind == AgentKind::Codex {
+            // 2026-10-15 本机实测：桌面端的 composer_predictions 也触发
+            // UserPromptSubmit，额度耗尽时没有 Stop。保留内部请求标记，
+            // 由 daemon 按回合过滤后续事件，不能仅丢掉这一条 prompt。
+            let is_user_prompt = event_name == "UserPromptSubmit";
+            event.codex = Some(bark_core::event::CodexContext {
+                turn_id: raw.get("turn_id").and_then(Value::as_str)
+                    .filter(|v| !v.is_empty()).map(str::to_owned),
+                transcript_path: raw.get("transcript_path").and_then(Value::as_str)
+                    .filter(|v| !v.is_empty()).map(str::to_owned),
+                is_user_prompt,
+                is_background: is_user_prompt && raw.get("prompt").and_then(Value::as_str)
+                    .is_some_and(|p| p.starts_with("This is an app-generated request for a suggested next user message. The user did not write this message.")),
+            });
+        }
+        Some(event)
     }
 
     fn trust_hint(&self) -> Option<&'static str> {
@@ -1995,6 +2011,22 @@ mod tests {
         assert_eq!(tool.tool_name.as_deref(), Some("Bash"));
         assert_eq!(adapter.hook_events().len(), 8);
         assert!(adapter.normalize("agent-turn-complete", &json!({})).is_none());
+    }
+
+    #[test]
+    fn codex_preserves_turn_identity_and_marks_only_prediction_prompts() {
+        let adapter = codex();
+        let raw = json!({"session_id":"s1", "turn_id":"t1", "transcript_path":"C:/codex/rollout.jsonl",
+            "prompt":"This is an app-generated request for a suggested next user message. The user did not write this message.\nPredict the next input."});
+        let event = adapter.normalize("UserPromptSubmit", &raw).unwrap();
+        let context = event.codex.unwrap();
+        assert_eq!(context.turn_id.as_deref(), Some("t1"));
+        assert_eq!(context.transcript_path.as_deref(), Some("C:/codex/rollout.jsonl"));
+        assert!(context.is_background && context.is_user_prompt);
+        assert!(!adapter.normalize("PostToolUse", &raw).unwrap().codex.unwrap().is_background);
+        let normal = adapter.normalize("UserPromptSubmit", &json!({"prompt":"Explain composer_predictions"})).unwrap();
+        assert!(!normal.codex.unwrap().is_background);
+        assert!(claude_code().normalize("UserPromptSubmit", &raw).unwrap().codex.is_none());
     }
 
     #[test]

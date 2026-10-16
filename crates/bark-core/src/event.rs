@@ -86,7 +86,20 @@ impl EventKind {
     }
 }
 
-/// 归一化后的事件，全链路统一格式
+/// Codex hook 的回合标识与本地 transcript 路径，仅供终态补偿使用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexContext {
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub is_user_prompt: bool,
+    #[serde(default)]
+    pub is_background: bool,
+}
+
+/// 归一化后的事件，全链路统一格式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedEvent {
     pub id: String,
@@ -134,6 +147,8 @@ pub struct NormalizedEvent {
     /// 回合内保活）才置 true。
     #[serde(default)]
     pub keepalive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexContext>,
 }
 
 impl NormalizedEvent {
@@ -195,6 +210,7 @@ impl NormalizedEvent {
             // hook 型事件都是「真信号」（PostToolUse 是 Claude 系唯一的心跳，靠它建档）：
             // 纯保活标志只由插件型 adapter 在自己的周期心跳上显式置位
             keepalive: false,
+            codex: None,
         }
     }
 

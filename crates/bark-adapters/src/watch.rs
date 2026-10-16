@@ -71,6 +71,7 @@ pub(crate) fn emit(
         // 监控型 adapter 的轮询心跳是**真实信号**（它同时也是建档信号，见 is_watch_agent 的
         // 撕裂快照去重）：只有插件型 adapter 明确知道自己「只是在续命」时才置 keepalive
         keepalive: false,
+        codex: None,
     };
     // try_send：通道满时丢弃而不是阻塞轮询线程（否则 stop 标志永远等不到）
     let _ = tx.try_send(ev);
