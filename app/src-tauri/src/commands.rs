@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 // - "main"（index.html → main.ts → App.vue + pages）：save_config / set_agent_enabled /
 //   test_channel / test_sound / glow_preview / glow_preview_burst / glow_off；
 // - "main" + "tray-menu"（menu.html → menu.ts 直接 invoke）：reset_glow / toggle_mute / quit_app；
-// - "widget"（widget.html → widget.ts）：save_widget_position / set_widget_pinned / close_widget；
+// - "widget"（widget.html → widget.ts）：save_widget_position / set_widget_pinned / set_widget_auto_hide / close_widget；
 // - 任意窗口：show_main_panel（App.vue / widget.ts 都调）与只读命令
 //   （agent_statuses / needs_agent_setup / get_config / diagnostics / list_events /
 //   clear_events / list_active_sessions / list_monitors / check_update / open_release_page）；
@@ -409,6 +409,32 @@ pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 悬浮窗菜单只允许修改自己的自动隐藏开关，不开放主窗口的整份配置写权限。
+#[tauri::command]
+pub async fn set_widget_auto_hide(
+    webview: Webview,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    auto_hide: bool,
+) -> Result<(), String> {
+    require_window(&webview, WIDGET_ONLY)?;
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        ensure_config_writable(&state)?;
+        let _write_guard = crate::state::lock(&state.config_write);
+        let mut next = crate::state::read(&state.config).clone();
+        next.widget.auto_hide = auto_hide;
+        next.save(&state.config_path).map_err(|e| format!("保存自动隐藏失败: {e:#}"))?;
+        *crate::state::write(&state.config) = next;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    // 设置页与悬浮窗共享这次已落盘的结果。
+    let _ = app.emit("bark://widget-config", serde_json::json!({ "auto_hide": auto_hide }));
+    Ok(())
 }
 
 /// 悬浮窗右键菜单「关闭悬浮窗」：等价于把开关关掉（落盘 + 销毁窗口）。

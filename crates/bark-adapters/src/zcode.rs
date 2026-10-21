@@ -321,13 +321,32 @@ fn is_ask_user_question(raw: &Value) -> bool {
     raw.get("tool_name").and_then(|v| v.as_str()) == Some("AskUserQuestion")
 }
 
+/// 会话 id 是否 ZCode 的会话级 id（**单版本口径**，2026-10-21 收敛）。
+///
+/// 现行版本（3.16.2 实测）主会话是 `session_<32hex>`（日志、artifacts、SQLite
+/// 同源）；子代理**不换前缀**，仍是 [`is_subagent_session_id`] 认定的
+/// `sess_subagent_agent_<uuid>`（bundle 里 `sess_` 前缀与 `subagent_agent_` 标记
+/// 是两个独立常量，前缀更名只施加于主会话）。旧代 `sess_<uuid>` 主会话**不再
+/// 支持**：ZCode 全量自动更新，没有停在旧版的用户（2026-10-20 的两代兼容
+/// 旋即收敛；若真出现旧版日志，行为是退回判死超时，不误报）。
+fn is_session_id(s: &str) -> bool {
+    s.starts_with("session_") || is_subagent_session_id(s)
+}
+
+/// 子代理会话命名判定（2026-10-21 实测，3.16.2）：`sess_subagent_agent_<uuid>`。
+///
+/// 注意**子代理不随主会话换前缀**——父会话已是 `session_<32hex>`，子代理仍以
+/// `sess_` 开头（曾推定存在 `session_subagent_*`，实测不存在、已删除）。
+fn is_subagent_session_id(s: &str) -> bool {
+    s.starts_with("sess_subagent")
+}
+
 /// ZCode 的子代理判定（覆盖 bark-core 的通用启发式）。
 ///
 /// 通用启发式把 `agent_type` / `agent_id` 非空即判子代理，而 ZCode 的 `agent_type` 是
 /// `SessionStart` 的**可选**普通字段（主会话也可能带）；一旦主会话带上它，子代理事件
 /// 不通知的规则会把**所有**完成/授权通知静默吞掉——误判的代价远大于噪音。所以这里
-/// 只认显式布尔字段，以及本机实测到的子代理会话命名
-/// （`~/.zcode/cli/artifacts/sess_subagent_*`）。
+/// 只认显式布尔字段，以及子代理会话命名（见 [`is_subagent_session_id`]）。
 ///
 /// 只服务 hook 载荷的 normalize 路径；日志看门狗的合成事件走
 /// [`LogSignal`] 的 `is_subagent` 字段（解析时按同一份命名约定判定）。
@@ -342,7 +361,7 @@ pub(crate) fn is_subagent(raw: &Value) -> bool {
     raw.get("session_id")
         .or_else(|| raw.get("sessionId"))
         .and_then(|v| v.as_str())
-        .is_some_and(|s| s.starts_with("sess_subagent"))
+        .is_some_and(is_subagent_session_id)
 }
 
 impl HookAdapter for ZcodeAdapter {
@@ -772,8 +791,9 @@ pub enum LogSignal {
     /// 回合被用户中断 → 看门狗合成 `RunAborted`
     Aborted {
         session_id: String,
-        /// 按会话名判定（`sess_subagent_*`）：日志行没有 hook 载荷的布尔字段，
-        /// 只能靠命名。合成事件必须带上——通知与音效有 is_subagent 门
+        /// 按会话名判定（`sess_subagent_agent_*`，2026-10-21 实测子代理不换前缀）：
+        /// 日志行没有 hook 载荷的布尔字段，只能靠命名。合成事件必须带上——通知与
+        /// 音效有 is_subagent 门
         is_subagent: bool,
     },
     /// 回合致命失败（非取消）→ 看门狗合成 `RunFailed`
@@ -824,9 +844,62 @@ impl LogSignal {
     }
 }
 
-/// 一行 ZCode 日志的解析产物：会话活动 + 可能的回合终态信号。
+/// 子代理生命周期活动（日志合成通道，看门狗消费）。
+///
+/// 2026-10-21 实测（3.16.2）：**子代理会话不触发任何 hook**——派生一个只读子代理
+/// 跑完整回合，Stop / SessionStart 零投递（daemon 侧事件 id 落盘零增量），而同一
+/// 时刻主会话 hook 照常工作。hook 通道对子代理全盲，会话表永远不会有它们的条目；
+/// 子代理要在界面上可见（挂到父行下，与 DSH 同款），唯一痕迹来源是日志行：
+/// `turn.started` / `tool.call.started` / `turn.completed` 带会话 id、
+/// `context.parentSessionId` 血缘与 `context.toolName`。看门狗据此合成
+/// Activity / RunCompleted 事件（带 `parent_session_id`）塞进管道，建档、挂树、
+/// 存活传播全走既有机制。
+///
+/// `turn.failed` **不在此列**：它由 [`LogSignal`] 终态路径统一处理（cancelled →
+/// Aborted、其余 → Failed），两条通道各自合成终态会互相打架。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentEvent {
+    /// `turn.started` → 合成无 tool_name 的 Activity（思考中，建档）
+    TurnStarted {
+        session_id: String,
+        parent_session_id: String,
+    },
+    /// `tool.call.started` → 合成带 tool_name 的 Activity（执行工具）
+    ToolCall {
+        session_id: String,
+        parent_session_id: String,
+        tool_name: String,
+    },
+    /// `turn.completed` → 合成 RunCompleted（摘表；通知/音效/特效有 is_subagent 门）
+    TurnCompleted {
+        session_id: String,
+        parent_session_id: String,
+    },
+}
+
+impl SubagentEvent {
+    /// 涉及的子代理会话 id
+    pub fn session_id(&self) -> &str {
+        match self {
+            SubagentEvent::TurnStarted { session_id, .. }
+            | SubagentEvent::ToolCall { session_id, .. }
+            | SubagentEvent::TurnCompleted { session_id, .. } => session_id,
+        }
+    }
+
+    /// 父会话 id（血缘）：合成事件要带上，前端据此挂树、状态机据此向祖先传播存活
+    pub fn parent_session_id(&self) -> &str {
+        match self {
+            SubagentEvent::TurnStarted { parent_session_id, .. }
+            | SubagentEvent::ToolCall { parent_session_id, .. }
+            | SubagentEvent::TurnCompleted { parent_session_id, .. } => parent_session_id,
+        }
+    }
+}
+
+/// 一行 ZCode 日志的解析产物：会话活动 + 可能的回合终态信号 + 可能的子代理活动。
 pub struct LogLine {
-    /// 本行归属的会话 id（`sess_` 前缀，与 hook 载荷同源）
+    /// 本行归属的会话 id（现行格式，与 hook 载荷同源）
     pub session_id: String,
     /// 子代理行里的 `context.parentSessionId`：子代理的日志活动同样证明父会话
     /// 的回合还活着——父会话在子代理运行期间不写自己的日志（实测 `Agent` 工具
@@ -834,6 +907,10 @@ pub struct LogLine {
     pub parent_session_id: Option<String>,
     /// 回合终态信号；无关记录是 `None`（但它仍是存活心跳）
     pub signal: Option<LogSignal>,
+    /// 子代理生命周期活动（见 [`SubagentEvent`]）：仅子代理行的
+    /// turn.started / tool.call.started / turn.completed 会产生，主会话行为 `None`
+    /// （主会话有自己的 hook 通道）
+    pub subagent: Option<SubagentEvent>,
 }
 
 /// 从一行 ZCode 日志里解析会话活动与回合终态信号（非会话级记录返回 None）。
@@ -841,23 +918,58 @@ pub fn parse_log_line(line: &str) -> Option<LogLine> {
     // 行首 BOM 剥离（§4.16）：与 jsonio 的 BOM 口径一致——部分编辑器/轮转工具
     // 会给文件或行补 BOM，不剥的话整行解析失败、信号被静默丢弃
     let v: Value = serde_json::from_str(line.trim().trim_start_matches('\u{feff}')).ok()?;
-    // 只认会话级记录：hook 载荷里的 session_id 与它同源
+    // 只认会话级记录：hook 载荷里的 session_id 与它同源（见 is_session_id）
     let session_id = v.get("sessionId")?.as_str()?;
-    if !session_id.starts_with("sess_") {
+    if !is_session_id(session_id) {
         return None;
     }
     let parent_session_id = v
         .get("context")
         .and_then(|c| c.get("parentSessionId"))
         .and_then(|p| p.as_str())
-        .filter(|p| p.starts_with("sess_"))
+        .filter(|p| is_session_id(p))
         .map(str::to_string);
     let signal = log_signal_from(&v, session_id);
+    let subagent = subagent_event_from(&v, session_id, parent_session_id.as_deref());
     Some(LogLine {
         session_id: session_id.to_string(),
         parent_session_id,
         signal,
+        subagent,
     })
+}
+
+/// 子代理生命周期活动提取（[`parse_log_line`] 的伴生内核）。
+///
+/// 只认**子代理会话**（命名判定）且**带血缘**的行：主会话有自己的 hook 通道，
+/// 缺 `parentSessionId` 的子代理行挂不了树（宁可当纯存活心跳，不造孤儿行——
+/// 前端会为它合成占位父行，语义是「有个看不见的父」，不如不显示）。
+fn subagent_event_from(v: &Value, session_id: &str, parent: Option<&str>) -> Option<SubagentEvent> {
+    if !is_subagent_session_id(session_id) {
+        return None;
+    }
+    let parent = parent?;
+    let ctx = v.get("context");
+    match v.get("event").and_then(|e| e.as_str()) {
+        Some("turn.started") => Some(SubagentEvent::TurnStarted {
+            session_id: session_id.to_string(),
+            parent_session_id: parent.to_string(),
+        }),
+        Some("tool.call.started") => Some(SubagentEvent::ToolCall {
+            session_id: session_id.to_string(),
+            parent_session_id: parent.to_string(),
+            tool_name: ctx
+                .and_then(|c| c.get("toolName"))
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.trim().is_empty())?
+                .to_string(),
+        }),
+        Some("turn.completed") => Some(SubagentEvent::TurnCompleted {
+            session_id: session_id.to_string(),
+            parent_session_id: parent.to_string(),
+        }),
+        _ => None,
+    }
 }
 
 /// 从一行 ZCode 日志里解析回合终态信号（无关记录返回 None）。
@@ -869,7 +981,7 @@ pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
 fn log_signal_from(v: &Value, session_id: &str) -> Option<LogSignal> {
     let ctx = v.get("context");
     // 子代理判定只有会话名可用（日志行没有 hook 载荷的布尔字段）
-    let is_subagent = session_id.starts_with("sess_subagent");
+    let is_subagent = is_subagent_session_id(session_id);
     let event_name = v.get("event").and_then(|e| e.as_str());
     // 中断判定**收窄到两条实测形态**（§2.9）：旧实现对任意事件的 `context.error`
     // 含 "cancel" 就合成 RunAborted，"cancelled by API error, retrying" 这类
@@ -1009,6 +1121,10 @@ pub struct TailScan {
     /// 传播上来的父会话 id）——看门狗据此做存活心跳（刷新 `last_activity`，
     /// 防长静默被判死误杀，见 app 侧 `state::touch_session`）
     pub alive_sessions: Vec<String>,
+    /// 新发现的子代理生命周期活动（见 [`SubagentEvent`]）：看门狗据此合成
+    /// 子代理事件（带血缘）塞进管道——这是子代理在界面上可见的唯一通道
+    /// （2026-10-21 实测：子代理不触发任何 hook）
+    pub subagent_events: Vec<SubagentEvent>,
 }
 
 impl TailScan {
@@ -1016,6 +1132,7 @@ impl TailScan {
         TailScan {
             signals: Vec::new(),
             alive_sessions: Vec::new(),
+            subagent_events: Vec::new(),
         }
     }
 }
@@ -1129,6 +1246,9 @@ impl AbortLogTail {
             }
             if let Some(sig) = parsed.signal {
                 out.signals.push(sig);
+            }
+            if let Some(act) = parsed.subagent {
+                out.subagent_events.push(act);
             }
         }
         out
@@ -1626,25 +1746,42 @@ mod tests {
     }
 
     // ---- 中断推断（非官方机制）---------------------------------------------
+    // 注：本组「实测原样」样本采集于旧代 id 时期（2026-09），sessionId 已统一改写为
+    // 现行格式（session_<32hex>，2026-10-21 起只认这一版），其余字段保持原样——
+    // 这些测试钉的是信号形态，不是 id 格式。
 
     /// 实测原样：用户按停止后的第一条记录
-    const REAL_STOP_LINE: &str = r#"{"timestamp":"2026-09-10T16:28:00.959Z","level":"info","event":"v4.stop.foreground_execution_inspected","module":"core.runtime","message":"v4 stop foreground execution inspected","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"activeForegroundExecutionId":"runtime_command_1","expectedForegroundExecutionId":"runtime_command_1","runtimeStopKind":"stopped"}}"#;
+    const REAL_STOP_LINE: &str = r#"{"timestamp":"2026-09-10T16:28:00.959Z","level":"info","event":"v4.stop.foreground_execution_inspected","module":"core.runtime","message":"v4 stop foreground execution inspected","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"activeForegroundExecutionId":"runtime_command_1","expectedForegroundExecutionId":"runtime_command_1","runtimeStopKind":"stopped"}}"#;
     /// 实测原样：紧随其后的取消记录（**顶层没有 event 字段**）
-    const REAL_CANCEL_LINE: &str = r#"{"timestamp":"2026-09-10T16:28:00.984Z","level":"warn","module":"core.runtime","message":"v4 background turn failed","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"error":"Turn was cancelled.","inputId":"01a08c25-72ff-7399-b777-702fdc678785"}}"#;
+    const REAL_CANCEL_LINE: &str = r#"{"timestamp":"2026-09-10T16:28:00.984Z","level":"warn","module":"core.runtime","message":"v4 background turn failed","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"error":"Turn was cancelled.","inputId":"01a08c25-72ff-7399-b777-702fdc678785"}}"#;
     /// 实测原样（2026-09-19）：Captcha 超时导致的回合致命失败——进程不退、不发任何
     /// hook，status = "failed"，真实错误在 error.cause.message
-    const REAL_TURN_FAILED_LINE: &str = r#"{"timestamp":"2026-09-19T13:26:03.740Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"f909d120-72f5-4f31-9fe8-40f62c173eda","spanId":"29e1649a-5412-42","parentSpanId":"3d4d2568-b191-4f","sessionId":"sess_87eab534-f233-4d4b-b2fa-fce4caf3c45c","turnId":"turn_f032c4f6-a76c-42d6-97fd-3267cccadeed","status":"failed","context":{"queryId":"01a0b9cc-215d-700a-a1a1-221096c82786","turnNumber":11,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn execution failed","code":"UNKNOWN_ERROR","type":"unknown_error","context":{"errorPayloadRole":"wrapper"},"cause":{"name":"AiSdkModelAdapterError","message":"Captcha instance timed out after 10000ms.","code":"model_request_failed","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3-Flash","errorPhase":"prepare","exceptionKind":"generic","providerId":"account:bigmodel-start-plan","providerKind":"anthropic","reason":"unknown","requestId":"3a090f18-e2cc-45fe-a51f-70ce63ca8505","retryable":false,"source":"runtime","traceId":"f909d120-72f5-4f31-9fe8-40f62c173eda","transport":"sse"},"cause":{"name":"RuntimeHeadersRefreshError","message":"Captcha instance timed out after 10000ms.","cause":{"name":"ProtocolRequestError","message":"Captcha instance timed out after 10000ms."}}}}}"#;
+    const REAL_TURN_FAILED_LINE: &str = r#"{"timestamp":"2026-09-19T13:26:03.740Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"f909d120-72f5-4f31-9fe8-40f62c173eda","spanId":"29e1649a-5412-42","parentSpanId":"3d4d2568-b191-4f","sessionId":"session_87eab534f2334d4bb2fafce4caf3c45c","turnId":"turn_f032c4f6-a76c-42d6-97fd-3267cccadeed","status":"failed","context":{"queryId":"01a0b9cc-215d-700a-a1a1-221096c82786","turnNumber":11,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn execution failed","code":"UNKNOWN_ERROR","type":"unknown_error","context":{"errorPayloadRole":"wrapper"},"cause":{"name":"AiSdkModelAdapterError","message":"Captcha instance timed out after 10000ms.","code":"model_request_failed","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3-Flash","errorPhase":"prepare","exceptionKind":"generic","providerId":"account:bigmodel-start-plan","providerKind":"anthropic","reason":"unknown","requestId":"3a090f18-e2cc-45fe-a51f-70ce63ca8505","retryable":false,"source":"runtime","traceId":"f909d120-72f5-4f31-9fe8-40f62c173eda","transport":"sse"},"cause":{"name":"RuntimeHeadersRefreshError","message":"Captcha instance timed out after 10000ms.","cause":{"name":"ProtocolRequestError","message":"Captcha instance timed out after 10000ms."}}}}}"#;
     /// 实测原样（2026-09-18）：用户中断的 turn.failed——status = "cancelled"，
     /// error.message = "Turn was cancelled."（中断的第三条痕迹，须归并为 Aborted）
-    const REAL_TURN_CANCELLED_LINE: &str = r#"{"timestamp":"2026-09-18T08:37:31.751Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","spanId":"a65374e6-4cc6-4f","parentSpanId":"67e43b88-b528-4b","sessionId":"sess_dfa58fb4-0119-46da-8c09-a1dd64be80d7","turnId":"turn_4f23348c-b59d-4a30-aaf5-5d509c13ee3a","status":"cancelled","context":{"queryId":"01a0b3a8-2dec-7fd3-9083-da8c3f924c79","turnNumber":0,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn was cancelled.","code":"TURN_CANCELLED","type":"turn_cancelled","cause":{"name":"AiSdkModelAdapterError","message":"Model request was cancelled.","code":"model_request_cancelled","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3-Flash","errorPhase":"stream","exceptionKind":"generic","providerId":"bigmodel-api","providerKind":"anthropic","reason":"cancelled","requestId":"279a2a57-68f9-4584-91b3-dda2c4542ceb","retryable":false,"source":"runtime","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","transport":"sse"},"cause":{"name":"Error","message":"v4 session stopped"}}}}"#;
-    const SID: &str = "sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719";
+    const REAL_TURN_CANCELLED_LINE: &str = r#"{"timestamp":"2026-09-18T08:37:31.751Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","spanId":"a65374e6-4cc6-4f","parentSpanId":"67e43b88-b528-4b","sessionId":"session_dfa58fb4011946da8c09a1dd64be80d7","turnId":"turn_4f23348c-b59d-4a30-aaf5-5d509c13ee3a","status":"cancelled","context":{"queryId":"01a0b3a8-2dec-7fd3-9083-da8c3f924c79","turnNumber":0,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn was cancelled.","code":"TURN_CANCELLED","type":"turn_cancelled","cause":{"name":"AiSdkModelAdapterError","message":"Model request was cancelled.","code":"model_request_cancelled","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3-Flash","errorPhase":"stream","exceptionKind":"generic","providerId":"bigmodel-api","providerKind":"anthropic","reason":"cancelled","requestId":"279a2a57-68f9-4584-91b3-dda2c4542ceb","retryable":false,"source":"runtime","traceId":"5af90b5c-f74c-485d-8ce2-7f4cc59660d0","transport":"sse"},"cause":{"name":"Error","message":"v4 session stopped"}}}}"#;
+    const SID: &str = "session_672cbc8cd92e4cdeae862bd0448d2719";
+
+    /// 新代会话 id（3.16.2 起实测）：`session_<32hex>`，日志 / artifacts / SQLite 同源。
+    /// 2026-10-20 的线上漏报：`session_` 不含 `sess_` 前缀，旧过滤器把新版的每一行
+    /// 日志整行丢弃——额度耗尽连写 5 条 failed 零通知、会话卡「思考中」。
+    /// 2026-10-21 起只认这一版（用户群全量自动更新，旧代 `sess_<uuid>` 不再支持）。
+    const NEW_SID: &str = "session_efeb21c1eed37f380221a9b8c2980036";
+    /// 实测原样（2026-10-20，ZCode 3.16.2.8769）：GLM 额度耗尽的回合致命失败——
+    /// status = "failed"、cause.code = model_request_failed、真实错误
+    /// "exceed quota limit"（providerCode 1005）在 cause.message。
+    /// 仅略去 cause.context 里冗长的 responseBodySummary / responseHeaders 原文，
+    /// 判定用到的字段全部保留
+    const REAL_QUOTA_FAILED_LINE: &str = r#"{"timestamp":"2026-10-20T09:32:53.414Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","spanId":"dfe5e8ea-2da3-4d","parentSpanId":"4c8b8b30-970d-44","sessionId":"session_efeb21c1eed37f380221a9b8c2980036","turnId":"turn_fed133c3-ceac-4fa7-b919-12128314a93a","status":"failed","context":{"queryId":"01a158a4-95d5-72c4-a93d-e0d97aa22852","turnNumber":1,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn execution failed","code":"UNKNOWN_ERROR","type":"unknown_error","context":{"errorPayloadRole":"wrapper"},"cause":{"name":"AiSdkModelAdapterError","message":"exceed quota limit","code":"model_request_failed","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3","errorPhase":"stream","exceptionKind":"provider_business","providerCode":"1005","responseStatus":200,"providerId":"account:zai-start-plan","providerKind":"anthropic","reason":"invalid_request","requestId":"23749f0c-8dfc-4f66-a61c-a4542c0134ee","retryable":false,"source":"provider","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","transport":"sse"},"cause":{"name":"ProviderBusinessError","message":"exceed quota limit","code":"PROVIDER_BUSINESS_ERROR"}}}}"#;
+    /// 实测原样（2026-10-20）：新代格式的普通会话行——无终态信号，但算存活心跳
+    const NEW_PLAIN_LINE: &str = r#"{"timestamp":"2026-10-20T09:19:52.866Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"Tool call started","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","spanId":"cfd4198e-333a-42","parentSpanId":"221b100b-8ac0-44","sessionId":"session_efeb21c1eed37f380221a9b8c2980036","turnId":"turn_0659842f-9b1a-4c65-9e5c-2c1a7384272f","toolCallId":"call_40d9fe7bd41942c8b35dae83","status":"started","context":{"queryId":"01a1589c-14f0-7d46-b985-99e6fd63844d","turnNumber":0,"providerId":"account:zai-start-plan","modelId":"GLM-5.3","iteration":0,"querySource":"main_turn","toolName":"Bash"}}"#;
 
     /// 普通会话行（实测形态：tool.call.started）——无终态信号，但算存活心跳
-    const PARENT_SID: &str = "sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2";
+    const PARENT_SID: &str = "session_4b98fe9a84ec4cf98872b8ec9fb1fdb2";
     const SUB_SID: &str = "sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754";
-    const PLAIN_LINE: &str = r#"{"timestamp":"2026-09-28T03:08:52.637Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2","turnId":"turn_1","toolCallId":"call_1","context":{"queryId":"q1","turnNumber":1,"toolName":"Bash"}}"#;
+    const PLAIN_LINE: &str = r#"{"timestamp":"2026-09-28T03:08:52.637Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"session_4b98fe9a84ec4cf98872b8ec9fb1fdb2","turnId":"turn_1","toolCallId":"call_1","context":{"queryId":"q1","turnNumber":1,"toolName":"Bash"}}"#;
     /// 子代理行（实测形态）：context.parentSessionId 指向父会话
-    const SUBAGENT_LINE: &str = r#"{"timestamp":"2026-09-28T03:10:00.000Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754","turnId":"turn_1","toolCallId":"call_2","context":{"agentId":"agent_55166edb","agentType":"general-purpose","parentToolCallId":"call_1","parentSessionId":"sess_4b98fe9a-84ec-4cf9-8872-b8ec9fb1fdb2","toolName":"Bash"}}"#;
+    const SUBAGENT_LINE: &str = r#"{"timestamp":"2026-09-28T03:10:00.000Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"tool call started","sessionId":"sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754","turnId":"turn_1","toolCallId":"call_2","context":{"agentId":"agent_55166edb","agentType":"general-purpose","parentToolCallId":"call_1","parentSessionId":"session_4b98fe9a84ec4cf98872b8ec9fb1fdb2","toolName":"Bash"}}"#;
 
     fn append(path: &Path, text: &str) {
         use std::io::Write;
@@ -1659,7 +1796,7 @@ mod tests {
         for (line, sid) in [
             (REAL_STOP_LINE, SID),
             (REAL_CANCEL_LINE, SID),
-            (REAL_TURN_CANCELLED_LINE, "sess_dfa58fb4-0119-46da-8c09-a1dd64be80d7"),
+            (REAL_TURN_CANCELLED_LINE, "session_dfa58fb4011946da8c09a1dd64be80d7"),
         ] {
             let sig = parse_log_signal(line).expect("真实中断记录必须被识别");
             assert!(matches!(sig, LogSignal::Aborted { .. }), "应判为中断: {line}");
@@ -1669,7 +1806,7 @@ mod tests {
         let sig = parse_log_signal(REAL_TURN_FAILED_LINE).expect("致命失败必须被识别");
         match &sig {
             LogSignal::Failed { session_id, turn_id, message, .. } => {
-                assert_eq!(session_id, "sess_87eab534-f233-4d4b-b2fa-fce4caf3c45c");
+                assert_eq!(session_id, "session_87eab534f2334d4bb2fafce4caf3c45c");
                 assert_eq!(turn_id.as_deref(), Some("turn_f032c4f6-a76c-42d6-97fd-3267cccadeed"));
                 assert_eq!(message, "Captcha instance timed out after 10000ms.");
             }
@@ -1690,18 +1827,18 @@ mod tests {
 
         // turn.failed 没有 error 载荷（异常记录）：回合确实失败了，用兜底文案合成
         let sig = parse_log_signal(
-            r#"{"timestamp":"2026-09-10T16:28:00.982Z","level":"error","event":"turn.failed","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"queryId":"q","turnNumber":0,"turnPhase":"processing_input"}}"#,
+            r#"{"timestamp":"2026-09-10T16:28:00.982Z","level":"error","event":"turn.failed","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"queryId":"q","turnNumber":0,"turnPhase":"processing_input"}}"#,
         )
         .expect("无 error 载荷的 turn.failed 也是回合终态");
         assert!(matches!(sig, LogSignal::Failed { message, .. } if !message.is_empty()));
 
         // 负样本：请求层失败（会重试、事件名不是 turn.failed）、hook 失败、正常工具完成
         for line in [
-            r#"{"timestamp":"2026-09-19T13:26:03.718Z","level":"warn","event":"model.request.failed","sessionId":"sess_87eab534-f233-4d4b-b2fa-fce4caf3c45c","status":"failed","context":{"attempt":1,"maxAttempts":11,"retryable":false,"statusMessage":"Captcha instance timed out after 10000ms."}}"#,
-            r#"{"timestamp":"2026-09-10T16:28:00.960Z","level":"warn","event":"hook.run.failed","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"hookEventName":"PostToolUseFailure","hookIndex":0,"source":"config.PostToolUseFailure.0.0"}}"#,
-            r#"{"timestamp":"2026-09-10T16:29:54.481Z","level":"info","event":"tool.call.completed","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"toolName":"Skill"}}"#,
+            r#"{"timestamp":"2026-09-19T13:26:03.718Z","level":"warn","event":"model.request.failed","sessionId":"session_87eab534f2334d4bb2fafce4caf3c45c","status":"failed","context":{"attempt":1,"maxAttempts":11,"retryable":false,"statusMessage":"Captcha instance timed out after 10000ms."}}"#,
+            r#"{"timestamp":"2026-09-10T16:28:00.960Z","level":"warn","event":"hook.run.failed","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"hookEventName":"PostToolUseFailure","hookIndex":0,"source":"config.PostToolUseFailure.0.0"}}"#,
+            r#"{"timestamp":"2026-09-10T16:29:54.481Z","level":"info","event":"tool.call.completed","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"toolName":"Skill"}}"#,
             // 同类记录但停顿原因不是用户停止
-            r#"{"timestamp":"2026-09-10T16:28:00.959Z","level":"info","event":"v4.stop.foreground_execution_inspected","sessionId":"sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719","context":{"runtimeStopKind":"completed"}}"#,
+            r#"{"timestamp":"2026-09-10T16:28:00.959Z","level":"info","event":"v4.stop.foreground_execution_inspected","sessionId":"session_672cbc8cd92e4cdeae862bd0448d2719","context":{"runtimeStopKind":"completed"}}"#,
             // 非会话级记录
             r#"{"timestamp":"2026-09-10T16:28:00.959Z","level":"info","event":"v4.stop.foreground_execution_inspected","sessionId":"other","context":{"runtimeStopKind":"stopped"}}"#,
             "not json at all",
@@ -1711,24 +1848,72 @@ mod tests {
         }
     }
 
+    /// 会话 id 单版本口径（2026-10-21 收敛）：只认现行 `session_<32hex>` 主会话与
+    /// `sess_subagent_agent_*` 子代理（实测子代理**不换前缀**）；旧代 `sess_<uuid>`
+    /// 主会话不再解析——出现时退回判死超时，不误报。
+    #[test]
+    fn single_generation_session_ids_are_enforced() {
+        // 致命失败：额度耗尽（"exceed quota limit"）必须合成 Failed 信号
+        let sig = parse_log_signal(REAL_QUOTA_FAILED_LINE)
+            .expect("现行 session_ 前缀的致命失败必须被识别");
+        match &sig {
+            LogSignal::Failed { session_id, turn_id, message, is_subagent } => {
+                assert_eq!(session_id, NEW_SID);
+                assert_eq!(
+                    turn_id.as_deref(),
+                    Some("turn_fed133c3-ceac-4fa7-b919-12128314a93a")
+                );
+                assert_eq!(message, "exceed quota limit", "真实错误在 cause.message");
+                assert!(!is_subagent, "主会话的失败不得标成子代理");
+            }
+            other => panic!("应判为致命失败: {other:?}"),
+        }
+
+        // 普通行：无终态信号，但必须算存活心跳（长静默回合靠它防心跳判死误杀）
+        let l = parse_log_line(NEW_PLAIN_LINE).expect("现行格式普通行必须算会话活动");
+        assert_eq!(l.session_id, NEW_SID);
+        assert_eq!(l.parent_session_id, None);
+        assert!(l.signal.is_none());
+
+        // 子代理命名：只认实测形态 sess_subagent_agent_*（新代子代理不换前缀，
+        // 曾推定的 session_subagent_* 实测不存在——不得再判子代理）
+        assert!(is_subagent_session_id("sess_subagent_agent_005ac652"));
+        assert!(!is_subagent_session_id("session_subagent_agent_005ac652"));
+        assert!(!is_subagent_session_id(NEW_SID), "主会话不得误判子代理");
+        assert!(!is_subagent_session_id("sess_"), "前缀必须是完整的 sess_subagent");
+
+        // hook 载荷路径同口径：camelCase + 实测命名也要命中
+        let ev = ZcodeAdapter::with_paths(vec![])
+            .normalize("Stop", &json!({ "sessionId": "sess_subagent_agent_005ac652" }))
+            .unwrap();
+        assert!(ev.is_subagent);
+
+        // 旧代 sess_<uuid> 主会话：整行拒绝（单版本口径，见 is_session_id 文档）
+        assert!(is_session_id(NEW_SID));
+        assert!(is_session_id("sess_subagent_agent_005ac652"), "子代理行仍要算会话级记录");
+        assert!(!is_session_id("sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719"), "旧代主会话不再支持");
+        assert!(!is_session_id("other"), "非会话 id 仍要被过滤");
+    }
+
     #[test]
     fn turn_failed_status_tiers_subagent_and_dedup_fallback() {
         // status = "failed" 但文案含 cancel：**不**得吞成中断——结构化字段明确时
         // 文案只作参考，否则真实失败会静默消失（不通知、不亮失败色）
         let sig = parse_log_signal(
-            r#"{"event":"turn.failed","status":"failed","sessionId":"sess_abc12345","turnId":"turn_a","error":{"message":"Request was cancelled by upstream","cause":{"message":"upstream reset"}}}"#,
+            r#"{"event":"turn.failed","status":"failed","sessionId":"session_abc12345","turnId":"turn_a","error":{"message":"Request was cancelled by upstream","cause":{"message":"upstream reset"}}}"#,
         )
         .expect("status=failed 必须判为失败");
         assert!(matches!(&sig, LogSignal::Failed { message, .. } if message == "upstream reset"));
 
         // status 缺失：cancel 文案兜底仍然生效（容忍措辞微调的宽匹配口径）
         let sig = parse_log_signal(
-            r#"{"event":"turn.failed","sessionId":"sess_abc12345","error":{"message":"Turn was cancelled."}}"#,
+            r#"{"event":"turn.failed","sessionId":"session_abc12345","error":{"message":"Turn was cancelled."}}"#,
         )
         .expect("status 缺失时按文案判中断");
         assert!(matches!(sig, LogSignal::Aborted { .. }));
 
-        // 子代理会话的失败：is_subagent 按会话名判定（看门狗据此拒合成）
+        // 子代理会话的失败：is_subagent 按会话名判定（看门狗照常合成，
+        // 用它把子代理的会话条目收掉——通知/音效/特效三道门拦着不扰人）
         let sig = parse_log_signal(
             r#"{"event":"turn.failed","status":"failed","sessionId":"sess_subagent_agent_005ac652","turnId":"turn_b","error":{"message":"Turn execution failed","cause":{"message":"boom"}}}"#,
         )
@@ -1738,7 +1923,7 @@ mod tests {
 
         // 无 turnId 的失败：不去重（None）——无标识时宁可重复也不静默吞信号
         let sig = parse_log_signal(
-            r#"{"event":"turn.failed","status":"failed","sessionId":"sess_abc12345","error":{"message":"Turn execution failed","cause":{"message":"boom"}}}"#,
+            r#"{"event":"turn.failed","status":"failed","sessionId":"session_abc12345","error":{"message":"Turn execution failed","cause":{"message":"boom"}}}"#,
         )
         .unwrap();
         assert!(matches!(&sig, LogSignal::Failed { turn_id: None, .. }));
@@ -1748,16 +1933,27 @@ mod tests {
     /// 会话活动解析：普通行也是存活心跳；子代理行带 `parentSessionId` 要向父会话传播
     #[test]
     fn log_line_extracts_session_activity_and_parent() {
-        // 普通会话行（无终态信号）：session_id 有、signal 无，但仍是存活心跳
+        // 普通会话行（无终态信号）：session_id 有、signal 无，但仍是存活心跳；
+        // 主会话行不产生子代理活动（它有自己的 hook 通道）
         let l = parse_log_line(PLAIN_LINE).expect("会话级行必须解析");
         assert_eq!(l.session_id, PARENT_SID);
         assert_eq!(l.parent_session_id, None);
         assert!(l.signal.is_none(), "普通行不是终态信号");
+        assert!(l.subagent.is_none(), "主会话行不得合成子代理活动");
 
-        // 子代理行（实测形态）：parentSessionId 指向父会话
+        // 子代理行（实测形态）：parentSessionId 指向父会话，tool.call.started
+        // 折成 ToolCall 活动（这是子代理在界面上可见的唯一通道）
         let l = parse_log_line(SUBAGENT_LINE).expect("子代理行必须解析");
         assert_eq!(l.session_id, SUB_SID);
         assert_eq!(l.parent_session_id.as_deref(), Some(PARENT_SID));
+        assert_eq!(
+            l.subagent,
+            Some(SubagentEvent::ToolCall {
+                session_id: SUB_SID.to_string(),
+                parent_session_id: PARENT_SID.to_string(),
+                tool_name: "Bash".to_string(),
+            })
+        );
 
         // 终态行：signal 照旧挂在同一解析产物上（parse_log_signal 走同一内核）
         let l = parse_log_line(REAL_TURN_FAILED_LINE).unwrap();
@@ -1765,6 +1961,76 @@ mod tests {
 
         // 无 sessionId 的进程级行（如 memory_sample）不算会话活动
         assert!(parse_log_line(r#"{"event":"zcode_protocol.process.memory_sample","context":{}}"#).is_none());
+    }
+
+    /// 子代理生命周期提取（2026-10-21 实测：子代理不触发任何 hook，日志行是
+    /// 它们在界面上可见的唯一通道）：turn.started / tool.call.started /
+    /// turn.completed 折成 [`SubagentEvent`]，缺血缘或非生命周期行不折。
+    #[test]
+    fn subagent_lifecycle_events_are_extracted() {
+        // turn.started → TurnStarted（建档「思考中」）
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"turn.started","sessionId":"{SUB_SID}","status":"started","context":{{"agentType":"general-purpose","parentSessionId":"{PARENT_SID}"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            l.subagent,
+            Some(SubagentEvent::TurnStarted {
+                session_id: SUB_SID.to_string(),
+                parent_session_id: PARENT_SID.to_string(),
+            })
+        );
+
+        // turn.completed → TurnCompleted（摘表）
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"turn.completed","sessionId":"{SUB_SID}","status":"completed","context":{{"parentSessionId":"{PARENT_SID}"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            l.subagent,
+            Some(SubagentEvent::TurnCompleted {
+                session_id: SUB_SID.to_string(),
+                parent_session_id: PARENT_SID.to_string(),
+            })
+        );
+
+        // 缺 toolName 的 tool.call.started：折不成 ToolCall（无工具名判不了
+        // 「执行工具」），但仍算存活心跳
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"tool.call.started","sessionId":"{SUB_SID}","context":{{"parentSessionId":"{PARENT_SID}"}}}}"#
+        ))
+        .unwrap();
+        assert!(l.subagent.is_none());
+
+        // 缺 parentSessionId：挂不了树，不折活动（宁可不显示，不造孤儿行）
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"turn.started","sessionId":"{SUB_SID}","context":{{"agentType":"general-purpose"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(l.parent_session_id, None);
+        assert!(l.subagent.is_none(), "无血缘的子代理行不得合成活动");
+
+        // turn.failed 不走活动通道（由 LogSignal 终态路径统一处理，防止双终态）
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"turn.failed","sessionId":"{SUB_SID}","status":"failed","context":{{"parentSessionId":"{PARENT_SID}"}},"error":{{"message":"boom"}}}}"#
+        ))
+        .unwrap();
+        assert!(l.subagent.is_none());
+        assert!(matches!(l.signal, Some(LogSignal::Failed { .. })));
+
+        // 主会话的同名事件不折（命名判定先于事件名）
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"turn.started","sessionId":"{PARENT_SID}","context":{{}}}}"#
+        ))
+        .unwrap();
+        assert!(l.subagent.is_none());
+
+        // 子代理行的其他记录（如持久化噪音）：不是生命周期，不折，但算存活
+        let l = parse_log_line(&format!(
+            r#"{{"timestamp":"t","event":"session.persistence.completed","sessionId":"{SUB_SID}","context":{{"parentSessionId":"{PARENT_SID}"}}}}"#
+        ))
+        .unwrap();
+        assert!(l.subagent.is_none());
     }
 
     #[test]
@@ -1779,14 +2045,19 @@ mod tests {
         append(&log, &PLAIN_LINE[..40]);
         assert!(tail.poll(&dir).alive_sessions.is_empty(), "半行不该算活动");
 
-        // 补齐后：普通行报自身会话；子代理行报自身 + 父会话，重复的父会话去重
+        // 补齐后：普通行报自身会话；子代理行报自身 + 父会话，重复的父会话去重；
+        // 子代理行的 tool.call.started 同时折成 ToolCall 活动（显示通道）
         append(&log, &format!("{}\n{}\n", &PLAIN_LINE[40..], SUBAGENT_LINE));
         let scan = tail.poll(&dir);
         assert!(scan.signals.is_empty(), "这两行都不是终态信号");
         assert_eq!(scan.alive_sessions, vec![PARENT_SID.to_string(), SUB_SID.to_string()]);
+        assert_eq!(scan.subagent_events.len(), 1, "只有子代理行折活动");
+        assert_eq!(scan.subagent_events[0].session_id(), SUB_SID);
+        assert_eq!(scan.subagent_events[0].parent_session_id(), PARENT_SID);
 
         // 同一批行不重复计活（与信号同口径：增量读取）
         assert!(tail.poll(&dir).alive_sessions.is_empty(), "同一行不该被读第二次");
+        assert!(tail.poll(&dir).subagent_events.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1892,7 +2163,7 @@ mod tests {
         // 这里锁反面：同款 context 挂在别的事件名上**不再**合成 RunAborted
         for event in ["tool.call.completed", "turn.retrying", "model.request.failed"] {
             let line = format!(
-                r#"{{"event":"{event}","sessionId":"sess_abc12345","context":{{"runtimeStopKind":"stopped","error":"Turn was cancelled."}}}}"#
+                r#"{{"event":"{event}","sessionId":"session_abc12345","context":{{"runtimeStopKind":"stopped","error":"Turn was cancelled."}}}}"#
             );
             assert!(
                 parse_log_signal(&line).is_none(),
@@ -1904,32 +2175,32 @@ mod tests {
     /// (ii) 形态：无 event 字段 + message 含 "background turn failed" + error 含 cancel
     #[test]
     fn abort_shape_background_turn_failed_warn_record() {
-        let ok = r#"{"timestamp":"t","level":"warn","module":"core.runtime","message":"v4 background turn failed","sessionId":"sess_abc12345","context":{"error":"Turn was cancelled."}}"#;
+        let ok = r#"{"timestamp":"t","level":"warn","module":"core.runtime","message":"v4 background turn failed","sessionId":"session_abc12345","context":{"error":"Turn was cancelled."}}"#;
         assert!(matches!(parse_log_signal(ok), Some(LogSignal::Aborted { .. })));
     }
 
     /// (ii) 的 message 短语是必要条件：换措辞的记录不算中断痕迹
     #[test]
     fn abort_shape_cancel_warn_needs_message_phrase() {
-        let no_phrase = r#"{"message":"background turn aborted","sessionId":"sess_abc12345","context":{"error":"Turn was cancelled."}}"#;
+        let no_phrase = r#"{"message":"background turn aborted","sessionId":"session_abc12345","context":{"error":"Turn was cancelled."}}"#;
         assert!(parse_log_signal(no_phrase).is_none(), "message 不含 background turn failed 不算");
     }
 
     /// (ii) 的 error 含 cancel 是必要条件
     #[test]
     fn abort_shape_cancel_warn_needs_cancel_in_error() {
-        let no_cancel = r#"{"message":"v4 background turn failed","sessionId":"sess_abc12345","context":{"error":"model blew up"}}"#;
+        let no_cancel = r#"{"message":"v4 background turn failed","sessionId":"session_abc12345","context":{"error":"model blew up"}}"#;
         assert!(parse_log_signal(no_cancel).is_none(), "error 不含 cancel 不算");
     }
 
     /// (ii) 只认**没有 event 字段**的 warn 记录；带 event 的记录走各自分支
     #[test]
     fn abort_shape_cancel_warn_requires_missing_event_field() {
-        let has_event = r#"{"event":"turn.failed","message":"v4 background turn failed","sessionId":"sess_abc12345","context":{"error":"Turn was cancelled."}}"#;
+        let has_event = r#"{"event":"turn.failed","message":"v4 background turn failed","sessionId":"session_abc12345","context":{"error":"Turn was cancelled."}}"#;
         // turn.failed 走三档 status 判定（status 缺失 → cancel 文案兜底 → 中断），
         // 但那是 turn.failed 分支，不是 (ii) ——这里断言它不从 (ii) 漏出去即可
         assert!(parse_log_signal(has_event).is_some(), "turn.failed 有自己的判定分支");
-        let other_event = r#"{"event":"model.request.failed","message":"v4 background turn failed","sessionId":"sess_abc12345","context":{"error":"Turn was cancelled."}}"#;
+        let other_event = r#"{"event":"model.request.failed","message":"v4 background turn failed","sessionId":"session_abc12345","context":{"error":"Turn was cancelled."}}"#;
         assert!(
             parse_log_signal(other_event).is_none(),
             "带 event 的记录不得走 (ii) 的兜底匹配"
@@ -1943,14 +2214,14 @@ mod tests {
     fn cancel_text_on_non_terminal_records_is_not_aborted() {
         for line in [
             // 「取消后重试」类文案：会话还在跑
-            r#"{"event":"model.request.failed","sessionId":"sess_abc12345","context":{"error":"cancelled by API error, retrying","attempt":1}}"#,
-            r#"{"event":"model.request.retrying","sessionId":"sess_abc12345","context":{"error":"request cancelled due to timeout, retrying"}}"#,
+            r#"{"event":"model.request.failed","sessionId":"session_abc12345","context":{"error":"cancelled by API error, retrying","attempt":1}}"#,
+            r#"{"event":"model.request.retrying","sessionId":"session_abc12345","context":{"error":"request cancelled due to timeout, retrying"}}"#,
             // 纯工具级取消（工具被跳过，回合继续）
-            r#"{"event":"tool.call.cancelled","sessionId":"sess_abc12345","context":{"toolName":"Bash","error":"tool call cancelled by user filter"}}"#,
+            r#"{"event":"tool.call.cancelled","sessionId":"session_abc12345","context":{"toolName":"Bash","error":"tool call cancelled by user filter"}}"#,
             // 有 event 字段的任意记录：error 含 cancel 不再兜底命中
-            r#"{"event":"hook.run.failed","sessionId":"sess_abc12345","context":{"error":"hook cancelled by timeout"}}"#,
+            r#"{"event":"hook.run.failed","sessionId":"session_abc12345","context":{"error":"hook cancelled by timeout"}}"#,
             // 无 event 但 message 不是 background turn failed
-            r#"{"message":"turn progress","sessionId":"sess_abc12345","context":{"error":"cancelled by API error, retrying"}}"#,
+            r#"{"message":"turn progress","sessionId":"session_abc12345","context":{"error":"cancelled by API error, retrying"}}"#,
         ] {
             assert!(
                 parse_log_signal(line).is_none(),

@@ -564,6 +564,7 @@ export const api = {
   saveWidgetPosition: (x: number, y: number) => invoke<void>("save_widget_position", { x, y }),
   /// 悬浮窗右键菜单「固定位置」开关（落盘到 widget.pinned，重启后保持）
   setWidgetPinned: (pinned: boolean) => invoke<void>("set_widget_pinned", { pinned }),
+  setWidgetAutoHide: (autoHide: boolean) => invoke<void>("set_widget_auto_hide", { autoHide }),
   /// 悬浮窗右键菜单「关闭悬浮窗」：关掉开关并销毁窗口；
   /// 主窗口的悬浮窗设置页经 bark://widget-closed 同步勾选态
   closeWidget: () => invoke<void>("close_widget"),

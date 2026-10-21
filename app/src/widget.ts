@@ -24,7 +24,6 @@ import {
   EVENT_LABELS,
   agentIcon,
   agentName,
-  agentShortName,
   isSubagentSession,
   PHASE_LABELS,
   placeholderName,
@@ -34,8 +33,9 @@ import {
   type SessionRow,
   type SessionStatus,
 } from "./api";
-import { initTheme } from "./theme";
-import { hideRowTip, scheduleRowTip } from "./widget-tip";
+import { initTheme, onThemeChange } from "./theme";
+import { hideRowTip, initRowTip, refreshRowTip, scheduleRowTip, scheduleTipHide } from "./widget-tip";
+import { CARD_WIDTH, MAX_LIST_HEIGHT, fitPosition, placeTip, tipWidth, splitName, SubagentLabels, type Rect } from "./widget-layout";
 import logo from "./assets/logo.png";
 
 const win = getCurrentWindow();
@@ -54,24 +54,13 @@ interface WidgetInit {
 }
 const init: WidgetInit =
   (window as unknown as { __WIDGET_INIT__?: WidgetInit }).__WIDGET_INIT__ ??
-  { x: 60, y: 60, width: 240, pinned: false, auto_hide: true };
+  { x: 60, y: 60, width: CARD_WIDTH, pinned: false, auto_hide: true };
 
-const CARD_W = init.width;
-const ROW_H = 26;
+const CARD_W = CARD_WIDTH;
 const PAD_V = 12;
-/**
- * 子代理行「首级」的左内边距。
- *
- * 基准是主会话行里**正文起点**的偏移（行内边距 2 + 图标 15 + 行 gap 8 = 25，见 widget.html
- * 的 `.row-item` / `.agent-icon`），再加 6px 让子代理整体比父行的名字**略右一点**：
- * 完全齐平时（实测差 2px 内）只剩 ↳ 和小一号字体在表达层级，扫一眼分不出谁是父；
- * 略右移既不浪费宽度，又把「这是派生出来的」写在缩进上。
- *
- * 主会话行有图标、子代理行没有，按层级数直接缩进（2 起）会整体偏左一大截，所以首级
- * 直接顶到上面算出的位置，再深的层级才按级右移。
- */
-const SUB_ALIGN_PX = 31;
-const IDLE_H = 38;
+const SUB_ALIGN_PX = 30;
+const IDLE_H = 44;
+const subagentLabels = new SubagentLabels();
 /** 完成/失败事件的驻留时长：与屏幕光效的完成色停留同量级 */
 const TERMINAL_HOLD_MS = 6000;
 /** 拖动停止多久后再读窗口位置落盘（等 OS 拖拽循环安静下来） */
@@ -81,7 +70,7 @@ const HIDE_DELAY_MS = 5000;
 /** 淡入 / 淡出时长（CSS 过渡同值，见 widget.html） */
 const FADE_MS = 160;
 
-type StateColor = "thinking" | "waiting" | "completed" | "failed";
+type StateColor = "thinking" | "waiting" | "completed" | "failed" | "aborted";
 
 let pinned = init.pinned;
 let dragging = false;
@@ -92,20 +81,20 @@ let expandedH = IDLE_H;
  * 上一帧「是否存在多个工作区」的判定（由 [`currentRows`] 每次渲染更新）。
  *
  * 终态驻留行在 `onEvent` 里就要定名字，那时没有整份快照可遍历。它只决定终态行的行内
- * 标签带不带 ` · 工作区名` 后缀——不带的话，跨工作区时它跟另一个工作区的行长得一样，
+ * 标签是否使用工作区名——不带的话，跨工作区时它跟另一个工作区的行长得一样，
  * 会被读成「挂在别人下面」（实测踩过）。
  */
 let lastMixedWorkspaces = false;
 
 interface Row {
   key: string;
+  sessionId?: string;
   agent: string;
-  /** 主标签：agent 名；跨工作区时带 ` · 工作区名` 后缀，占位父行是 `会话 …尾号`（见 [`rowLabel`]） */
+  /** 主标签：单工作区显示 agent，多工作区显示项目，子代理使用稳定编号。 */
   name: string;
   /**
-   * 悬停提示文案（见 [`rowTip`]）；空串 = 该行不给提示（行上已经写着了）。
-   * 用 `data-tip` 属性下发：行是每次 render 重建的，挂在元素上的监听会泄漏
-   * （见 widget-tip.ts 的说明）。
+   * 详情正文：完整工作区名。没有工作区时由渲染层回退为完整标签。
+   * 行节点按身份复用，更新快照时保持已展开的详情与滚动位置。
    */
   tip: string;
   label: string;
@@ -172,56 +161,20 @@ async function loadSessions() {
   }
 }
 
-/**
- * 会话行的**主标签**：默认是 agent 名（图标同源，见 `agentIcon`）；跨工作区时加
- * ` · 工作区名` 后缀，且那时改用**简称**。
- *
- * 为什么跨工作区必须把工作区名写在行上：同一个 agent 在两个工作区各开一个会话时，两行
- * 都是「DeepSeek Harness」，光看行分不出谁是谁（实测踩过：用户把另一工作区的会话当成了
- * 「凭空多出来的会话」）。只有一个工作区时不写——纯冗余，还占宽度。
- *
- * 为什么那时改用简称：全称 + 后缀（`DeepSeek Harness · passport-vibemic`）在 240px 的
- * 卡片里必然被 ellipsis 从中间截掉，两个工作区截出来的可能都是 `DeepSeek Harness · p…`，
- * 等于白写。简称（`DSH · passport-vibemic`）才放得下能区分的那一段。
- */
+/** Multiple workspaces use project names; icons and details retain the agent identity. */
 function rowLabel(agent: string, project: string | null, mixedWorkspaces: boolean): string {
-  return mixedWorkspaces && project ? `${agentShortName(agent)} · ${project}` : agentName(agent);
+  return mixedWorkspaces && project ? project : agentName(agent);
 }
-
-/**
- * 子代理行的主标签：`DSH 子代理` / `DeepSeek Harness 子代理`。
- *
- * **不写工作区名**：子代理跟它的父会话必然在同一个工作区，行上再写一遍既是冗余、又跟父行
- * 抢宽度（父行写工作区名是为了区分「同 agent 的多个工作区」，子代理没有这个歧义）。
- * 写「子代理」三个字反而解决了真正的问题——一眼看出这行是派生的，而不是又一个会话。
- *
- * 缩写在跨工作区时用（与父行的口径一致）：那时行上要放下「agent 名 + 子代理」。
- */
-function subagentLabel(agent: string, mixedWorkspaces: boolean): string {
-  return `${mixedWorkspaces ? agentShortName(agent) : agentName(agent)} 子代理`;
+function subagentLabel(agent: string, sessionId: string): string {
+  return subagentLabels.get(sessionRowKey(agent, sessionId));
 }
-
-/**
- * 悬停提示的文案（指针停在该行上时浮出），`""` = 不给提示、不渲染 `data-tip`。
- *
- * 内容就是**工作区名本身**。为什么不带 agent 名：行上已经写着 agent（单一工作区）或
- * `DSH · 工作区`（跨工作区），提示里再拼一遍是重复；用户要的就是「这行是哪个工作区」。
- *
- * 工作区为什么放在悬停里而不是行内：**子代理与主会话在同一个工作区**，行内再写一遍纯属
- * 冗余（一张卡上同一个名字重复五六次）；它真正有用的场景是「同一个 agent 开了多个工作区」
- * ——鼠标一停就能确认这行是哪个会话，不用常驻占位。
- *
- * 子代理行不给提示（调用点直接跳过）：它的标签已经是 `X 子代理`，工作区与父行相同。
- */
-function rowTip(project: string | null): string {
-  return project ? project : "";
-}
+function rowTip(project: string | null): string { return project ?? ""; }
 
 /**
  * 已「手动终止」的会话行：`agent|session_id` → 标记时刻。
  *
- * 用户按停止时**不合成新行**，而是把已经显示着的那一行就地标成「手动终止」（红点，
- * 与失败同色但文案不同）。为什么不用驻留行：那会多出一行「主的」，或者（父行已不在快照
+ * 用户按停止时**不合成新行**，而是把已经显示着的那一行就地标成「手动终止」（中性色）。
+ * 为什么不用驻留行：那会多出一行「主的」，或者（父行已不在快照
  * 里时）合成一行 `会话 …尾号` —— 一串 id 尾号既难认、也不是用户想看的（实测被点名）。
  *
  * daemon 收到终态就把条目摘掉，所以这一行可能只存在一帧。为了让它**看得清**，标记会
@@ -282,7 +235,7 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
   const map: Partial<Record<NormalizedEvent["type"], [StateColor, string]>> = {
     run_completed: ["completed", EVENT_LABELS.run_completed],
     run_failed: ["failed", EVENT_LABELS.run_failed],
-    run_aborted: ["failed", ABORT_LABEL],
+    run_aborted: ["aborted", ABORT_LABEL],
   };
   const hit = map[ev.type];
   if (!hit) return;
@@ -300,9 +253,9 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
     if (!abortedMemo.has(key)) {
       abortedMemo.set(key, {
         name: ev.is_subagent
-          ? subagentLabel(ev.agent, lastMixedWorkspaces)
+          ? subagentLabel(ev.agent, ev.session_id)
           : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
-        tip: "",
+        tip: ev.project ?? "",
         // 子代理恒挂在父行下面一级；主会话顶格。`undefined` = **不知道**（事件没带
         // `is_subagent`）：这样的一行**不缩进**，也就不带根行的图标（见 render 的图标条件），
         // 免得出现「子代理标签 + 根行图标」这种自相矛盾的一行
@@ -322,16 +275,16 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
   // 同一条口径）。行本身照常出现——用户要的就是「看得见子代理在做什么」。
   terminal = {
     key: ev.id,
+    sessionId: ev.session_id,
     agent: ev.agent,
     // 驻留行与它**取代的那一行同名**：跨工作区时会话行带 ` · 工作区名`、子代理行写
     // 「子代理」。名字不一致就会被读成「挂在别人下面」（实测踩过：子代理收尾那一瞬间，
     // 它的「任务完成」行看着挂到了另一个工作区的会话下）。单一工作区时才用全称——
     // 那时没有歧义，缩写反而是丢信息
     name: ev.is_subagent
-      ? subagentLabel(ev.agent, lastMixedWorkspaces)
+      ? subagentLabel(ev.agent, ev.session_id)
       : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
-    // 驻留行是短命的一条，不给提示（免得高度/焦点刚变就浮一个框）
-    tip: "",
+    tip: ev.project ?? "",
     label: hit[1],
     state: hit[0],
     attention: !ev.is_subagent,
@@ -352,16 +305,15 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
 let expiryTimer = 0;
 function scheduleExpiry() {
   window.clearTimeout(expiryTimer);
-  if (!terminal) return;
-  const left = TERMINAL_HOLD_MS - (Date.now() - terminal.at);
-  if (left <= 0) {
-    terminal = null;
-    return;
-  }
+  const now = Date.now();
+  const deadlines = [...abortedRows.values()].map((at) => at + ABORT_HOLD_MS).filter((at) => at > now);
+  if (terminal) deadlines.push(terminal.at + TERMINAL_HOLD_MS);
+  if (!deadlines.length) return;
   expiryTimer = window.setTimeout(() => {
-    terminal = null;
+    if (terminal && Date.now() - terminal.at >= TERMINAL_HOLD_MS) terminal = null;
     render();
-  }, left + 50);
+    scheduleExpiry();
+  }, Math.max(0, Math.min(...deadlines) - now) + 50);
 }
 
 /**
@@ -384,7 +336,7 @@ function rowsUnder(rows: Row[], roots: Set<string>): Set<string> {
 function currentRows(): Row[] {
   // 排序 + 挂树交给 api（与事件流的「运行中会话」区共用一份口径）：后端快照按
   // started_at 倒序平铺，直接用会让子代理与父行交错、看不出谁派生了谁。
-  // 不截断：所有会话都展示（用户明确要求），卡片高度随行数增长
+  // 不截断：全部会话都保留，超出可用高度时在卡片内滚动。
   const list = sessionRows(sessions);
   // 手动终止标记的过期：**还有活着的子代理引用这个父会话就不清**。
   //
@@ -425,8 +377,8 @@ function currentRows(): Row[] {
     // 这一行还在快照里：把「上一帧见到的样子」记准（常驻父行会用到）
     if (aborted && !placeholder) {
       abortedMemo.set(sessionRowKey(s.agent, s.session_id), {
-        name: sub ? subagentLabel(s.agent, mixedWorkspaces) : rowLabel(s.agent, s.project, mixedWorkspaces),
-        tip: sub ? "" : rowTip(s.project),
+        name: sub ? subagentLabel(s.agent, s.session_id) : rowLabel(s.agent, s.project, mixedWorkspaces),
+        tip: rowTip(s.project),
         depth,
         // 真实行子代理与否是确定的（快照里的 `parent`），记下来供合成行复用
         subagent: sub,
@@ -437,20 +389,21 @@ function currentRows(): Row[] {
     const name = placeholder
       ? placeholderName(s.session_id)
       : sub
-        ? subagentLabel(s.agent, mixedWorkspaces)
+        ? subagentLabel(s.agent, s.session_id)
         : rowLabel(s.agent, s.project, mixedWorkspaces);
-    const tip = placeholder || sub ? "" : rowTip(s.project);
+    const tip = rowTip(s.project);
     // 每一行都留一份「上一帧见到的样子」：父行消失后要靠它把占位父行还原成真名字
     lastSeenRow.set(sessionRowKey(s.agent, s.session_id), { name, tip });
     return {
       key: s.session_id,
+      sessionId: s.session_id,
       agent: s.agent,
       name,
-      // 子代理行不给提示：它的标签已经说清了「是什么」，工作区名与父行重复
+      // 子代理详情同样保留完整工作区，方便确认归属。
       tip,
       // 未知 phase 兜底显示原值：undefined 漏进 escapeHtml 会抛 TypeError、悬浮窗冻结在旧帧
       label: placeholder ? "已结束" : aborted ? ABORT_LABEL : (PHASE_LABELS[s.phase] ?? String(s.phase)),
-      state: aborted ? "failed" : state,
+      state: aborted ? "aborted" : state,
       // 等待（等待确认 / 等待输入）要人管 = 有事；思考类（思考中 / 执行工具）不用。
       // 子代理行恒不置位：它做的事是父回合的一部分，弹卡片这件事留给父会话
       // （父会话在等子代理期间零事件，但心跳经 touch_ancestors 续着，不会被判死）。
@@ -486,7 +439,7 @@ function currentRows(): Row[] {
         name: memo?.name ?? last?.name ?? `${agentName(row.agent)} 已结束`,
         tip: memo?.tip ?? last?.tip ?? "",
         label: aborted ? ABORT_LABEL : "已结束",
-        state: aborted ? "failed" : "completed",
+        state: aborted ? "aborted" : "completed",
         // 手动终止是用户自己按的、结束是自然的：都不该把卡片弹回来
         attention: false,
         isSession: false,
@@ -534,64 +487,91 @@ function escapeHtml(s: unknown): string {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 }
 
-function render() {
-  // 行要整段重建（innerHTML）：提示框记的是旧行的元素，重建后它的位置就没人维护了。
-  // 重建即收起——下次 mouseover 会按新行重新排（见 widget-tip.ts 的时序说明）
-  hideRowTip();
-  const list = currentRows();
-  if (!list.length) {
-    appEl.innerHTML = `<div class="card"><div class="row-item idle"><img src="${logo}" alt="" /><span>空闲 · 没有进行中的会话</span></div></div>`;
-  } else {
-    appEl.innerHTML =
-      `<div class="card">` +
-      list
-        .map((r) => {
-          // 子代理行：行首 ↳（层级缩进内联给出——深度是数据，不是样式），
-          // 名字与状态由 CSS 弱化（见 widget.html 的 .row-item.sub）。
-          // 父会话不在快照里的子代理**不顶格**：api 会给它补一行占位父行（见 sessionRows），
-          // 它照常缩进挂在占位行下面——顶格平铺会被读成「挂到了别的会话下面」（实测事故）
-          // 缩进：首级顶到正文起点（与上一行的会话名对齐，见 SUB_ALIGN_PX），再深的层级
-          // 按级右移；层级封顶（与事件流同一口径，见 SESSION_INDENT_MAX）——卡片只有
-          // 240px，一直右移会把名字挤没。
-          // 注意：缩进看 `depth`，而「是不是子代理」看 `r.subagent`——子代理可能因为
-          // 父行被摘掉而 `depth = 0`（见 currentRows），那时它仍是子代理行
-          const step = Math.min(r.depth, SESSION_INDENT_MAX) - 1;
-          // 占位父行没有 ↳ 记号，补回记号占的宽度，才与别的行的正文起点一致
-          const pad = r.subagent ? SUB_ALIGN_PX + Math.max(step, 0) * 11 : r.placeholder ? SUB_ALIGN_PX - 3 : 0;
-          const indent = pad > 0 ? ` style="padding-left:${pad}px"` : "";
-          const mark = r.subagent ? `<span class="tree">↳</span>` : "";
-          // 占位父行与子代理行都不放图标：子代理的父行就在正上方，同一棵树必然同 agent；
-          // 占位行则根本不知道是哪个 agent 的会话（它不在快照里）
-          const icon =
-            r.subagent || r.placeholder ? "" : `<span class="agent-icon">${agentIcon(r.agent)}</span>`;
-          // 工作区名走悬停提示（data-tip，由 widget-tip.ts 的委托监听消费）：
-          // 空串 = 该行没什么可补充的，不提示
-          const tip = r.tip ? ` data-tip="${escapeHtml(r.tip)}"` : "";
-          const cls = `${r.subagent ? " sub" : ""}${r.placeholder ? " placeholder" : ""}`;
-          return (
-            `<div class="row-item${cls}"${indent}${tip}>` +
-            mark +
-            icon +
-            `<span class="name">${escapeHtml(r.name)}</span>` +
-            `<span class="state ${r.state}"><i class="dot"></i>${escapeHtml(r.label)}</span>` +
-            `</div>`
-          );
-        })
-        .join("") +
-      `</div>`;
-  }
-  // 全部会话行都展示（不折叠）：卡片高度 = 行数 × 行高，行多了卡片就长
-  expandedH = list.length ? PAD_V + list.length * ROW_H : IDLE_H;
+const cardEl = document.createElement("div");
+cardEl.className = "card";
+const listEl = document.createElement("div");
+listEl.className = "session-list";
+const footerEl = document.createElement("div");
+footerEl.className = "list-footer";
+footerEl.hidden = true;
+cardEl.append(listEl, footerEl);
+appEl.append(cardEl);
+const rowElements = new Map<string, HTMLElement>();
+let maxListHeight = MAX_LIST_HEIGHT;
+let listContentHeight = 32;
 
-  void syncWindowSize().catch((e) => console.warn("同步悬浮窗尺寸失败：", e));
+function render() {
+  const list = currentRows();
+  const keep = new Set<string>();
+  const labelKeys = new Set(sessions.map((s) => sessionRowKey(s.agent, s.session_id)));
+  for (const key of abortedRows.keys()) labelKeys.add(key);
+  if (terminal?.sessionId) labelKeys.add(sessionRowKey(terminal.agent, terminal.sessionId));
+  subagentLabels.retain(labelKeys);
+  list.forEach((r, index) => {
+    const key = sessionRowKey(r.agent, r.key);
+    keep.add(key);
+    let el = rowElements.get(key);
+    if (!el) { el = document.createElement("div"); rowElements.set(key, el); }
+    const group = index > 0 && !r.subagent && list[index - 1].subagent;
+    const lastChild = r.subagent && (!list[index + 1] || list[index + 1].depth < r.depth || !list[index + 1].subagent);
+    el.className = "row-item" + (r.subagent ? " sub" : "") + (r.placeholder ? " placeholder" : "") + (group ? " group-start" : "") + (lastChild ? " last-child" : "");
+    el.dataset.state = r.state;
+    el.dataset.tip = r.tip || r.name;
+    el.dataset.tipHeading = agentName(r.agent) + (r.subagent ? " · " + r.name : "");
+    const pad = r.subagent ? SUB_ALIGN_PX + Math.max(0, Math.min(r.depth, SESSION_INDENT_MAX) - 1) * 11 : 7;
+    el.style.paddingLeft = pad + "px";
+    el.style.setProperty("--indent", pad + "px");
+    const [start, tail] = splitName(r.name);
+    const icon = r.subagent ? '<span class="tree" aria-hidden="true"></span>' : '<span class="agent-icon">' + agentIcon(r.agent) + '</span>';
+    const pin = pinned && index === 0 ? '<span class="pin-mark" aria-label="位置已固定">⌖</span>' : '';
+    const markup = icon + '<span class="name"><span class="name-start">' + escapeHtml(start) + '</span><span class="name-tail">' + escapeHtml(tail) + '</span></span>' + pin + '<span class="state ' + r.state + '"><i class="dot" aria-hidden="true"></i>' + escapeHtml(r.label) + '</span>';
+    if (el.innerHTML !== markup) el.innerHTML = markup;
+    if (listEl.children[index] !== el) listEl.insertBefore(el, listEl.children[index] ?? null);
+  });
+  for (const [key, el] of rowElements) if (!keep.has(key)) { el.remove(); rowElements.delete(key); }
+  const idle = listEl.querySelector(".idle");
+  if (list.length) idle?.remove();
+  else if (!idle) listEl.innerHTML = '<div class="row-item idle"><img src="' + logo + '" alt=""><span>空闲 · 没有进行中的会话</span></div>';
+  listContentHeight = list.length ? list.reduce((height, row, index) => height + (row.subagent ? 29 : 32) + (index > 0 && !row.subagent && list[index - 1].subagent ? 6 : 0), 0) : 32;
+  const attentionCount = list.filter((r) => r.state === "waiting" || r.state === "failed").length;
+  footerEl.innerHTML = '<span>' + list.filter((r) => !r.placeholder).length + ' 个会话 · 可滚动</span><b>' + attentionCount + ' 项待处理</b>';
+  updateCardHeight();
+  void syncWindowSize().then(refreshRowTip).catch((e) => console.warn("同步悬浮窗尺寸失败：", e));
   evaluateVisibility(list);
 }
 
-// ---- 窗口尺寸 ----
+function updateCardHeight() {
+  listEl.style.maxHeight = maxListHeight + "px";
+  footerEl.hidden = listContentHeight <= maxListHeight;
+  expandedH = PAD_V + Math.min(listContentHeight, maxListHeight) + (footerEl.hidden ? 0 : 31);
+}
 
-async function syncWindowSize() {
-  if (menuOpen) return; // 菜单把窗口撑大过，尺寸由 closeMenu 还原，别在这儿缩回去
-  await win.setSize(new LogicalSize(CARD_W, expandedH));
+async function screenGeometry() {
+  const [pos, scale, mon] = await Promise.all([win.outerPosition(), win.scaleFactor(), currentMonitor()]);
+  const ratio = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const work = mon?.workArea;
+  return {
+    position: { x: pos.x / ratio, y: pos.y / ratio },
+    screen: {
+      x: (work?.position.x ?? mon?.position.x ?? 0) / ratio,
+      y: (work?.position.y ?? mon?.position.y ?? 0) / ratio,
+      width: (work?.size.width ?? mon?.size.width ?? 1920 * ratio) / ratio,
+      height: (work?.size.height ?? mon?.size.height ?? 1080 * ratio) / ratio,
+    } satisfies Rect,
+  };
+}
+
+function syncWindowSize() {
+  return queueMenuOp(async () => {
+    if (menuOpen || menuMoving || tipOpen || tipMoving || dragging) return;
+    const { position, screen } = await screenGeometry();
+    if (menuOpen || menuMoving || tipOpen || tipMoving || dragging) return;
+    maxListHeight = Math.min(MAX_LIST_HEIGHT, Math.max(32, screen.height - PAD_V - 31 - 120));
+    updateCardHeight();
+    const next = fitPosition({ ...position, width: CARD_W, height: expandedH }, screen);
+    await win.setSize(new LogicalSize(CARD_W, expandedH));
+    if (next.x !== position.x || next.y !== position.y) await win.setPosition(new LogicalPosition(next.x, next.y));
+  });
 }
 
 // ---- 自动隐藏（安静即隐、有事即现）----
@@ -778,9 +758,10 @@ let saveTimer = 0;
 
 async function saveCurrentPosition() {
   // 菜单会把窗口临时撑高/上移（见 openMenu），期间的位置不是用户放置的，不落盘
-  if (menuOpen || menuMoving) return;
+  if (menuOpen || menuMoving || tipOpen || tipMoving) return;
   try {
     const [pos, scale] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
+    if (menuOpen || menuMoving || tipOpen || tipMoving) return;
     await api.saveWidgetPosition(Math.round(pos.x / scale), Math.round(pos.y / scale));
   } catch (e) {
     console.warn("保存悬浮窗位置失败：", e);
@@ -816,11 +797,16 @@ appEl.addEventListener("mousedown", (e) => {
     return;
   }
   if (e.button !== 0) return;
+  const scrollBar = listEl.getBoundingClientRect().right - (listEl.offsetWidth - listEl.clientWidth);
+  if (listEl.scrollHeight > listEl.clientHeight && e.clientX >= scrollBar) return;
   if (e.detail >= 2) {
     void api.showPanel().catch((err) => console.warn("打开主面板失败：", err)); // 双击：打开主面板（与托盘菜单「显示主窗口」同一条命令路径）
     return;
   }
   if (pinned) return;
+  // Use the current visual position as the drag origin, even if details shifted it upward.
+  tipSavedPosition = null;
+  hideRowTip();
   dragging = true;
   // startDragging 的 promise 要到 OS 拖拽循环结束才落定，天然就是「拖完了」信号
   // （mouseup 会被拖拽循环吞掉，不能当收尾）：finally 里统一复位 dragging、
@@ -832,6 +818,7 @@ appEl.addEventListener("mousedown", (e) => {
     .finally(() => {
       dragging = false;
       schedulePositionSave();
+      void syncWindowSize().catch((e) => console.warn("拖动后调整悬浮窗失败：", e));
       evaluateVisibility();
     });
 });
@@ -846,28 +833,66 @@ document.addEventListener("mouseup", () => {
 
 // 双击悬浮窗的动作并入上面的 mousedown（e.detail >= 2）——见那里的原因说明。
 
-// ---- 行悬停提示（工作区名）----
-//
-// 事件委托而不是逐行挂监听：行是每次 render 重建 innerHTML 的，挂在元素上的监听会随帧泄漏
-// （见 widget-tip.ts）。`mouseover` / `mouseout` 会冒泡，正好用来在容器上接。
-appEl.addEventListener("mouseover", (e) => {
-  const row = (e.target as Element | null)?.closest?.(".row-item[data-tip]") as HTMLElement | null;
-  // 移到同卡片里**没有**提示的行（多工作区时行内已写工作区名、占位行、驻留行）也要收起：
-  // 不处理的话上一条提示会 stale 地挂在桌上——`mouseout` 那边只在真正离开卡片时才收，
-  // 行与行之间移动的 `relatedTarget` 非空，收不到这里
-  if (!row) {
-    if ((e.target as Element | null)?.closest?.(".row-item")) hideRowTip();
-    return;
-  }
-  scheduleRowTip(row.dataset.tip ?? "", row);
+// ---- 行悬停详情 ----
+listEl.addEventListener("mouseover", (event) => {
+  if (dragging || menuOpen || menuMoving) return;
+  const row = (event.target as Element | null)?.closest<HTMLElement>(".row-item[data-tip]");
+  if (row) scheduleRowTip(row);
 });
-appEl.addEventListener("mouseout", (e) => {
-  // 只在真正离开卡片时收起：行与行之间移动会连发 out/in，靠 in 那边接管即可
-  if (!(e as MouseEvent).relatedTarget) hideRowTip();
-});
-appEl.addEventListener("mouseleave", hideRowTip);
-// 拖动 / 右键菜单 / 双击打开面板时提示都该消失（不然会挂在桌面上）
+listEl.addEventListener("mouseleave", scheduleTipHide);
+listEl.addEventListener("scroll", refreshRowTip);
 appEl.addEventListener("mousedown", hideRowTip);
+onThemeChange(refreshRowTip);
+
+let tipOpen = false;
+let tipMoving = false;
+let tipSavedPosition: { x: number; y: number } | null = null;
+
+async function closeTipWindowImpl() {
+  if (!tipOpen && !tipMoving && !tipSavedPosition) return;
+  tipOpen = false;
+  tipMoving = true;
+  const saved = tipSavedPosition;
+  tipSavedPosition = null;
+  try {
+    await win.setSize(new LogicalSize(CARD_W, expandedH));
+    if (saved && !dragging) await win.setPosition(new LogicalPosition(saved.x, saved.y));
+  } finally {
+    tipMoving = false;
+  }
+}
+
+initRowTip({
+  close: () => queueMenuOp(closeTipWindowImpl),
+  place: (box, row, current) => queueMenuOp(async () => {
+    if (!current() || menuOpen || menuMoving || dragging || hidden || fadingOut()) return false;
+    tipMoving = true;
+    try {
+      const { position, screen } = await screenGeometry();
+      if (!current() || dragging) return false;
+      const origin = tipSavedPosition ?? position;
+      const card = { ...origin, width: CARD_W, height: expandedH };
+      const plan = tipWidth(card, screen);
+      box.style.width = plan.width + "px";
+      box.style.maxHeight = "112px";
+      const geometry = placeTip(card, screen, row.getBoundingClientRect().top, box.offsetHeight);
+      box.style.left = geometry.left + "px";
+      box.style.top = geometry.top + "px";
+      box.style.maxHeight = geometry.height + "px";
+      box.dataset.placement = geometry.side;
+      if (!tipSavedPosition) tipSavedPosition = origin;
+      tipOpen = true;
+      await win.setSize(new LogicalSize(geometry.windowWidth, geometry.windowHeight));
+      if (!current() || dragging) return false;
+      if (position.x !== geometry.x || position.y !== geometry.y) {
+        await win.setPosition(new LogicalPosition(geometry.x, geometry.y));
+      }
+      return current();
+    } finally {
+      tipMoving = false;
+    }
+  }),
+});
 
 // ---- 右键菜单（固定位置 / 关闭悬浮窗）----
 
@@ -886,10 +911,10 @@ let menuSavedY: number | null = null;
  */
 let menuChain: Promise<void> = Promise.resolve();
 
-function queueMenuOp(op: () => Promise<void>): Promise<void> {
+function queueMenuOp<T>(op: () => Promise<T>): Promise<T> {
   // 前一段的成败不影响后一段；op 自身不抛，这里再兜一层
   const run = menuChain.then(op, op);
-  menuChain = run.catch(() => {});
+  menuChain = run.then(() => {}, () => {});
   return run;
 }
 
@@ -905,12 +930,15 @@ function closeMenu(): Promise<void> {
 
 function renderMenuState() {
   document.getElementById("ctx-pin")!.classList.toggle("checked", pinned);
+  document.getElementById("ctx-auto")!.classList.toggle("checked", autoHide);
 }
 
 async function openMenuImpl(cx: number, cy: number) {
   // 防重入：菜单开着时再次右键不重新打开——否则 menuSavedY 会被覆写成上移后的 y，
   // closeMenu 还原到错误位置（底边附近的卡片会向上漂移，见 §1.18）
   if (menuOpen) return;
+  hideRowTip();
+  await closeTipWindowImpl();
   cancelHide(); // 菜单打开期间不许隐藏（指针不一定触发过 mouseenter，别只靠悬停挡）
   menuMoving = true; // 从这里到 closeMenu 还原完，窗口的移动都不是用户放置
   renderMenuState();
@@ -929,13 +957,13 @@ async function openMenuImpl(cx: number, cy: number) {
       const pos = await win.outerPosition();
       const winTop = pos.y / scale;
       const cursorY = winTop + cy;
-      const screenBottom = (mon.position.y + mon.size.height) / scale;
+      const screenBottom = (mon.workArea.position.y + mon.workArea.size.height) / scale;
       if (cursorY + mh + 6 > screenBottom) {
         // 菜单朝下会伸出屏幕底 → 朝上翻：底边贴光标上沿，窗口顶边抬到菜单上方
         const wantTop = cursorY - mh - 6;
         upShift = Math.max(0, winTop - wantTop);
         // 别把窗口抬出屏幕顶
-        upShift = Math.min(upShift, winTop - mon.position.y / scale);
+        upShift = Math.min(upShift, winTop - mon.workArea.position.y / scale);
         // 窗口上移 upShift 后，同一屏幕位置在窗口里的相对 y 变小
         my = Math.max(4, cursorY - 2 - mh - (winTop - upShift));
         needH = Math.round(my + mh + 4);
@@ -1006,17 +1034,36 @@ document.addEventListener("mouseenter", () => {
 // 同时解除悬停挂起（悬停期间不计时）
 document.addEventListener("mouseleave", () => {
   hovering = false;
+  hideRowTip();
   if (!dragging) void closeMenu().catch((err) => console.warn("收起悬浮窗菜单失败：", err));
   evaluateVisibility();
 });
 
+document.getElementById("ctx-panel")!.addEventListener("click", async () => {
+  await closeMenu();
+  void api.showPanel().catch((e) => console.warn("打开主面板失败：", e));
+});
 document.getElementById("ctx-pin")!.addEventListener("click", async () => {
-  pinned = !pinned;
+  const button = document.getElementById("ctx-pin") as HTMLButtonElement;
+  const next = !pinned;
+  button.disabled = true;
   try {
-    await api.setWidgetPinned(pinned);
-  } catch (e) {
-    console.warn("保存固定状态失败：", e);
-  }
+    await api.setWidgetPinned(next);
+    pinned = next;
+    render();
+  } catch (e) { console.warn("保存固定状态失败：", e); }
+  finally { button.disabled = false; }
+  await closeMenu();
+});
+document.getElementById("ctx-auto")!.addEventListener("click", async () => {
+  const button = document.getElementById("ctx-auto") as HTMLButtonElement;
+  const next = !autoHide;
+  button.disabled = true;
+  try {
+    await api.setWidgetAutoHide(next);
+    autoHide = next;
+  } catch (e) { console.warn("保存自动隐藏失败：", e); }
+  finally { button.disabled = false; }
   await closeMenu();
 });
 document.getElementById("ctx-exit")!.addEventListener("click", async () => {

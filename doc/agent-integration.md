@@ -240,7 +240,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
   **对策（非官方）**：daemon 会**每秒增量读一次 ZCode 的本地日志**（`~/.zcode/cli/log/zcode-<日期>.jsonl`），识别中断记录后合成一条 **`run_aborted`（中止）**——效果是**按停止后约 1 秒内**会话清出列表、流光在没有别的会话在跑时直接收起（不亮失败色、不亮完成色、不通知；与 Qoder 的 `SessionEnd`、DSH 的 `aborted` 统一到同一类）。判据见下文「中断信号」；应用升级改了日志格式时会自然退化回判死超时，不会误报。不想让它读日志，关掉 ZCode 接入开关即可（那时它完全不工作）。
   「等你输入」只覆盖走 `PreToolUse`/`PermissionRequest` 的提问（`AskUserQuestion`），计划模式批准（`ExitPlanMode`）按「需要确认」通知——这类交互本身**不能**由 hook 代替你回答；
 - **`PostToolUse` 注册为 `tool_finished`（工具收尾）**：它是**等待状态解除的唯一信号**——答完 `AskUserQuestion` / 批完权限后，agent 要先思考一段时间才可能调下一个工具，这期间没有 `PreToolUse`（下一次工具开始才有）、没有 `UserPromptSubmit`（新回合才有）。曾经以「进程开销翻倍」为由不注册它，实测代价算错了方向：每轮多 3 次起进程（毫秒级）几乎无感，而「答完问题后等待色卡几十秒、直到下一个工具才开始」是用户每天可见的（实测复现）。它当心跳处理：相位回落思考中、会话留在表里；不通知、不入历史、不响音效（与 `activity` 同口径的纯状态信号）。注意收尾时点=工具结束：被批准工具**执行期间**相位仍是等待中（那段时间本来就没有事件），收尾才解除；乱序晚到（Stop 之后才到）由状态机的回声防护抑制，不会复活刚结束的会话。
-- **子代理不做识别**：实测载荷里没有 `agent_type`/`agent_id`/`is_subagent`（主会话与子代理都只有 `session_id`），所以 ZCode 的子代理事件**会照常通知**。通用的「`agent_type` 非空即判子代理」启发式对 ZCode 会误伤主会话，适配器里已显式覆盖：只认 `is_subagent`/`subagent` 显式布尔值与 `sess_subagent_*` 会话命名；
+- **子代理不触发任何 hook（2026-10-21 实测，3.16.2）**：派生一个只读子代理跑完整回合，`Stop` / `SessionStart` 零投递（daemon 侧事件 id 落盘零增量），同一时刻主会话 hook 照常工作——hook 通道对子代理**全盲**。子代理的识别与显示全部走日志通道（见下文「子代理语义」）；hook 载荷路径仍保留防御式判定（显式布尔 `is_subagent`/`subagent` 与 `sess_subagent_*` 命名——旧代确实发过子代理 hook，未来版本也可能恢复），但「`agent_type` 非空即判子代理」的通用启发式对 ZCode 会误伤主会话（`agent_type` 是 `SessionStart` 的可选普通字段），适配器里已显式覆盖；
 - **别指望项目级 hooks**：写在 `<工作区>/.zcode/config.json` 或 `zcode.json` 里的 `hooks` 在现行版本被整体忽略（日志记 `config_project_hooks_ignored`），设置页也隐藏了工作区作用域入口；只有用户级这份生效；
 - **同一份文件里可能有别的工具的条目**（clawd / OpenViking / Hindsight 等都往这里合并 hook）。我们只在数组末尾追加**自己的独立组**、按条目摘除，既不并入也不重排别人的组；反过来，clawd 见到我们的 `PermissionRequest` 条目会拒绝注册它自己的阻塞 hook（它的自我保护，对我们无影响）；
 - **`AskUserQuestion` / `ExitPlanMode` 不走授权决定通道**，对我们只是「通知怎么写」的差别：前者归一为 `input_required`（「等待输入」），其余 `PermissionRequest` 是 `permission_required`（「需要确认」）。
@@ -257,6 +257,10 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 ```
 
 **中断信号**（看门狗用的判据，跨 4 天日志实测 12 次中断 1:1 对应）：`v4.stop.foreground_execution_inspected` 且 `runtimeStopKind == "stopped"`，或一条**顶层没有 `event` 字段**的 warn 记录其 `context.error` 含 `cancelled`。**不能**用 `turn.failed` 判：实测 20 条里只有 12 条是中断，其余是真实的模型/工具失败（那种情况 hook 正常上报，再合成一条就重复了）。看门狗还有两道保险：只对「会话表里还在跑」的会话生效（正常回合的 `Stop` 已清表 → 不重复通知），同一会话 30 秒内只合成一次（两条记录相隔 25ms）。
+
+**会话 id 单版本口径**（2026-10-21 收敛）：只认现行格式——主会话 `session_<32hex>`（3.16.2 起实测，日志、artifacts、SQLite 同源）、子代理 `sess_subagent_agent_<uuid>`（**子代理不换前缀**：bundle 里 `sess_` 前缀与 `subagent_agent_` 标记是两个独立常量，前缀更名只施加于主会话；曾推定 `session_subagent_*`，实测不存在）。历史背景：2026-10-20 曾因 `session_` 不含 `sess_` 前缀（第 5 个字符是 `i` 不是 `_`）整行丢弃新版日志——当日 GLM 额度耗尽连写 5 条 `status:"failed"` 的 `turn.failed`（`cause.message = "exceed quota limit"`，providerCode 1005），零通知、会话卡「思考中」直到心跳判死兜底。旧代 `sess_<uuid>` 主会话不再支持：ZCode 全量自动更新，没有停在旧版的用户；真出现旧版日志时行为是退回判死超时，不误报。
+
+**子代理语义**（ZCode 版，2026-10-21 实测 + 实现）：子代理会话**不触发任何 hook**，识别与显示全部由日志看门狗完成——子代理行的 `turn.started` / `tool.call.started` / `turn.completed`（都带 `context.parentSessionId` 血缘与 `context.toolName`）被折成合成事件塞进管道：`Activity`（思考中/执行工具，建档）与 `RunCompleted`（摘表），带 `parent_session_id` 与 `is_subagent`。建档、挂树（悬浮窗 `↳` 缩进 + 「子代理」标记，与 DSH 同一套前端）、向父会话传播存活全部复用既有机制；通知 / 音效 / 全屏特效三道 `is_subagent` 门拦着，纯显示不扰人。子代理的 `turn.failed` 走与主会话相同的终态信号路径（cancelled → 中止、其余 → 失败），照常合成以收掉会话条目——早年「子代理失败不合成」的拒绝是因为特效通道还没有门，如今门已齐（`burst_for_event` / `edge_kind`）。缺血缘的子代理行不折活动（挂不了树，宁可不显示）；`turn.completed` 摘表后若同一子代理被 `SendMessage` 续开新回合，下一条 `turn.started` 会重新建档。
 
 另外两条**通用**的加载/行为规则值得记住：
 - **hooks 配置里任何一条不合规，整份配置都会被拒**（`config.file.invalid`，日志给出精确路径如 `hooks.events.PostToolUse.0: Invalid input: expected object, received null`），不是只有那一条失效——BOM 那次是同一个机制；
@@ -730,7 +734,7 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
 - 其它 agent 若进程被直接杀掉，不会有任何终态事件——这种情况靠**心跳静止判死**兜底（流光转失败色、条目清出列表）。
 - **判死时长**默认 10 分钟，由后台巡检每 30s 检查一次（不需要等下一条事件到来——早期版本只在有新事件时才算判死，所以会一直卡在思考色，已修）。想让中断后的反馈更快，用环境变量 `BARK_STALE_AFTER_MS`（毫秒，最小 5000）覆盖，例如 `BARK_STALE_AFTER_MS=60000` = 静默 1 分钟即判死；代价是**长时间跑单个工具**时可能被误判成「意外终止」。
-- **ZCode 不受长静默误判**：它的日志看门狗在读终态信号之余还做**存活心跳**——任何带会话 id 的日志行（含子代理行经 `parentSessionId` 向父会话传播）都会刷新 `last_activity`，判死口径是「无 hook **且** 无日志活动」。长工具 / 长子代理 / 长思考期间 hook 静默但日志还在写，不会被误判成意外终止；进程被杀后日志同步停写，判死照常。其余 hook 型 agent 没有这层信号，仍按 hook 心跳静止判死。
+- **ZCode 不受长静默误判**：它的日志看门狗在读终态信号之余还做**存活心跳**——任何带会话 id 的日志行（含子代理行经 `parentSessionId` 向父会话传播）都会刷新 `last_activity`，判死口径是「无 hook **且** 无日志活动」。长工具 / 长子代理 / 长思考期间 hook 静默但日志还在写，不会被误判成意外终止；进程被杀后日志同步停写，判死照常。同一通道还负责**子代理显示**（子代理不触发 hook，见上文「子代理语义」）。其余 hook 型 agent 没有这层信号，仍按 hook 心跳静止判死。
 - **不想等**：托盘菜单 →「重置流光」立刻驱散当前颜色（下一次事件到来时按正常逻辑重新点亮），会话条目也会在下一次快照时消失。
 
 **手动中止后流光为什么不亮失败色也不亮完成色**：这是刻意的。用户主动中止归一成 `run_aborted`——不是失败（不亮失败色、不弹「任务失败」）也不是完成（不亮完成色、不谎报跑完）；没有别的会话在跑时**直接收起光效**，还有别的会话在跑就照常显示它们的状态。若你看到某个 agent 中止后仍亮完成 / 失败色，说明它的中止信号还没被归到这一类（见 §0 的说明与各 agent 的「注册事件」一行）。

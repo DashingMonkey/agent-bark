@@ -45,6 +45,7 @@ pub fn run() {
             commands::list_monitors,
             commands::save_widget_position,
             commands::set_widget_pinned,
+            commands::set_widget_auto_hide,
             commands::close_widget,
             commands::show_main_panel,
             commands::reset_glow,

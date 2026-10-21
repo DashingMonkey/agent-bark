@@ -52,6 +52,7 @@ async function toggle(key: "enabled" | "auto_hide", on: boolean) {
 
 // 悬浮窗右键「关闭悬浮窗」时本页可能正开着：同步勾选态，别让界面撒谎
 let unlistenWidgetClosed: (() => void) | null = null;
+let unlistenWidgetConfig: (() => void) | null = null;
 /** 卸载标志：listen 的 promise 落定前组件可能已经卸载（注册竞态），
  *  resolve 时若已卸载就立即 unlisten，否则这条监听会永久泄漏在窗口里（code-review §2.16） */
 let cancelled = false;
@@ -59,6 +60,14 @@ let cancelled = false;
 onMounted(() => {
   load();
   cancelled = false;
+  listen<{ auto_hide: boolean }>("bark://widget-config", (event) => {
+    if (config.value && typeof event.payload?.auto_hide === "boolean") {
+      config.value.widget.auto_hide = event.payload.auto_hide;
+    }
+  }).then((fn) => {
+    if (cancelled) fn();
+    else unlistenWidgetConfig = fn;
+  }).catch((e) => console.warn("订阅悬浮窗配置失败：", e));
   listen("bark://widget-closed", () => {
     if (config.value) config.value.widget.enabled = false;
   })
@@ -76,6 +85,8 @@ onUnmounted(() => {
   cancelled = true;
   unlistenWidgetClosed?.();
   unlistenWidgetClosed = null;
+  unlistenWidgetConfig?.();
+  unlistenWidgetConfig = null;
 });
 </script>
 

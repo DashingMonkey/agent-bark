@@ -26,9 +26,9 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 pub const WIDGET_LABEL: &str = "widget";
 
 /// 卡片宽度（逻辑像素，前端渲染同宽，两边必须一致）
-pub const CARD_W: f64 = 240.0;
+pub const CARD_W: f64 = 280.0;
 /// 空闲态（无进行中会话）高度（逻辑像素，首帧兜底；内容变化后由前端 set_size 跟随）
-pub const IDLE_H: f64 = 38.0;
+pub const IDLE_H: f64 = 44.0;
 
 /// 建窗时注入的初始参数（见模块注释的「位置记忆口径」）
 #[derive(Serialize)]

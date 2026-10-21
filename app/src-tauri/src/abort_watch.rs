@@ -26,25 +26,35 @@
 //! hook 心跳静默是常态（实测 `Agent` 工具单次可跑 27 分钟），没有这层正向信号，
 //! 「心跳静止超时判死」会把还在跑的回合误判成意外终止（红光 + 失败音）。
 //!
+//! 第三职责是**子代理显示**（2026-10-21 实测：新代 ZCode 子代理**不触发任何
+//! hook**，hook 通道对子代理全盲）：从子代理日志行（turn.started /
+//! tool.call.started / turn.completed，都带 `parentSessionId` 血缘）合成
+//! Activity / RunCompleted 事件塞进管道——建档、挂树（前端 ↳ + 「子代理」标记）、
+//! 向父会话传播存活，全部复用既有机制（与 DSH 插件带血缘的事件同一套状态机）。
+//! 合成事件带 `is_subagent`：通知、音效、流光特效三道门都拦得住，纯显示不扰人。
+//!
 //! 四道保险，避免误报与刷屏：
-//! 1. **只对「我们自己认为还在跑」的会话生效**：正常回合的 `Stop` 已经把会话清掉了，
-//!    所以日志里那些记录不会再触发一次通知；启动时读不到历史（会话表是空的）。
+//! 1. **终态只对「我们自己认为还在跑」的会话生效**：正常回合的 `Stop` 已经把
+//!    会话清掉了，所以日志里那些记录不会再触发一次通知；启动时读不到历史
+//!    （会话表是空的）。子代理活动合成不受此门约束——子代理没有 hook 通道，
+//!    这条日志通道就是它们的「第一条心跳」，门住它就永远建档不了。
 //! 2. **按信号去重 30 秒**：中断的三条痕迹相隔毫秒级，按会话去重合并成一次；
 //!    失败按会话+回合去重（不同回合的连续失败不得互相吞），回合 id 缺失时
-//!    干脆不去重——无标识时宁可重复也不静默吞信号。
-//! 3. **子代理的失败信号直接不合成**：通知与音效有 is_subagent 门，流光特效通道
-//!    没有（子代理心跳要驱动边缘色）——父任务在跑时每个失败的子代理都会补放一次
-//!    全屏红雾散，正是「一个任务拆成十几条」在特效通道的复现。其残留条目交给
-//!    心跳判死巡检兜底（一轮判死合并成一次、不逐个闪）。中断不受影响：
-//!    `RunAborted` 本就不通知、不亮失败色。
-//! 4. **合成事件带 is_subagent**（中断路径）：与 normalize 同一份判定，
-//!    防御式对齐——`RunAborted` 虽不通知，标记不齐会让上游过滤各走各的口径。
+//!    干脆不去重——无标识时宁可重复也不静默吞信号。子代理活动不另设去重：
+//!    tail 是增量读取，同一行日志不会被读两次。
+//! 3. **子代理终态照常合成**（RunFailed / RunAborted / RunCompleted）：
+//!    通知与音效有 is_subagent 门，流光特效的同款门也已补齐（`burst_for_event`
+//!    与 `edge_kind`，见 glow 模块）——早年「子代理失败不合成」的拒绝是因为
+//!    特效通道还没有门，如今合成只是为了把子代理的会话条目收掉（否则失败的
+//!    子代理行要挂满 10 分钟等判死巡检清场）。
+//! 4. **合成事件带 is_subagent**：与 normalize 同一份判定，防御式对齐——
+//!    标记不齐会让上游过滤各走各的口径。
 //!
 //! 代价与边界：这是**非官方**做法，依赖 ZCode 的日志格式（应用升级可能失效）；
 //! 失效时的表现是「退回到判死超时」，不会误报。接入开关关闭时整个看门狗不工作。
 
 use crate::state::{lock, read, AppState};
-use bark_adapters::zcode::{AbortLogTail, LogSignal};
+use bark_adapters::zcode::{AbortLogTail, LogSignal, SubagentEvent};
 use bark_core::{EventKind, NormalizedEvent};
 use serde_json::json;
 use std::collections::HashMap;
@@ -80,14 +90,53 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
             for sid in &scan.alive_sessions {
                 crate::state::touch_session(&state, "zcode", sid);
             }
-            for sig in scan.signals {
-                // 子代理的致命失败不合成（见模块 doc 第 3 条）；
-                // 中断照常合成：RunAborted 静默，只做会话清场
-                if matches!(&sig, LogSignal::Failed { .. }) && sig.is_subagent() {
-                    continue;
+            // 子代理显示（第三职责）：合成子代理生命周期事件塞进管道。放在终态
+            // 信号之前——同一批里「turn.started 后紧跟 turn.failed」时，先建档
+            // 才能让失败信号过下面的会话门、把刚建的条目收掉。
+            for act in &scan.subagent_events {
+                let (kind, tool_name) = match act {
+                    SubagentEvent::TurnStarted { .. } => (EventKind::Activity, None),
+                    SubagentEvent::ToolCall { tool_name, .. } => {
+                        (EventKind::Activity, Some(tool_name.as_str()))
+                    }
+                    SubagentEvent::TurnCompleted { .. } => (EventKind::RunCompleted, None),
+                };
+                // cwd 取父会话表里的值：子代理与父同工作区、项目名一致；表里没有
+                // （daemon 晚启动、父会话还没建档）就空着——挂树靠 parent id，不靠 cwd
+                let parent_key = crate::state::session_key("zcode", act.parent_session_id());
+                let cwd = lock(&state.active_sessions)
+                    .get(&parent_key)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_default();
+                let mut raw = json!({
+                    "session_id": act.session_id(),
+                    "cwd": cwd,
+                });
+                if let Some(t) = tool_name {
+                    raw["tool_name"] = json!(t);
                 }
+                let mut ev = NormalizedEvent::from_raw("zcode", kind, &raw);
+                ev.is_subagent = true;
+                ev.parent_session_id = Some(act.parent_session_id().to_string());
+                tracing::debug!(
+                    session = %ev.session_id,
+                    kind = ?ev.kind,
+                    "ZCode 看门狗：由本地日志合成子代理活动"
+                );
+                // 投递带超时（与终态信号同口径）：管道满时丢弃本条并留痕——
+                // 子代理显示是 best-effort，下一条活动行会补上状态
+                match tokio::time::timeout(Duration::from_secs(1), tx.send(ev)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return, // 管道已关闭（应用退出）
+                    Err(_) => {
+                        tracing::warn!("ZCode 子代理活动投递超时（管道背压），丢弃本条");
+                    }
+                }
+            }
+            for sig in scan.signals {
                 // 只处理「我们正在跟」的会话：既挡掉启动前的历史记录，
-                // 也挡掉正常回合（Stop 已清表）之后的残留日志。
+                // 也挡掉正常回合（Stop 已清表）之后的残留日志。子代理会话的
+                // 条目由上面的活动合成通道建档，同样受这扇门保护。
                 // **会话检查先于去重登记**（§2.18）：被跳过的信号不该占掉 30s 去重槽，
                 // 否则「先到一条我们没在跟的会话的日志、30s 内该会话才建立」时，
                 // 真信号会被自己人吞掉

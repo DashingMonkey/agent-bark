@@ -2405,6 +2405,61 @@ mod tests {
         );
     }
 
+    /// ZCode 子代理生命周期（日志看门狗合成的事件形态，2026-10-21）：子代理不触发
+    /// 任何 hook，看门狗把日志行折成带 `parent_session_id` + `is_subagent` 的
+    /// Activity / RunCompleted——这条测试用**与 abort_watch 完全相同的构造**钉住
+    /// 「建档挂树 → 工具相位 → 摘表」整条链路，前端据此渲染 `↳` + 「子代理」标记。
+    #[test]
+    fn zcode_log_synthesized_subagent_lifecycle_creates_and_clears_row() {
+        let (mut sessions, mut finished) = table();
+        let parent_id = "session_4b98fe9a84ec4cf98872b8ec9fb1fdb2";
+        let sub_id = "sess_subagent_agent_55166edb-f294-4605-9f31-bad5885b3754";
+
+        // 父会话在跑（主会话自己的 hook 通道：PreToolUse Agent）
+        let mut p = ev(EventKind::Activity, 1000, Some("Agent"), "");
+        p.agent = "zcode".into();
+        p.session_id = parent_id.into();
+        apply_session_event(&mut sessions, &mut finished, &p);
+
+        // 看门狗合成 turn.started → Activity（无工具名，思考中），带血缘建档
+        let mut start = ev(EventKind::Activity, 1100, None, "");
+        start.agent = "zcode".into();
+        start.session_id = sub_id.into();
+        start.is_subagent = true;
+        start.parent_session_id = Some(parent_id.into());
+        apply_session_event(&mut sessions, &mut finished, &start);
+        let key = session_key("zcode", sub_id);
+        let s = &sessions[&key];
+        assert_eq!(s.phase, SessionPhase::Thinking, "turn.started 建档为思考中");
+        assert_eq!(s.parent.as_deref(), Some(parent_id), "建档即带血缘（前端挂树判据）");
+        assert_eq!(s.parent_key.as_deref(), Some(format!("zcode|{parent_id}").as_str()));
+
+        // 看门狗合成 tool.call.started → Activity（带工具名，执行工具）
+        let mut tool = ev(EventKind::Activity, 1200, Some("Read"), "");
+        tool.agent = "zcode".into();
+        tool.session_id = sub_id.into();
+        tool.is_subagent = true;
+        tool.parent_session_id = Some(parent_id.into());
+        apply_session_event(&mut sessions, &mut finished, &tool);
+        assert_eq!(sessions[&key].phase, SessionPhase::ToolRunning, "工具行折成执行工具");
+        assert_eq!(sessions[&key].last_tool.as_deref(), Some("Read"));
+
+        // 父会话仍在（子代理活动经 parent_session_id 向祖先传播存活，不在本表断言——
+        // 由 touch_ancestors 的专项测试覆盖）
+        assert!(sessions.contains_key(&session_key("zcode", parent_id)));
+
+        // 看门狗合成 turn.completed → RunCompleted 摘表；父会话不受影响
+        let mut done = ev(EventKind::RunCompleted, 1300, None, "");
+        done.agent = "zcode".into();
+        done.session_id = sub_id.into();
+        done.is_subagent = true;
+        done.parent_session_id = Some(parent_id.into());
+        let d = apply_session_event(&mut sessions, &mut finished, &done);
+        assert!(d.changed, "摘表是状态变化");
+        assert!(!sessions.contains_key(&key), "turn.completed 后子代理行收掉");
+        assert!(sessions.contains_key(&session_key("zcode", parent_id)), "父会话照常在跑");
+    }
+
     /// 自指血缘（`parent_session_id == session_id`）在建档路径也要挡掉。
     ///
     /// 不挡的后果不是「少一层缩进」而是整条会话从界面上消失：前端 `sessionRows` 把它判成
