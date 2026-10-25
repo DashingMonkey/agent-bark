@@ -30,11 +30,18 @@ pub enum SessionPhase {
     WaitingPermission,
     /// 打断：等待用户输入
     WaitingInput,
+    /// 主回合已结束，后代仍未收尾；不需要用户操作。
+    WaitingChildren,
+    /// 等待结果交接/主代理续跑，不把旧回合完成当作任务完成。
+    Settling,
 }
 
 /// 一条 agent 会话的实时运行状态
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
+    #[serde(skip)]
+    pub lifecycle: crate::task_lifecycle::RunState,
+    pub active_descendants: usize,
     pub agent: String,
     pub session_id: String,
     pub project: Option<String>,
@@ -458,7 +465,8 @@ pub(crate) fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 
 /// 事件管道主循环
 pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandle, state: Arc<AppState>) {
-    while let Some(event) = rx.recv().await {
+    while let Some(mut event) = rx.recv().await {
+        event.completion_deferred = false;
         // 0. 事件去重：同一条事件可能既被实时投递又被启动补投（hook 超时后落盘）。
         //    重复处理会让历史和通知都出现两条。
         if state.mark_seen(&event) {
@@ -506,9 +514,23 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         // 0.5 会话实时状态：所有事件（含心跳）都参与推导，变化即推送前端快照。
         //     陈旧补投（时间戳老过判死阈值）不进状态表——它声称的任何状态都已过时。
         let stale = is_stale_replay(&event);
-        let (running_lost, suppressed_echo, phase_changed) = {
+        let (running_lost, suppressed_echo, phase_changed, deferred) = {
             let mut sessions = lock(&state.active_sessions);
             let mut finished = lock(&state.recent_finished);
+            if event.cwd.is_empty() {
+                let source_key = event.parent_session_id.as_ref()
+                    .map(|parent| session_key(&event.agent, parent))
+                    .unwrap_or_else(|| session_key(&event.agent, &event.session_id));
+                if let Some(source) = sessions.get(&source_key) {
+                    event.cwd = source.cwd.clone();
+                    event.project = source.project.clone();
+                }
+            }
+            if event.kind == EventKind::RunCompleted && event.message.is_empty() {
+                if let Some(s) = sessions.get(&session_key(&event.agent, &event.session_id)) {
+                    event.message = s.lifecycle.candidate_message.clone();
+                }
+            }
             let delta = apply_session_event_inner(&mut sessions, &mut finished, &event, stale);
             // 子代理事件声明了血缘（parent_session_id）→ 存活心跳向祖先递归传播：
             // 子代理干活期间父会话没有任何自己的事件（实测 DSH `Agent` 工具单次可跑
@@ -532,15 +554,24 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                     let _ = app.emit("bark://sessions", &snapshot);
                 }
             }
-            (delta.running_lost, delta.suppressed_echo, delta.phase_changed)
+            (delta.running_lost, delta.suppressed_echo, delta.phase_changed, delta.deferred)
         };
+        event.completion_deferred = deferred || (suppressed_echo && event.kind == EventKind::RunCompleted);
+        if deferred {
+            crate::glow::sync_task_state(&app, &state);
+        }
+        // 新运行/暂扣会取消尚在聚合窗口内的旧完成提醒。
+        if deferred || (!suppressed_echo && matches!(event.kind, EventKind::Activity | EventKind::RunFailed | EventKind::RunAborted)) {
+            let key = format!("{}|run_completed|{}", event.agent, event.session_id);
+            state.pending.lock().await.remove(&key);
+        }
         // 0.6 屏幕边缘流光：会话表已更新完，据此推导颜色。
         //     放在锁外——内部可能要建窗口（会派发到主线程）。
         //     终态回声（如上文 Stop 之后紧跟的 SessionEnd）不改状态表，也不该改流光，
         //     否则正常回合的完成色会被压成失败色；但心跳判死仍需照常显失败色。
         //     陈旧补投（stale）不驱动 glow/音效（§1.6）：它声称的状态早已过时，
         //     照常驱动会「开局红光 + 失败音」；历史与通知保留（离线兜底的本意）。
-        if should_drive_glow(stale, suppressed_echo, running_lost) {
+        if !deferred && should_drive_glow(stale, suppressed_echo, running_lost) {
             crate::glow::update_from_event(&app, &state, &event, running_lost);
             // 状态音效与流光同一套四状态语义（思考/等待/完成/失败），默认全部未选
             // = 静音。子代理事件不响（与通知的子代理过滤同口径，否则一个任务拆出
@@ -565,7 +596,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
 
         // 2. 回合刚结束的空闲回声不通知：「任务完成」的通知已经覆盖了它，
         //    再来一条「等待输入」纯属噪音（事件本身仍入历史与前端事件流）
-        if suppressed_echo {
+        if suppressed_echo || deferred {
             continue;
         }
 
@@ -637,6 +668,8 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                 }
             }
         }
+        let completion_session = (event.kind == EventKind::RunCompleted)
+            .then(|| session_key(&event.agent, &event.session_id));
         let state2 = state.clone();
         tokio::spawn(async move {
             // 窗口夹取：load() 已夹过一次，这里再兜一道（防手改配置绕过）
@@ -649,6 +682,9 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                 claim_pending(&mut pending, &key, seq)
             };
             if let Some(mut p) = p {
+                if completion_session.as_ref().is_some_and(|key| lock(&state2.active_sessions).contains_key(key)) {
+                    return; // 聚合窗口内恢复运行，旧完成不再可派发。
+                }
                 if p.merged > 0 {
                     p.notification.body = append_merged_note(p.notification.body, p.merged);
                 }
@@ -1125,6 +1161,7 @@ struct SessionDelta {
     /// 快照必须**立即**推送（相位跃迁 / 建档 / 摘档）：只有纯 last_activity、
     /// 计数刷新才允许被 should_push_snapshot 节流（§4.4）
     urgent: bool,
+    deferred: bool,
 }
 
 /// 状态表快照（剔除僵死条目，按回合开始时间倒序，展示稳定）
@@ -1244,8 +1281,11 @@ fn apply_session_event_inner(
         suppressed_echo: false,
         phase_changed: false,
         urgent: false,
+        deferred: false,
     };
     if stale {
+        // 可靠回合边界的离线补投只留诊断；不能把旧候选完成当作当前任务成功。
+        delta.suppressed_echo = ev.run.is_some();
         return delta;
     }
     // 日志轮询与 hook 投递并行：排队期间可能已经开始下一回合。
@@ -1265,6 +1305,33 @@ fn apply_session_event_inner(
     // 跃迁判定的基准：本事件处理前的相位（prune 之后、match 之前）。
     // 摘档后取不到 → None，与建档后的 Some(...) 天然不等。
     let prev_phase = sessions.get(&key).map(|s| s.phase.clone());
+    // 可靠 Started 不得复活一个已处理过终态的旧回合（日志/hook 乱序）。
+    if ev.run.as_ref().is_some_and(|r| r.boundary == bark_core::RunBoundary::Started)
+        && finished.get(&key).is_some_and(|at| ev.timestamp <= *at)
+    {
+        delta.suppressed_echo = true;
+        return delta;
+    }
+    if ev.kind == EventKind::RunCompleted && ev.run.is_some()
+        && !sessions.contains_key(&key) && !finished.contains_key(&key)
+        && (ev.run.as_ref().is_some_and(|r| r.children_active == Some(true))
+            || crate::task_lifecycle::descendant_count(sessions, &key) > 0)
+    {
+        sessions.insert(key.clone(), new_session(ev, SessionPhase::WaitingChildren));
+    }
+    match crate::task_lifecycle::prepare(sessions, ev) {
+        crate::task_lifecycle::Decision::Ignore => {
+            delta.suppressed_echo = true;
+            return delta;
+        }
+        crate::task_lifecycle::Decision::Defer => {
+            delta.deferred = true;
+            delta.changed = true;
+            delta.urgent = true;
+            return delta;
+        }
+        crate::task_lifecycle::Decision::Apply => {}
+    }
     match ev.kind {
         EventKind::RunCompleted | EventKind::RunFailed | EventKind::RunAborted => {
             // 回合结束 → 会话回到空闲，不再出现在「运行中」列表。
@@ -1462,6 +1529,18 @@ fn apply_session_event_inner(
         EventKind::SessionStart => {}
     }
 
+    if let Some(session) = sessions.get_mut(&key) {
+        if let Some(run) = &ev.run {
+            if session.lifecycle.turn_id.is_none() {
+                session.lifecycle.turn_id = Some(run.turn_id.clone());
+                session.lifecycle.started_at = ev.timestamp;
+            }
+        }
+    }
+    if crate::task_lifecycle::refresh(sessions) {
+        delta.changed = true;
+        delta.urgent = true;
+    }
     // 相位跃迁 = 建档 / 摘档 / 相位字段变化。同相位重复心跳（监控型 adapter 的
     // 保活）只刷 last_activity，不算跃迁——要在上限清理之前比对，那一步
     // 淘汰的是别的条目，与本事件的跃迁无关。
@@ -1514,6 +1593,8 @@ fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
     let parent = valid_parent_id(ev);
     // 新建条目时 tool_name 存在 → 首个心跳就是 PreToolUse：tool_calls 记 1
     SessionStatus {
+        lifecycle: Default::default(),
+        active_descendants: 0,
         agent: ev.agent.clone(),
         session_id: ev.session_id.clone(),
         project: ev.project.clone(),
@@ -1570,7 +1651,7 @@ async fn dispatch(state: &Arc<AppState>, n: &Notification) {
     let channels = {
         let cfg = read(&state.config);
         let quiet = in_quiet_hours(&cfg.rules.quiet_hours);
-        if !dispatch_gate(state.is_muted(), quiet) {
+        if cfg.agent_disabled(&n.agent) || !dispatch_gate(state.is_muted(), quiet) {
             tracing::info!("muted / quiet hours at dispatch, skip");
             return;
         }
@@ -1729,6 +1810,8 @@ mod tests {
 
     fn ev(kind: EventKind, ts: i64, tool: Option<&str>, msg: &str) -> NormalizedEvent {
         NormalizedEvent {
+            run: None,
+            completion_deferred: false,
             id: format!("id-{ts}"),
             agent: "trae-code".into(),
             kind,
@@ -2736,6 +2819,8 @@ mod tests {
         // 把「死的那条」提前清掉，测不出巡检本身的行为。
         let now = 1_000_000i64;
         let mk = |sid: &str, last: i64| SessionStatus {
+            lifecycle: Default::default(),
+            active_descendants: 0,
             agent: "zcode".into(),
             session_id: sid.into(),
             project: Some("p".into()),
@@ -3005,4 +3090,224 @@ mod tests {
         e.session_id = "s1".into();
         assert!(!skips_state_machine(&e), "真实会话照常进状态机");
     }
+
+    fn boundary(sid: &str, parent: Option<&str>, turn: &str, kind: EventKind, boundary: bark_core::RunBoundary, at: i64) -> NormalizedEvent {
+        let mut e = ev(kind, at, None, "");
+        e.agent = "zcode".into();
+        e.session_id = sid.into();
+        e.parent_session_id = parent.map(str::to_owned);
+        e.is_subagent = parent.is_some();
+        e.run = Some(bark_core::RunContext { turn_id: turn.into(), boundary, children_active: None });
+        e
+    }
+
+    #[test]
+    fn task_completion_waits_through_child_handoff_and_parent_summary() {
+        use bark_core::RunBoundary::{Started, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        let apply = |s: &mut HashMap<_, _>, f: &mut HashMap<_, _>, e| apply_session_event(s, f, &e);
+        apply(&mut sessions, &mut finished, boundary("p", None, "1", EventKind::Activity, Started, 100));
+        apply(&mut sessions, &mut finished, boundary("c", Some("p"), "1", EventKind::Activity, Started, 200));
+        let d = apply(&mut sessions, &mut finished, boundary("p", None, "1", EventKind::RunCompleted, Finished, 300));
+        assert!(d.deferred);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::WaitingChildren);
+        assert_eq!(sessions["zcode|p"].active_descendants, 1);
+        assert!(!finished.contains_key("zcode|p"));
+        apply(&mut sessions, &mut finished, boundary("c", Some("p"), "1", EventKind::RunCompleted, Finished, 400));
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Settling);
+        assert_eq!(sessions["zcode|p"].active_descendants, 0);
+        let duplicate = apply(&mut sessions, &mut finished, boundary("p", None, "1", EventKind::RunCompleted, Finished, 450));
+        assert!(duplicate.deferred, "最后一个子代理结束不能释放旧完成");
+        apply(&mut sessions, &mut finished, boundary("p", None, "2", EventKind::Activity, Started, 500));
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Thinking);
+        let late = apply(&mut sessions, &mut finished, boundary("p", None, "1", EventKind::RunCompleted, Finished, 300));
+        assert!(late.suppressed_echo);
+        let done = apply(&mut sessions, &mut finished, boundary("p", None, "2", EventKind::RunCompleted, Finished, 600));
+        assert!(!done.deferred && !done.suppressed_echo);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn stop_candidate_needs_authoritative_end_and_preserves_reply() {
+        use bark_core::RunBoundary::{Started, Finished, Candidate};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::Activity, Started, 100));
+        let mut candidate = boundary("p", None, "1", EventKind::RunCompleted, Candidate, 200);
+        candidate.message = "final answer".into();
+        assert!(apply_session_event(&mut sessions, &mut finished, &candidate).deferred);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Settling);
+        assert_eq!(sessions["zcode|p"].lifecycle.candidate_message, "final answer");
+        assert!(!apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::RunCompleted, Finished, 300)).deferred);
+        assert!(sessions.is_empty());
+        assert!(apply_session_event(&mut sessions, &mut finished, &candidate).suppressed_echo);
+    }
+
+    #[test]
+    fn nested_descendants_hold_each_parent_until_its_own_summary() {
+        use bark_core::RunBoundary::{Started, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        for (sid, parent) in [("p", None), ("c", Some("p")), ("g", Some("c"))] {
+            apply_session_event(&mut sessions, &mut finished, &boundary(sid, parent, "1", EventKind::Activity, Started, 100));
+        }
+        for sid in ["p", "c"] {
+            assert!(apply_session_event(&mut sessions, &mut finished, &boundary(sid, None, "1", EventKind::RunCompleted, Finished, 200)).deferred);
+        }
+        apply_session_event(&mut sessions, &mut finished, &boundary("g", Some("c"), "1", EventKind::RunCompleted, Finished, 300));
+        assert_eq!(sessions["zcode|c"].phase, SessionPhase::Settling);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::WaitingChildren);
+        apply_session_event(&mut sessions, &mut finished, &boundary("c", Some("p"), "2", EventKind::Activity, Started, 400));
+        apply_session_event(&mut sessions, &mut finished, &boundary("c", Some("p"), "2", EventKind::RunCompleted, Finished, 500));
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Settling);
+    }
+
+    #[test]
+    fn abort_or_failure_cancels_held_completion_without_child_resurrection() {
+        use bark_core::RunBoundary::{Started, Finished};
+        for terminal in [EventKind::RunAborted, EventKind::RunFailed] {
+            let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+            for (sid, parent) in [("p", None), ("c", Some("p"))] {
+                apply_session_event(&mut sessions, &mut finished, &boundary(sid, parent, "1", EventKind::Activity, Started, 100));
+            }
+            apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::RunCompleted, Finished, 200));
+            let d = apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", terminal, Finished, 300));
+            assert!(!d.deferred);
+            assert!(!sessions.contains_key("zcode|p"));
+            apply_session_event(&mut sessions, &mut finished, &boundary("c", Some("p"), "1", EventKind::RunCompleted, Finished, 400));
+            assert!(sessions.is_empty());
+        }
+    }
+
+    #[test]
+    fn held_parent_ignores_tool_echo_but_keeps_heartbeat_and_user_attention() {
+        use bark_core::RunBoundary::{Started, Finished, Progress};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        for (sid, parent) in [("p", None), ("c", Some("p"))] {
+            apply_session_event(&mut sessions, &mut finished, &boundary(sid, parent, "1", EventKind::Activity, Started, 100));
+        }
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::RunCompleted, Finished, 200));
+        let mut echo = boundary("p", None, "1", EventKind::ToolFinished, Progress, 300);
+        assert!(apply_session_event(&mut sessions, &mut finished, &echo).suppressed_echo);
+        echo.keepalive = true;
+        apply_session_event(&mut sessions, &mut finished, &echo);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::WaitingChildren);
+        echo.kind = EventKind::PermissionRequired;
+        echo.keepalive = false;
+        apply_session_event(&mut sessions, &mut finished, &echo);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::WaitingPermission);
+    }
+
+    #[test]
+    fn legacy_adapter_completion_is_unchanged() {
+        use bark_core::RunBoundary::Started;
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        let mut parent = boundary("p", None, "1", EventKind::Activity, Started, 100);
+        parent.run = None;
+        apply_session_event(&mut sessions, &mut finished, &parent);
+        let mut child = boundary("c", Some("p"), "1", EventKind::Activity, Started, 100);
+        child.run = None;
+        apply_session_event(&mut sessions, &mut finished, &child);
+        parent.kind = EventKind::RunCompleted;
+        parent.timestamp = 200;
+        assert!(!apply_session_event(&mut sessions, &mut finished, &parent).deferred);
+        assert!(!sessions.contains_key("zcode|p"));
+    }
+
+
+    #[test]
+    fn provisional_stop_can_continue_in_the_same_turn() {
+        use bark_core::RunBoundary::{Started, Candidate, Progress, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::Activity, Started, 100));
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::RunCompleted, Candidate, 200));
+        let mut tool = boundary("p", None, "1", EventKind::Activity, Progress, 300);
+        tool.tool_name = Some("Bash".into());
+        assert!(!apply_session_event(&mut sessions, &mut finished, &tool).suppressed_echo);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::ToolRunning);
+        assert!(!apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::RunCompleted, Finished, 400)).deferred);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn producer_child_fact_holds_completion_when_start_delivery_was_missed() {
+        use bark_core::RunBoundary::Finished;
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        let mut end = boundary("p", None, "1", EventKind::RunCompleted, Finished, 100);
+        end.run.as_mut().unwrap().children_active = Some(true);
+        assert!(apply_session_event(&mut sessions, &mut finished, &end).deferred);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::WaitingChildren);
+        let stale = apply_session_event_inner(&mut sessions, &mut finished, &end, true);
+        assert!(stale.suppressed_echo, "旧离线边界不再发送完成提醒");
+    }
+
+    #[test]
+    fn producer_finished_children_override_delayed_child_terminal_delivery() {
+        use bark_core::RunBoundary::{Started, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        for (sid, parent) in [("p", None), ("c", Some("p"))] {
+            apply_session_event(&mut sessions, &mut finished, &boundary(sid, parent, "1", EventKind::Activity, Started, 100));
+        }
+        let mut end = boundary("p", None, "1", EventKind::RunCompleted, Finished, 300);
+        end.run.as_mut().unwrap().children_active = Some(false);
+        let delta = apply_session_event(&mut sessions, &mut finished, &end);
+        assert!(!delta.deferred && !delta.suppressed_echo);
+        assert!(!sessions.contains_key("zcode|p"));
+        assert!(sessions.contains_key("zcode|c"), "子终态还在传输，不伪造子代理结束事件");
+        apply_session_event(&mut sessions, &mut finished, &boundary("c", Some("p"), "1", EventKind::RunCompleted, Finished, 200));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn producer_finished_children_do_not_release_a_previously_held_turn() {
+        use bark_core::RunBoundary::{Started, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "1", EventKind::Activity, Started, 100));
+        let mut end = boundary("p", None, "1", EventKind::RunCompleted, Finished, 200);
+        end.run.as_mut().unwrap().children_active = Some(true);
+        assert!(apply_session_event(&mut sessions, &mut finished, &end).deferred);
+        end.timestamp = 300;
+        end.run.as_mut().unwrap().children_active = Some(false);
+        assert!(apply_session_event(&mut sessions, &mut finished, &end).deferred);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Settling);
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "2", EventKind::Activity, Started, 400));
+        let delta = apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "2", EventKind::RunCompleted, Finished, 500));
+        assert!(!delta.deferred && !delta.suppressed_echo);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn old_abort_without_turn_id_cannot_remove_a_newer_run() {
+        use bark_core::RunBoundary::{Started, Finished};
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        apply_session_event(&mut sessions, &mut finished, &boundary("p", None, "2", EventKind::Activity, Started, 300));
+        let mut old = boundary("p", None, "1", EventKind::RunAborted, Finished, 200);
+        old.run = None;
+        assert!(apply_session_event(&mut sessions, &mut finished, &old).suppressed_echo);
+        assert_eq!(sessions["zcode|p"].phase, SessionPhase::Thinking);
+        assert_eq!(sessions["zcode|p"].lifecycle.turn_id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn zcode_log_sequence_replays_through_the_common_state_machine() {
+        let parent = "session_4b98fe9a84ec4cf98872b8ec9fb1fdb2";
+        let child = "sess_subagent_agent_55166edb";
+        let (mut sessions, mut finished) = (HashMap::new(), HashMap::new());
+        let steps = [(parent,"turn.started","p1"), (child,"turn.started","c1"),
+            (parent,"turn.completed","p1"), (child,"turn.completed","c1"),
+            (parent,"turn.started","p2"), (parent,"turn.completed","p2")];
+        let mut completions = 0;
+        for (index, (sid, name, turn)) in steps.into_iter().enumerate() {
+            let row = serde_json::json!({"event":name,"sessionId":sid,"turnId":turn,
+                "timestamp":format!("2026-10-22T00:00:0{index}Z"),
+                "context": if sid == child { serde_json::json!({"parentSessionId":parent}) } else { serde_json::json!({}) }});
+            let event = bark_adapters::zcode::parse_lifecycle_event(&row.to_string()).unwrap();
+            let delta = apply_session_event(&mut sessions, &mut finished, &event);
+            if event.kind == EventKind::RunCompleted && !event.is_subagent && !delta.deferred && !delta.suppressed_echo {
+                completions += 1;
+            }
+            if index == 3 { assert_eq!(sessions[&session_key("zcode", parent)].phase, SessionPhase::Settling); }
+        }
+        assert_eq!(completions, 1);
+        assert!(sessions.is_empty());
+    }
+
 }

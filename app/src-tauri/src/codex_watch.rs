@@ -428,6 +428,8 @@ mod tests {
             project: None,
             cwd: "C:/work".into(),
             phase: crate::state::SessionPhase::Thinking,
+            lifecycle: Default::default(),
+            active_descendants: 0,
             prompt: None,
             last_tool: None,
             turn_count: 1,

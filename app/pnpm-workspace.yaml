@@ -2,3 +2,6 @@ allowBuilds:
   esbuild: true
 onlyBuiltDependencies:
   - esbuild
+overrides:
+  # RUSTSEC/GHSA-68fv-2mgg-jv7q: source-map-js < 1.2.2 事件循环 DoS
+  source-map-js: ^1.2.2

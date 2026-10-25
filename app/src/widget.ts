@@ -70,7 +70,7 @@ const HIDE_DELAY_MS = 5000;
 /** 淡入 / 淡出时长（CSS 过渡同值，见 widget.html） */
 const FADE_MS = 160;
 
-type StateColor = "thinking" | "waiting" | "completed" | "failed" | "aborted";
+type StateColor = "thinking" | "waiting" | "completed" | "failed" | "aborted" | "paused";
 
 let pinned = init.pinned;
 let dragging = false;
@@ -237,6 +237,7 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
     run_failed: ["failed", EVENT_LABELS.run_failed],
     run_aborted: ["aborted", ABORT_LABEL],
   };
+  if (ev.completion_deferred) return;
   const hit = map[ev.type];
   if (!hit) return;
   if (ev.type === "run_aborted") {
@@ -369,7 +370,8 @@ function currentRows(): Row[] {
   const abortedKeys = new Set<string>(abortedRows.keys());
   const rows: Row[] = list.map(({ session: s, depth, parentMissing, placeholder }: SessionRow) => {
     const state: StateColor =
-      s.phase === "waiting_permission" || s.phase === "waiting_input" ? "waiting" : "thinking";
+      s.phase === "waiting_permission" || s.phase === "waiting_input" ? "waiting"
+        : s.phase === "waiting_children" || s.phase === "settling" ? "paused" : "thinking";
     const sub = isSubagentSession(s);
     // 手动终止：把**已有的这一行**就地改成「手动终止」（见 abortedRows）。它是终态，
     // 所以不再算「等待中」的等待色；子代理行照旧不置 attention
@@ -402,7 +404,7 @@ function currentRows(): Row[] {
       // 子代理详情同样保留完整工作区，方便确认归属。
       tip,
       // 未知 phase 兜底显示原值：undefined 漏进 escapeHtml 会抛 TypeError、悬浮窗冻结在旧帧
-      label: placeholder ? "已结束" : aborted ? ABORT_LABEL : (PHASE_LABELS[s.phase] ?? String(s.phase)),
+      label: placeholder ? "已结束" : aborted ? ABORT_LABEL : (PHASE_LABELS[s.phase] ?? String(s.phase)) + (s.phase === "waiting_children" && s.active_descendants ? ` · ${s.active_descendants}` : ""),
       state: aborted ? "aborted" : state,
       // 等待（等待确认 / 等待输入）要人管 = 有事；思考类（思考中 / 执行工具）不用。
       // 子代理行恒不置位：它做的事是父回合的一部分，弹卡片这件事留给父会话

@@ -283,7 +283,7 @@ async function clear() {
           :class="{ 'is-sub': e.is_subagent }"
         >
           <div class="row">
-            <span :class="eventBadgeClass(e.type)">{{ EVENT_LABELS[e.type] }}</span>
+            <span :class="e.completion_deferred ? 'badge' : eventBadgeClass(e.type)">{{ e.completion_deferred ? "回合结束（暂不报完成）" : EVENT_LABELS[e.type] }}</span>
             <span class="agent-icon" v-html="agentIcon(e.agent)"></span>
             <span class="agent-name">{{ agentName(e.agent) }}</span>
             <span v-if="e.project" class="hint">{{ e.project }}</span>

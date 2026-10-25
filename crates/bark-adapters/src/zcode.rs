@@ -736,6 +736,22 @@ impl HookAdapter for ZcodeAdapter {
         let mut event = NormalizedEvent::from_raw(self.kind().id(), kind, raw);
         // 见 is_subagent：ZCode 的 agent_type 会误伤主会话，必须覆盖通用启发式
         event.is_subagent = is_subagent(raw);
+        if let Some(id) = raw.get("turn_id").or_else(|| raw.get("turnId")).and_then(Value::as_str) {
+            event.run = Some(bark_core::RunContext {
+                turn_id: id.to_string(),
+                children_active: None,
+                boundary: if kind == EventKind::RunCompleted {
+                    bark_core::RunBoundary::Candidate
+                } else {
+                    bark_core::RunBoundary::Progress
+                },
+            });
+        } else if kind == EventKind::RunCompleted {
+            // 没有回合号的 Stop 也只能当候选；日志确认前不能报任务完成。
+            event.run = Some(bark_core::RunContext {
+                turn_id: String::new(), children_active: None, boundary: bark_core::RunBoundary::Candidate,
+            });
+        }
         if event.message.is_empty() {
             // Stop 的助手回复正文：官方文档写 last_assistant_message（from_raw 已取），
             // 第三方逆向说是 responseText / responsePreview —— 两者都试，不赌哪份准
@@ -973,6 +989,47 @@ fn subagent_event_from(v: &Value, session_id: &str, parent: Option<&str>) -> Opt
 }
 
 /// 从一行 ZCode 日志里解析回合终态信号（无关记录返回 None）。
+/// 主代理自动续跑跳过 UserPromptSubmit hook，必须读取真实回合边界。
+/// Stop hook 可以继续同一回合，所以完成只以 turn.completed 为准。
+pub fn parse_lifecycle_event(line: &str) -> Option<NormalizedEvent> {
+    use bark_core::{RunBoundary, RunContext};
+    let raw: Value = serde_json::from_str(line.trim().trim_start_matches('\u{feff}')).ok()?;
+    let session = raw.get("sessionId")?.as_str()?;
+    if !is_session_id(session) { return None; }
+    let name = raw.get("event").and_then(Value::as_str).unwrap_or_default();
+    let signal = log_signal_from(&raw, session);
+    let (kind, boundary, message) = match name {
+        "turn.started" => (EventKind::Activity, RunBoundary::Started, String::new()),
+        "turn.completed" => (EventKind::RunCompleted, RunBoundary::Finished, String::new()),
+        "tool.call.started" if is_subagent_session_id(session) =>
+            (EventKind::Activity, RunBoundary::Progress, String::new()),
+        _ => match signal? {
+            LogSignal::Aborted { .. } => (EventKind::RunAborted, RunBoundary::Finished, "回合被中断".into()),
+            LogSignal::Failed { message, .. } => (EventKind::RunFailed, RunBoundary::Finished, message),
+        },
+    };
+    let mut event = NormalizedEvent::from_raw("zcode", kind, &raw);
+    event.message = message;
+    event.is_subagent = is_subagent_session_id(session);
+    event.parent_session_id = raw.pointer("/context/parentSessionId").and_then(Value::as_str)
+        .filter(|id| is_session_id(id)).map(str::to_owned);
+    if event.is_subagent && event.parent_session_id.is_none()
+        && !matches!(kind, EventKind::RunFailed | EventKind::RunAborted) { return None; }
+    if name == "tool.call.started" {
+        event.tool_name = raw.pointer("/context/toolName").and_then(Value::as_str).map(str::to_owned);
+    }
+    let turn = raw.get("turnId").and_then(Value::as_str);
+    if let Some(turn) = turn {
+        event.run = Some(RunContext { turn_id: turn.into(), boundary, children_active: None });
+    } else if matches!(name, "turn.started" | "turn.completed") {
+        return None; // 缺身份的边界不能覆盖正在跟踪的新回合。
+    }
+    // 保留来源时间，避免延迟读取的旧开始/旧结束覆盖当前回合。
+    event.timestamp = chrono::DateTime::parse_from_rfc3339(raw.get("timestamp")?.as_str()?).ok()?.timestamp_millis();
+    Some(event)
+}
+
+/// 从一行 ZCode 日志里解析回合终态信号（无关记录返回 None）。
 pub fn parse_log_signal(line: &str) -> Option<LogSignal> {
     parse_log_line(line).and_then(|l| l.signal)
 }
@@ -1115,6 +1172,8 @@ const CARRY_MAX: usize = 4 * 1024 * 1024;
 
 /// 一次增量读取的产物。
 pub struct TailScan {
+    /// 按日志原始顺序排列的主/子回合边界，不能分组后重排父子事件。
+    pub lifecycle_events: Vec<NormalizedEvent>,
     /// 新发现的回合终态信号
     pub signals: Vec<LogSignal>,
     /// 本次有过日志活动的会话 id（去重；含不构成信号的普通行，以及子代理行
@@ -1130,6 +1189,7 @@ pub struct TailScan {
 impl TailScan {
     fn empty() -> Self {
         TailScan {
+            lifecycle_events: Vec::new(),
             signals: Vec::new(),
             alive_sessions: Vec::new(),
             subagent_events: Vec::new(),
@@ -1232,6 +1292,9 @@ impl AbortLogTail {
         for line in complete.split(|b| *b == b'\n') {
             if line.is_empty() {
                 continue;
+            }
+            if let Some(event) = parse_lifecycle_event(&String::from_utf8_lossy(line)) {
+                out.lifecycle_events.push(event);
             }
             let Some(parsed) = parse_log_line(&String::from_utf8_lossy(line)) else {
                 continue;
@@ -2559,4 +2622,59 @@ mod tests {
         assert!(is_subagent(&json!({ "session_id": "sess_main", "is_subagent": true })));
         assert!(is_subagent(&json!({ "session_id": "sess_main", "subagent": true })));
     }
+
+    #[test]
+    fn lifecycle_log_preserves_main_turn_identity_and_timestamp() {
+        let row = json!({"event":"turn.started", "timestamp":"2026-10-22T00:00:00Z", "sessionId":NEW_SID,"turnId":"t2"});
+        let start = parse_lifecycle_event(&row.to_string()).unwrap();
+        assert_eq!(start.kind, EventKind::Activity);
+        assert_eq!(start.timestamp, 1792627200000);
+        assert_eq!(start.run.as_ref().unwrap().turn_id, "t2");
+        assert_eq!(start.run.as_ref().unwrap().boundary, bark_core::RunBoundary::Started);
+        assert!(!start.is_subagent);
+        let mut end = row.clone();
+        end["event"] = json!("turn.completed");
+        assert_eq!(parse_lifecycle_event(&end.to_string()).unwrap().kind, EventKind::RunCompleted);
+        end.as_object_mut().unwrap().remove("turnId");
+        assert!(parse_lifecycle_event(&end.to_string()).is_none());
+    }
+
+    #[test]
+    fn lifecycle_failures_keep_child_identity_without_requiring_parent_on_error_line() {
+        let row = json!({"event":"turn.failed", "timestamp":"2026-10-22T00:00:00Z", "sessionId":SUB_SID,"turnId":"t1","status":"failed","error":{"message":"failed"}});
+        let event = parse_lifecycle_event(&row.to_string()).unwrap();
+        assert_eq!(event.kind, EventKind::RunFailed);
+        assert!(event.is_subagent);
+        assert_eq!(event.run.unwrap().turn_id, "t1");
+    }
+
+    #[test]
+    fn stop_hook_is_a_candidate_even_without_turn_id() {
+        let adapter = ZcodeAdapter::default();
+        for raw in [json!({"session_id":NEW_SID}), json!({"session_id":NEW_SID,"turnId":"t1"})] {
+            let event = adapter.normalize("Stop", &raw).unwrap();
+            assert_eq!(event.run.unwrap().boundary, bark_core::RunBoundary::Candidate);
+        }
+    }
+
+    #[test]
+    fn tail_keeps_parent_child_boundaries_in_original_order() {
+        use std::io::Write;
+        let dir = tmpdir();
+        let file = dir.join("zcode-2026-10-22.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let mut tail = AbortLogTail::default();
+        assert!(tail.poll(&dir).lifecycle_events.is_empty());
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        for (sid, event, turn) in [(NEW_SID,"turn.started","p1"),(SUB_SID,"turn.started","c1"),(NEW_SID,"turn.completed","p1"),(SUB_SID,"turn.completed","c1"),(NEW_SID,"turn.started","p2")] {
+            writeln!(writer, "{}", json!({"event":event,"timestamp":"2026-10-22T00:00:00Z","sessionId":sid,"turnId":turn,"context":{"parentSessionId":NEW_SID}})).unwrap();
+        }
+        let events = tail.poll(&dir).lifecycle_events;
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.iter().map(|e| e.run.as_ref().unwrap().turn_id.as_str()).collect::<Vec<_>>(), ["p1","c1","p1","c1","p2"]);
+        assert!(tail.poll(&dir).lifecycle_events.is_empty());
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

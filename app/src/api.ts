@@ -75,6 +75,8 @@ export interface NormalizedEvent {
   message: string;
   timestamp: number;
   is_subagent?: boolean;
+  /** 回合完成被公共状态机暂扣，仅作诊断记录。 */
+  completion_deferred?: boolean;
   /**
    * 派生出这个会话的**父会话 id**（主会话没有这个字段）。
    *
@@ -89,9 +91,10 @@ export interface NormalizedEvent {
 }
 
 // 会话实时状态（后端 SessionPhase / SessionStatus 的 snake_case 序列化形态）
-export type SessionPhase = "thinking" | "tool_running" | "waiting_permission" | "waiting_input";
+export type SessionPhase = "thinking" | "tool_running" | "waiting_permission" | "waiting_input" | "waiting_children" | "settling";
 
 export interface SessionStatus {
+  active_descendants?: number;
   agent: string;
   session_id: string;
   project: string | null;
@@ -645,6 +648,8 @@ export const PHASE_LABELS: Record<SessionPhase, string> = {
   tool_running: "执行工具",
   waiting_permission: "等待确认",
   waiting_input: "等待输入",
+  waiting_children: "等待子代理",
+  settling: "等待汇总",
 };
 
 export function phaseBadgeClass(phase: SessionPhase): string {

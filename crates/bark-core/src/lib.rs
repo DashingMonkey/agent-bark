@@ -8,4 +8,4 @@ pub use config::{
     RulesConfig, ServerConfig, StateEffects, WebhookChannelConfig, WidgetConfig,
     MAX_AGGREGATE_WINDOW_MS,
 };
-pub use event::{now_millis, project_name_from_cwd, truncate_chars, EventKind, NormalizedEvent, MAX_MESSAGE_CHARS};
+pub use event::{now_millis, project_name_from_cwd, truncate_chars, EventKind, NormalizedEvent, RunBoundary, RunContext, MAX_MESSAGE_CHARS};

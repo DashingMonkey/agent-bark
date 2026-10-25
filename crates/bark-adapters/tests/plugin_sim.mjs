@@ -446,9 +446,8 @@ console.log('case 5: 新回合开始要取消上一回合还挂着的重投');
   dump('case5');
 }
 
-// --- 用例 6：heldCompletions——子代理在跑时完成要扣住，fan-out 结束才放行 ----
-
-console.log('case 6: 后代活跃时「完成」必须扣住，全部结束后补投');
+// --- 用例 6：插件可靠上报事实，暂扣由公共状态机负责 ------------------------
+console.log('case 6: 父子回合边界和后代活跃事实交给公共状态机');
 {
   sent.length = 0;
   timers.length = 0;
@@ -457,35 +456,58 @@ console.log('case 6: 后代活跃时「完成」必须扣住，全部结束后�
   plugin.apply(ctx);
   const parent = makeAgent('sess-p');
   const child = makeAgent('sess-c', 'D:\\proj\\demo', { origin: 'subagent', parentSession: 'sess-p' });
-
-  await ctx.dispatch('session/event', parent.session, { type: 'turn/start', data: {} });
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/start', data: { turn: 1 } });
   await ctx.dispatch('agent/status', { agent: parent, status: 'running' });
-  await ctx.dispatch('session/event', child.session, { type: 'turn/start', data: {} });
+  await ctx.dispatch('session/event', child.session, { type: 'turn/start', data: { turn: 1 } });
   await ctx.dispatch('agent/status', { agent: child, status: 'running' });
-  // 父回合先结束，但子代理还在跑：「任务完成」是提前的，必须扣住
   await ctx.dispatch('session/event', parent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   await ctx.dispatch('agent/status', { agent: parent, status: 'idle' });
   await advance();
-  check(
-    terminals('run_completed').length === 0,
-    '子代理还在跑时父完成不发（heldCompletions 扣住）',
-  );
-
-  // 子代理结束：先发它自己的终态，随即放行父完成
+  const first = terminals('run_completed')[0];
+  check(first?.session_id === 'sess-p' && first.run?.children_active === true,
+    '父回合结束立即送达，携带子代理仍活跃的事实');
+  check(first?.run?.turn_id === '1' && first.run?.boundary === 'finished', '终态带稳定回合号');
   await ctx.dispatch('session/event', child.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
   await ctx.dispatch('agent/status', { agent: child, status: 'idle' });
   await advance();
   const dones = terminals('run_completed');
-  check(dones.length === 2, '子代理终态 + 放行的父终态都送达');
-  check(
-    dones.length === 2 && dones[0].session_id === 'sess-c' && dones[1].session_id === 'sess-p',
-    '顺序正确：子代理终态在前、父完成补投在后',
-  );
-  check(
-    dones.length === 2 && dones[0].is_subagent === true && dones[1].is_subagent === false,
-    '子代理终态带 is_subagent（daemon 侧据此不亮绿屏）',
-  );
+  check(dones.length === 2 && dones[1].is_subagent === true, '子代理终态仍单独送达');
+  check(dones.filter(e => e.session_id === 'sess-p').length === 1, '子代理结束不补发父代理旧完成');
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/start', data: { turn: 2 } });
+  await advance();
+  check(sent.some(e => e.session_id === 'sess-p' && e.run?.boundary === 'started' && e.run?.turn_id === '2'),
+    '父代理汇总的新回合身份可供公共状态机撤销旧完成');
   dump('case6');
+}
+
+// 子终态重投期间，父回合不能把传输队列当成仍在执行的子代理。
+{
+  sent.length = 0;
+  timers.length = 0;
+  behavior = null;
+  const ctx = makeCtx();
+  plugin.apply(ctx);
+  const parent = makeAgent('sess-retry-parent');
+  const child = makeAgent('sess-retry-child', 'D:\\proj\\demo', { origin: 'subagent', parentSession: 'sess-retry-parent' });
+  for (const agent of [parent, child]) {
+    await ctx.dispatch('session/event', agent.session, { type: 'turn/start', data: { turn: 1 } });
+    await ctx.dispatch('agent/status', { agent, status: 'running' });
+  }
+  behavior = 'fail';
+  await ctx.dispatch('session/event', child.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await ctx.dispatch('agent/status', { agent: child, status: 'idle' });
+  await flush();
+  check(sent.some(e => e.session_id === 'sess-retry-child' && e.type === 'run_completed' && e.rejected),
+    '子代理结束首投失败，仍有待重投终态');
+  behavior = null;
+  await ctx.dispatch('session/event', parent.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await ctx.dispatch('agent/status', { agent: parent, status: 'idle' });
+  await flush();
+  const end = terminals('run_completed').find(e => e.session_id === 'sess-retry-parent');
+  check(end?.run?.children_active === false, '子终态重试不计为活跃后代');
+  await advance();
+  check(terminals('run_completed').some(e => e.session_id === 'sess-retry-child'), '子终态仍可靠重投');
+  dump('case6 retry');
 }
 
 // --- 用例 7：等待类事件必须真的发出去 + 子代理心跳带血缘 ---------------------

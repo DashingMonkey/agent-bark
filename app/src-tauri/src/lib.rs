@@ -4,6 +4,7 @@ mod trae_abort_watch;
 mod commands;
 mod glow;
 mod state;
+mod task_lifecycle;
 mod tray_menu;
 mod update;
 mod widget;

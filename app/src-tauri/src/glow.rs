@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, EventTarget, Manager, Monitor, WebviewUrl, WebviewWindowBuilder};
 
-use crate::state::{lock, read, AppState, SessionPhase, SessionStatus};
+use crate::state::{lock, read, AppState, SessionPhase};
 
 /// glow 窗口 label 前缀（实际 label 形如 `glow-0`）
 pub const GLOW_PREFIX: &str = "glow-";
@@ -415,13 +415,27 @@ fn burst_only(app: &AppHandle, state: &Arc<AppState>, burst: GlowState) {
 /// 会话表当前想要的状态：等待 > 运行中 > None（没有任何活跃会话）
 fn desired_state(state: &Arc<AppState>) -> Option<GlowState> {
     let sessions = lock(&state.active_sessions);
-    if sessions.values().any(is_waiting) {
-        Some(GlowState::Waiting)
-    } else if !sessions.is_empty() {
-        Some(GlowState::Running)
-    } else {
-        None
+    desired_from_phases(sessions.values().map(|s| &s.phase))
+}
+
+fn desired_from_phases<'a>(phases: impl Iterator<Item = &'a SessionPhase>) -> Option<GlowState> {
+    let mut desired = None;
+    for phase in phases {
+        match phase {
+            SessionPhase::WaitingPermission | SessionPhase::WaitingInput => return Some(GlowState::Waiting),
+            SessionPhase::Thinking | SessionPhase::ToolRunning => desired = Some(GlowState::Running),
+            // 主代理等待后代/汇总不等于模型正在运行，也不是等待用户操作。
+            SessionPhase::WaitingChildren | SessionPhase::Settling => {
+                desired.get_or_insert(GlowState::Idle);
+            }
+        }
     }
+    desired
+}
+
+/// 暂扣完成只同步常驻状态，绝不重放全屏特效。
+pub fn sync_task_state(app: &AppHandle, state: &Arc<AppState>) {
+    restore(app, state, desired_state(state).unwrap_or(GlowState::Idle));
 }
 
 /// **无事件版本**：心跳判死巡检用（见 `state::sweep_stale_sessions`）。
@@ -461,10 +475,6 @@ fn derive(desired: Option<GlowState>, kind: EventKind, running_lost: bool) -> Op
             _ => None,
         },
     }
-}
-
-fn is_waiting(s: &SessionStatus) -> bool {
-    matches!(s.phase, SessionPhase::WaitingPermission | SessionPhase::WaitingInput)
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,6 +1496,21 @@ pub(crate) fn scale_or_one(s: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_parent_is_silent_but_live_children_and_user_attention_take_priority() {
+        use SessionPhase::*;
+        assert_eq!(desired_from_phases([].iter()), None);
+        assert_eq!(desired_from_phases([WaitingChildren, Settling].iter()), Some(GlowState::Idle));
+        for phases in [[WaitingChildren, ToolRunning], [Thinking, Settling]] {
+            assert_eq!(desired_from_phases(phases.iter()), Some(GlowState::Running));
+        }
+        for phases in [[Thinking, WaitingInput], [WaitingPermission, Settling]] {
+            assert_eq!(desired_from_phases(phases.iter()), Some(GlowState::Waiting));
+        }
+        // 最后一个子代理结束后只有等待汇总的父行，不得亮完成色。
+        assert_eq!(derive(desired_from_phases([Settling].iter()), edge_kind(EventKind::RunCompleted, true), false), Some(GlowState::Idle));
+    }
 
     /// 锁配色：四个角色 ↔ 四个色值。
     ///

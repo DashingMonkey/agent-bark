@@ -161,6 +161,8 @@ mod tests {
 
     fn event(cwd: &str, project: Option<&str>) -> NormalizedEvent {
         NormalizedEvent {
+            run: None,
+            completion_deferred: false,
             id: "id".into(),
             agent: "dsh".into(),
             kind: EventKind::RunCompleted,

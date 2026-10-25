@@ -341,13 +341,13 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 driver remains scheduled or active*，实现里只在状态跳变时 emit），官方规范明确写
 *"Do not poll `agent/status`"*；而且它会在「唤醒后没有回合」时也翻到 running。
 
-**子代理语义**（2026-09-28，参考社区插件 dingyi222666/dsh-session-notification 的
-heldCompletions 与 dsh-notifier 的订阅修法）：
+**子代理语义**（2026-10-22）：
 
-- **完成通知会扣住**：回合结束但**后代会话还在跑**（沿 `session.header.parentSession`
-  血缘边递归查后代，等价社区的 `hasRunningDescendants`）时，`run_completed` 扣住不发，
-  等整个 fan-out 结束再补投；**失败/中止不扣**（错误是当下就要知道的事）。
-  不这么做的话，主 agent 派生子代理后回合间歇的「完成」会提前弹绿色完成特效；
+- **回合边界与任务完成分开**：DSH 插件可靠投递 `run.turn_id`、`run.boundary` 和
+  `run.children_active`，不再在插件里扣留完成。公共状态机在后代活跃时把父会话
+  保留为 `waiting_children`；后代结束后进入 `settling`，等主代理恢复并完成汇总。
+  不再在最后一个子代理结束时补投父代理旧完成。失败、中止立即生效。
+  接入协议、事件顺序和已知边界见 [父子任务状态](task-lifecycle.md)。
 - **子代理活动驱动流光、也在界面上可见，但不打扰人**：子代理心跳照发（`is_subagent` 门在 daemon
   侧只挡通知/音效/全屏特效/悬浮窗弹出），并经 `parent_session_id` 向祖先递归传播存活（daemon 侧
   `touch_ancestors_at`）——否则子代理跑 20 分钟、父会话零心跳会被判死误亮失败色。
@@ -402,7 +402,7 @@ heldCompletions 与 dsh-notifier 的订阅修法）：
   没有 `turn/end` 事件）、case 17（连 status 事件也没有）、case 14（缺 idle 边沿）；
 - **收尾的两条兜底**（2026-09-30 首修，与上一条同源）：
   1. 收尾原来只挂在 `agent/status: idle` 边沿上。实测 DSH 重启后**连续两个回合收尾都没有这个边沿**（终态一条都没报出去，daemon 里的条目挂死），所以 `turn/end` 现在无条件排一个 `REST_GRACE_MS`（1.5s）宽限窗：窗内没有新回合（`turn/start` 会取消它）就按 `turn/end` 的 reason 收尾；idle 边沿到了则立刻收并取消定时器（快路径）。排队输入连续多回合（实测间隔 1ms）因此仍然只报一次；
-  2. `hasActiveDescendants`（heldCompletions 的活跃判据）原来用插件自己的 `running` 记账，而 DSH 会在「被附着/唤醒但没有回合」时也把状态翻到 running——那种子会话（例如早就跑完、被重新附着的子代理）会把**父会话的完成永久扣住**。现在活跃判据改成**日志派生**：只有子会话 `turnOpen === true`（回合开着）才算在干活。
+  2. `hasActiveDescendants`（当前用于上报 `children_active`）原来用插件自己的 `running` 记账，而 DSH 会在「被附着/唤醒但没有回合」时也把状态翻到 running——那种子会话（例如早就跑完、被重新附着的子代理）会把**父会话的完成永久扣住**。现在活跃判据改成**日志派生**：只有子会话 `turnOpen === true`（回合开着）才算在干活。
   两条各有回归用例（`plugin_sim.mjs` case 14 / case 15）；
 - **幽灵行**（2026-09-30 修，用户实测「没有会话在跑，面板却一直挂着一条『思考中』」）：
   旧实现把「任何会话事件」当「agent 还活着」，而 DSH 会在**回合外**追加会话级事件
@@ -788,3 +788,13 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 ```
 
 本机开发时曾有一套现成脚本（探针 / 目录快照 / 全盘找字符串）放在仓库外的 `D:\MySpace\qoder-hook-probe`（`probe.mjs` / `probe-hook.mjs` / `snapshot.mjs` / `findneedle.mjs`）；**该目录已不在**，需要时按本节自己写一个十几行的 `probe.mjs` 即可。
+
+
+### ZCode 主回合与子代理完成判定（2026-10-22）
+
+`Stop` 仅作为完成候选保留回复摘要，以日志 `turn.completed` 确认边界；`turn.started`
+覆盖没有 `UserPromptSubmit` hook 的自动汇总回合。日志观察器按原始顺序提交主/子事件，
+保留来源时间和回合号，不再把子代理事件与父代理事件分组重排。父子任务使用与 DSH
+相同的公共判定，暂扣记录不触发完成推送、音效、光效或悬浮窗驻留。
+
+日志读取、缺失信号的处理与其他 agent 接入要求见 [父子任务状态](task-lifecycle.md)。

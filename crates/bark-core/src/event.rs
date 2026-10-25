@@ -99,6 +99,26 @@ pub struct CodexContext {
     pub is_background: bool,
 }
 
+/// 适配器提供的回合边界。Candidate（例如 Stop hook）必须等 Finished 确认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunBoundary {
+    Started,
+    Progress,
+    Candidate,
+    Finished,
+}
+
+/// 提供此字段的适配器启用公共父子任务完成判定；turn_id 在同一会话内稳定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunContext {
+    pub turn_id: String,
+    pub boundary: RunBoundary,
+    /// 来源对后代运行状态的权威快照；None 使用公共血缘表，false 可纠正迟到的子终态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_active: Option<bool>,
+}
+
 /// 归一化后的事件，全链路统一格式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedEvent {
@@ -130,7 +150,7 @@ pub struct NormalizedEvent {
     /// 子代理干活时父会话自己没有任何事件（实测 DSH `Agent` 工具单次可跑 27 分钟），
     /// 不传播就会被「心跳静止判死」误杀成意外终止（红光 + 失败音）。
     /// 与 ZCode 日志存活心跳的 parentSessionId 传播同一套口径（见 state::touch_ancestors）。
-    /// 只有显式声明血缘的 adapter 才填（目前仅 DSH 插件）；hook 型事件恒为 None。
+    /// 只有显式声明血缘的 adapter 才填（DSH 插件、ZCode 日志观察器等）。
     #[serde(default)]
     pub parent_session_id: Option<String>,
     /// **纯保活心跳**（不是活动信号）：只刷新已有条目的存活时刻并可回填血缘，
@@ -147,6 +167,11 @@ pub struct NormalizedEvent {
     /// 回合内保活）才置 true。
     #[serde(default)]
     pub keepalive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunContext>,
+    /// 公共状态机的输出：原始完成已记录，但不能驱动任何完成展示或提醒。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completion_deferred: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexContext>,
 }
@@ -193,6 +218,8 @@ impl NormalizedEvent {
         let message = truncate_chars(&extract_message(raw), MAX_MESSAGE_CHARS);
         let project = project_name_from_cwd(&cwd);
         NormalizedEvent {
+            run: None,
+            completion_deferred: false,
             id: uuid::Uuid::new_v4().to_string(),
             agent: agent.to_string(),
             kind,

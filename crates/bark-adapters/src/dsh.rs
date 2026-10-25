@@ -626,16 +626,9 @@ const parentOf = new Map();
 const childrenOf = new Map();
 const familyOf = new Map();
 
-/**
- * 被扣住的「完成」终态：会话键 → { body, keys }。
- *
- * 参考 dingyi222666/dsh-session-notification 的 heldCompletions：回合结束但
- * **后代会话还在跑**（子代理波次之间 / 后台派生）时，「任务完成」是提前的——
- * 扣住不发，等整个 fan-out 结束（hasActiveDescendants 变假）再补投。
- * 失败 / 中止**不扣**：错误是当下就要知道的事（社区口径 "A failure is
- * actionable now: never hold it behind subagents"）。
- */
-const heldTerminal = new Map();
+/** 当前回合标识随所有事件发送；公共状态机负责后代等待和最终完成。 */
+const currentRun = new Map();
+let runSequence = 0;
 
 /** 保活心跳的节流表：会话 id → 上次发送时刻（tool_finished 语义，只续命）。 */
 const lastLivenessAt = new Map();
@@ -794,17 +787,16 @@ function noteLineage(keys, parent) {
 }
 
 /**
- * 会话是否还「活着」：**回合开着**（日志派生）或有终态在途/被扣住。
+ * 会话是否还「活着」：**回合开着**（日志派生）。终态重投属于传输状态，不代表模型仍在执行。
  *
  * ⚠️ 这里**不能**用 `running`（`agent/status` 记账）判活跃：DSH 会在「附着/唤醒但没有
  * 回合」时也把状态翻到 running（开屏预创建的空会话、被重新附着的续跑子代理……），
- * 那种子会话会把**父会话的完成永久扣住**（`heldTerminal` 等不到 `hasActiveDescendants`
+ * 那种子会话会把**父会话的完成永久扣住**（活跃判定等不到 `hasActiveDescendants`
  * 变假）——用户实测症状：回合早就结束，卡片一直「思考中」，光带一直亮（2026-09-30）。
  * 回合开着才是真的在干活：`turn/start` … `turn/end`（拿得到官方投影时以它为准）。
  */
 function isActiveSession(key) {
-  if (turnOpen.get(key) === true) return true;
-  return pendingTerminal.has(key) || heldTerminal.has(key);
+  return turnOpen.get(key) === true;
 }
 
 /** 会话是否见过真实会话事件（心跳放行门槛，见 seenActivity 的说明）。 */
@@ -1142,7 +1134,7 @@ function reportAtRest(agent, session, keys) {
 /**
  * 递归查「还有后代会话活着吗」：沿 childrenOf 边 BFS（双键家族一起展开），
  * 等价于 dingyi 项目里沿 parentId 链走的 hasRunningDescendants。
- * 「活着」口径取自我们自己维护的 running / pendingTerminal / heldTerminal
+ * 「活着」口径取自日志派生的 turnOpen
  * ——不依赖 DSH 的 sessions list API（那个 API 的形态随版本变，见过 0.1.2
  * 移除 session.events 的先例）。
  */
@@ -1305,6 +1297,8 @@ function eventBody(f) {
     timestamp: Date.now(),
     is_subagent: o.isSubagent === true,
   };
+  const runId = currentRun.get(body.session_id);
+  if (runId) body.run = { turn_id: runId, boundary: o.runBoundary || "progress", children_active: false };
   const toolName = asText(o.toolName);
   if (toolName) body.tool_name = toolName;
   // 血缘：daemon 侧据此把存活心跳向祖先递归传播（state::touch_ancestors），
@@ -1369,13 +1363,10 @@ function finishTerminal(sessionId) {
   const turn = job ? job.turn : undefined;
   for (const k of keys) {
     pendingTerminal.delete(k);
-    // 终态送达 = 本回合结束：running 同步摘掉。否则「后代还活着」的判定会一直
-    // 真到 status idle 才变假——heldCompletions 的放行被拖后一拍（实测仿真回归）
+    // 终态送达后同步摘掉本地运行记账。
     running.delete(k);
   }
   markSettled(keys, turn);
-  // 本会话（可能是别人的后代）不再活跃：检查有没有被扣住的祖先完成该放行了
-  releaseHeld();
 }
 
 /** 重投一次待发终态；仍失败则排下一次，重试次数用尽就放弃（交给 daemon 判死收场）。 */
@@ -1415,7 +1406,7 @@ async function settle(type, agent, session, fields) {
   // 其次用本会话最近一次 turn/end 记下的回合号，最后才退化成一个周期标记
   const turn = typeof f.turn === "number" ? f.turn : lastTurnNoFor(keys);
   trace("settle", { type, key: sessionId, turn, skip: !keys.length || isSettledOf(keys, turn) });
-  if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k) || heldTerminal.has(k))) return;
+  if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k))) return;
   // 先算完 cwd / 子代理标记再入队：取字段抛异常时（结构随版本变动）
   // 不该把本回合标记成已上报——那样随后的兜底也会被跳过，一条通知都不剩。
   const body = eventBody({
@@ -1426,18 +1417,16 @@ async function settle(type, agent, session, fields) {
     isSubagent: isSubagentOf(agent, session),
     parentSessionId: parentStringOf(agent, session),
   });
-  // heldCompletions（参考 dingyi222666/dsh-session-notification）：回合结束但
-  // 后代会话还在跑 = 「子代理波次之间」的假完成——扣住不发，等 fan-out 全结束
-  // 由 releaseHeld() 补投。失败 / 中止不扣：错误是当下就要知道的事。
-  if (type === "run_completed" && hasActiveDescendants(keys)) {
-    const held = { body, keys, turn };
-    for (const k of keys) heldTerminal.set(k, held);
-    return;
-  }
+  // 后代活跃事实交给公共状态机；插件只负责可靠投递回合边界。
+  body.run = {
+    turn_id: typeof turn === "number" ? String(turn) : (currentRun.get(sessionId) || "unknown"),
+    boundary: "finished",
+    children_active: hasActiveDescendants(keys),
+  };
   await enqueueTerminal(body, keys, turn);
 }
 
-/** 正常终态入队投递（settle 与 releaseHeld 共用；重投路径见 retryTerminal）。 */
+/** 回合终态入队投递，失败时由 retryTerminal 重投。 */
 async function enqueueTerminal(body, keys, turn) {
   const sessionId = body.session_id;
   if (!keys.length || isSettledOf(keys, turn) || keys.some((k) => pendingTerminal.has(k))) return;
@@ -1453,19 +1442,6 @@ async function enqueueTerminal(body, keys, turn) {
   pending.timer = setTimeout(() => {
     void retryTerminal(sessionId);
   }, retryDelay(1));
-}
-
-/**
- * 释放「后代已全部结束」的被扣完成（heldCompletions 的另一半）。
- * 在任何会话变不活跃的时点调用：终态送达（finishTerminal）、status idle、disposed。
- * 递归释放是自动的：释放会走 enqueueTerminal → finishTerminal → 再进本函数。
- */
-function releaseHeld() {
-  for (const held of new Set(heldTerminal.values())) {
-    if (hasActiveDescendants(held.keys)) continue;
-    for (const k of held.keys) heldTerminal.delete(k);
-    void enqueueTerminal(held.body, held.keys, held.turn);
-  }
 }
 
 /**
@@ -1490,12 +1466,6 @@ function beginTurn(keys) {
   // 按回合标记记账时，新回合天然是新的标记（turn:N），不必清理；只有「没有回合号」
   // 的周期兜底标记需要在这里放行，否则老版本 DSH（没有 turn 号）的下一回合会被吞。
   for (const k of keys) if (settledSessions.get(k) === "cycle") settledSessions.delete(k);
-  // 上一回合被扣住的完成一并作废：此时放行只会把刚开始的新回合误报成已完成
-  // （与下面取消待投终态同口径，见本函数的文档注释）
-  const held = keys.map((k) => heldTerminal.get(k)).find(Boolean);
-  if (held) {
-    for (const k of held.keys) heldTerminal.delete(k);
-  }
   const job = keys.map((k) => pendingTerminal.get(k)).find(Boolean);
   if (job) {
     if (job.timer !== null) clearTimeout(job.timer);
@@ -1521,6 +1491,7 @@ function postActivity(fields) {
   const f = fields && typeof fields === "object" ? fields : {};
   postBestEffort(eventBody({
     type: "activity",
+    runBoundary: f.runBoundary,
     sessionId: asText(f.sessionId),
     cwd: asText(f.cwd),
     toolName: asText(f.toolName),
@@ -1644,15 +1615,9 @@ export function apply(ctx) {
     }
     // 注意：这里**不**停对账定时器。idle 边沿可能比 turn/end 先到（或干脆不来），
     // 让对账再跑一跳，它自己会在「回合关着且已报过」时停掉（见 startHeartbeat）。
-    if (!wasRunning) {
-      // 本会话本来就不活跃：仍要检查被扣住的祖先完成能不能放行（heldCompletions 的释放点）
-      releaseHeld();
-      return;
-    }
+    if (!wasRunning) return;
     // 收尾挂在**静止边沿**而不是每个 turn 上：一次运行可能跨多个 turn
     // （goal run / 排队的输入共享一个 running 区间），按 turn 通知会刷屏并提前播报完成。
-    // 顺序讲究：先把自己的终态报出去，再放行被扣住的祖先完成——否则「子代理结束」与
-    // 「父完成」会倒序，daemon 侧先看到父完成、后看到子代理收尾。
     if (trackTurnOf(keys) === false) {
       // `turn/end` 已经落盘（正常顺序）：立刻收尾
       cancelRest(keys);
@@ -1662,7 +1627,6 @@ export function apply(ctx) {
       // 期间若 turn/end 到了会提前收尾，见第 6 段
       scheduleRest(agent, session, keys);
     }
-    releaseHeld();
   }), { global: true });
 
   // 3) 请求/步骤出错（emit）：**只记正文，不立即报失败**。
@@ -1754,6 +1718,8 @@ export function apply(ctx) {
       const cwd = cwdOf(undefined, session);
 
       if (type === "turn/start") {
+        const turn = event.data && event.data.turn;
+        currentRun.set(sessionId, typeof turn === "number" ? String(turn) : `local:${++runSequence}`);
         for (const k of keys) {
           turnOpen.set(k, true);
           turnRan.set(k, true);
@@ -1761,7 +1727,7 @@ export function apply(ctx) {
         // 宽限窗内又开了新回合（排队的输入 / 立刻追问）= 同一次运行继续，取消待收尾
         cancelRest(keys);
         // **唯一建档点**：不带 keepalive 的 activity 才允许 daemon 新建条目
-        postActivity({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent });
+        postActivity({ sessionId, cwd, isSubagent: isSub, parentSessionId: parent, runBoundary: "started" });
         startHeartbeat(keys, session);
         return;
       }
@@ -1821,11 +1787,7 @@ export function apply(ctx) {
     trace("disposed", { key: sessionId, wasActive });
     stopHeartbeat(keys);
     cancelRest(keys);
-    // 上一回合的待投 / 被扣终态作废：会话都没了，再投只会往 daemon 塞一条无主事件
-    const held = keys.map((k) => heldTerminal.get(k)).find(Boolean);
-    if (held) {
-      for (const k of held.keys) heldTerminal.delete(k);
-    }
+    // 上一回合的待投终态作废：会话都没了，再投只会往 daemon 塞一条无主事件
     const job = keys.map((k) => pendingTerminal.get(k)).find(Boolean);
     if (job) {
       if (job.timer !== null) clearTimeout(job.timer);
@@ -1847,6 +1809,7 @@ export function apply(ctx) {
       const parent = parentOf.get(k);
       if (parent && childrenOf.has(parent)) childrenOf.get(parent).delete(k);
       parentOf.delete(k);
+      currentRun.delete(k);
       familyOf.delete(k);
       childrenOf.delete(k);
     }
@@ -1854,8 +1817,6 @@ export function apply(ctx) {
     if (wasActive) {
       void settle("run_aborted", agent, session, { sessionId, message: "会话已关闭", turn });
     }
-    // 活跃度变了：被扣住的祖先完成可能该放行了
-    releaseHeld();
   }), { global: true });
 }
 "##;
@@ -1995,10 +1956,9 @@ mod tests {
         ] {
             assert!(js.contains(kind), "缺少 TurnEndReason {kind}");
         }
-        // TurnEndReason 没有 "finished" 这个 kind（判据带引号：`tool_finished`
-        // 这个事件类型名合法地含有 finished 子串，不能误伤）
+        // TurnEndReason 没有 finished；公共边界的 boundary=finished 是另一套语义。
         assert!(
-            !js.contains("\"finished\""),
+            !js.contains("reason === \"finished\""),
             "TurnEndReason 里没有 finished"
         );
         // POST 超时：serial 监听里 await 的 fetch 不能无限期挂住 DSH 的回合收尾
@@ -2109,12 +2069,12 @@ mod tests {
         );
     }
 
-    /// 子代理语义的结构约束（fix2/3/4）：heldCompletions 扣完成、血缘传播存活、
+    /// 子代理语义的结构约束：边界交给公共层、血缘传播存活、
     /// scope 丢事件（global:true）、以及历史 bug 回归——`post()` 被删后
     /// approval/提问两个处理器还在调用它，ReferenceError 被 try/catch 吞掉，
     /// DSH 的「等待授权 / 等待输入」从未上报过。
     #[test]
-    fn generated_plugin_holds_completions_and_reports_lineage() {
+    fn generated_plugin_reports_boundaries_and_lineage() {
         let js = plugin_js(1234, "tok");
 
         // 1) post() 未定义的 bug 不得回归：等待类事件走 postBestEffort
@@ -2135,17 +2095,10 @@ mod tests {
             5,
             "5 个 scoped 监听都要带 global（防 scope 丢事件）: {js}"
         );
-        // 3) heldCompletions：完成类终态在后代活跃时扣住，且只扣完成（失败/中止不扣）
-        assert!(
-            js.contains("const heldTerminal = new Map()")
-                && js.contains("function hasActiveDescendants(keys)")
-                && js.contains("function releaseHeld()"),
-            "递归后代判定 + 扣留 + 放行三件套必须齐: {js}"
-        );
-        assert!(
-            js.contains("if (type === \"run_completed\" && hasActiveDescendants(keys))"),
-            "只有 run_completed 才扣（失败是当下就要知道的事）: {js}"
-        );
+        // 回合边界和后代事实交给公共状态机，不再在插件内扣住完成。
+        assert!(js.contains("children_active: hasActiveDescendants(keys)"));
+        assert!(js.contains("boundary: \"finished\""));
+        assert!(!js.contains("const heldTerminal"));
         // 4) 血缘：事件体带 parent_session_id（daemon 据此向祖先传播存活），
         //    读取走 parentStringOf（DSH 升级字段变动时的唯一检查点）
         assert!(

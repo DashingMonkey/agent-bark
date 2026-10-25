@@ -57,6 +57,8 @@ pub(crate) fn emit(
         return;
     }
     let ev = NormalizedEvent {
+        run: None,
+        completion_deferred: false,
         id: uuid::Uuid::new_v4().to_string(),
         agent: kind.id().to_string(),
         kind: event,

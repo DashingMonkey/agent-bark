@@ -391,6 +391,8 @@ mod tests {
 
     fn sample() -> NormalizedEvent {
         NormalizedEvent {
+            run: None,
+            completion_deferred: false,
             id: "id".into(),
             agent: "claude-code".into(),
             kind: EventKind::RunCompleted,

@@ -88,3 +88,6 @@ body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, san
 .ctx-item.checked .ctx-check::before { content: "✓"; }
 .ctx-separator { height: 1px; margin: 4px; background: var(--line); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
+
+/* 主代理等待子任务不等于等待用户，不使用提醒色。 */
+.state.paused { color: var(--muted); }
