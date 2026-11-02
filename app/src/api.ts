@@ -135,7 +135,7 @@ export interface SessionRow {
   /** 缩进层级：0 = 主会话 / 占位父行；子代理挂在它的父行下面 */
   depth: number;
   /**
-   * 父链**整条**都不在本批快照里（回合已结束、被摘档或判死淘汰）。
+   * 父链**整条**都不在本批快照里（回合已结束或已从本地显示移除）。
    *
    * 这类子代理**不缩进**（`depth` 恒为 0）：父行不在，缩进就失去参照物，它会紧跟在上一行
    * 的子树后面，看起来像「挂在了那个会话下面」（实测踩过：两个工作区各开一个 DSH 会话时，
@@ -404,8 +404,9 @@ export interface WidgetConfig {
   y: number;
   /** 固定位置：true 时卡片不响应拖动（悬浮窗右键菜单里切换） */
   pinned: boolean;
-  /** 自动隐藏：安静即隐、有事即现（行为口径见 widget.ts 的「自动隐藏」一节） */
-  auto_hide: boolean;
+  /** 靠边隐藏方向；位置始终保存展开时的卡片左上角。 */
+  dock_side: "top" | "left" | "right" | null;
+  dock_monitor: string | null;
 }
 
 /** 「通知」页「声音」里单个状态的音效设置（对应后端 StateSound） */
@@ -531,7 +532,7 @@ export const api = {
     invoke<string | null>("set_agent_enabled", { kind, enabled }),
   getConfig: () => invoke<BarkConfig>("get_config"),
   saveConfig: (config: Partial<Pick<BarkConfig, "channels" | "rules" | "notify" | "glow">> & {
-    widget?: Partial<Pick<BarkConfig["widget"], "enabled" | "auto_hide">>;
+    widget?: Partial<Pick<BarkConfig["widget"], "enabled">>;
   }) => invoke<void>("save_config", { config }),
   listEvents: (limit?: number) => invoke<NormalizedEvent[]>("list_events", { limit }),
   /// 清空后端事件历史（事件流页的「清空显示」）：不传 kind 清空全部，否则只清该类型。
@@ -539,6 +540,10 @@ export const api = {
   /// 返回**后端确实删掉的事件 id**：前端按它删本地副本，两边口径才一致。
   clearEvents: (kind?: string) => invoke<string[]>("clear_events", { kind: kind ?? null }),
   listActiveSessions: () => invoke<SessionStatus[]>("list_active_sessions"),
+  dismissSession: (s: SessionStatus) => invoke<void>("dismiss_session", {
+    agent: s.agent, sessionId: s.session_id,
+    expectedStartedAt: s.started_at, expectedLastActivity: s.last_activity,
+  }),
   /// 渠道测试：url / template 传 null 表示用已落盘配置；非 null 用传入值——
   /// 「测试」测的应当是**当前表单里未保存的输入**（bark 传 url，webhook 传 url+template），
   /// 否则新填的地址没保存就点测试，发去的还是旧地址（见 code-review §1.14）
@@ -563,11 +568,13 @@ export const api = {
   glowOff: () => invoke<void>("glow_off"),
   /// 「屏幕光效」页：实时枚举当前所有显示器（插拔后重新进页面即可刷新）
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),
+  /// 等原生拖动真正结束，返回是否发生位移。
+  startWidgetDrag: () => invoke<boolean>("start_widget_drag"),
   /// 悬浮窗位置记忆（拖动松手后上报，低频）：只写 widget 段，不整份落盘
-  saveWidgetPosition: (x: number, y: number) => invoke<void>("save_widget_position", { x, y }),
+  saveWidgetPosition: (x: number, y: number, dockSide: WidgetConfig["dock_side"] = null, dockMonitor: string | null = null) => invoke<void>("save_widget_position", { x, y, dockSide, dockMonitor }),
   /// 悬浮窗右键菜单「固定位置」开关（落盘到 widget.pinned，重启后保持）
   setWidgetPinned: (pinned: boolean) => invoke<void>("set_widget_pinned", { pinned }),
-  setWidgetAutoHide: (autoHide: boolean) => invoke<void>("set_widget_auto_hide", { autoHide }),
+  takeWidgetReveal: () => invoke<boolean>("take_widget_reveal"),
   /// 悬浮窗右键菜单「关闭悬浮窗」：关掉开关并销毁窗口；
   /// 主窗口的悬浮窗设置页经 bark://widget-closed 同步勾选态
   closeWidget: () => invoke<void>("close_widget"),

@@ -3,7 +3,7 @@
 // 独立入口，与主窗口的 Vue 应用无关。窗口由 tray_menu.rs 管理：点击托盘图标
 // 时落位 + 显示 + 聚焦，平时常驻隐藏。职责只有两件事：
 // 1. 静音勾选态渲染：建窗首帧用注入参数兜底，之后每次打开收 Rust 推送的最新值；
-// 2. 菜单项动作（经 commands.rs）：显示主窗口 / 重置流光 / 静音（勾选项，
+// 2. 菜单项动作（经 commands.rs）：显示主窗口 / 检测运行状态 / 静音（勾选项，
 //    切换后菜单保持打开，同原生 CheckMenuItem）/ 退出。
 //
 // 关闭：点窗口外 → Rust 侧失焦即收（主口径）；点菜单项 / Esc → 自收；
@@ -54,11 +54,11 @@ document.getElementById("menu-show")!.addEventListener("click", async () => {
   await hideSelf();
 });
 
-document.getElementById("menu-glow")!.addEventListener("click", async () => {
+document.getElementById("menu-recheck")!.addEventListener("click", async () => {
   try {
-    await invoke("reset_glow");
+    await invoke("recheck_sessions");
   } catch (e) {
-    console.warn("重置流光失败：", e);
+    console.warn("检测运行状态失败：", e);
   }
   await hideSelf();
 });

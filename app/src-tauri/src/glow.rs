@@ -8,7 +8,7 @@
 //! | `Running` | **思考颜色** | 思考中 / 执行工具 | 心跳 `Thinking` / `ToolRunning` |
 //! | `Waiting` | **等待颜色** | 等你确认或输入 | `WaitingPermission` / `WaitingInput` |
 //! | `Completed` | **完成颜色** · 停留后淡出 | 任务完成 | `RunCompleted` |
-//! | `Failed` | **失败颜色** · 停留后淡出 | 意外终止（失败 / 判死） | `RunFailed` / 心跳超时判死 |
+//! | `Failed` | **失败颜色** · 停留后淡出 | 明确的任务失败 | `RunFailed` |
 //!
 //! 全仓库只认这四个**角色名**，不写色系名与 hex（见 [`GlowState::color`]）；
 //! **用户主动中止**（`RunAborted`）是另一回事，它不亮灯，叫「中止」不叫「失败」。
@@ -160,7 +160,7 @@ pub enum GlowState {
     Waiting,
     /// 任务完成：完成色常亮后淡出
     Completed,
-    /// 意外终止（失败 / 心跳超时）：失败色脉冲后淡出
+    /// 明确的任务失败：失败色脉冲后淡出
     Failed,
 }
 
@@ -313,13 +313,13 @@ fn payload_with_burst(cfg: &GlowConfig, state: GlowState, burst: GlowState) -> G
 /// 但**全屏特效是独立的事件通道**（见 [`burst_only`]）：A 完成时哪怕 B 还在跑，
 /// 也以完成色补放一次雾散——「有一个完成了」是值得立刻知道的事件，
 /// 不该因为边缘还在表达 B 的状态就被静默吞掉。
-pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &NormalizedEvent, running_lost: bool) {
+pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &NormalizedEvent) {
     let desired = desired_state(state);
-    // 事件通道：还有别的活跃会话（边缘不会切终态）时，完成/失败/判死仍补放全屏。
+    // 事件通道：还有别的活跃会话（边缘不会切终态）时，完成/失败仍补放全屏。
     // 表空的情形由下面的正常推导接管——边缘切完成/失败色时 apply 本身就会触发
     // 同色全屏特效，这里再补就是双闪。
     if desired.is_some() {
-        if let Some(burst) = burst_for_event(ev.kind, running_lost, ev.is_subagent) {
+        if let Some(burst) = burst_for_event(ev.kind, ev.is_subagent) {
             burst_only(app, state, burst);
         }
     }
@@ -327,7 +327,7 @@ pub fn update_from_event(app: &AppHandle, state: &Arc<AppState>, ev: &Normalized
     // 不亮绿/红）。任务级完成色只属于根会话——否则子代理逐个收尾会逐个接管边缘
     // （DSH 实测：主 agent 等子代理时弹绿色完成特效）。多 agent 并行的思考色不受
     // 影响：`desired_state`（等待 > 思考）照常汇总**所有**会话，子代理心跳照样驱动。
-    let Some(next) = derive(desired, edge_kind(ev.kind, ev.is_subagent), running_lost) else {
+    let Some(next) = derive(desired, edge_kind(ev.kind, ev.is_subagent)) else {
         return;
     };
     apply(app, state, next);
@@ -344,28 +344,15 @@ fn edge_kind(kind: EventKind, is_subagent: bool) -> EventKind {
     }
 }
 
-/// 事件通道补放什么全屏特效（纯函数，§1.3）：`None` = 不补放。
-///
-/// `RunAborted` **一律不 burst**：手动中止不亮失败色全屏特效——即便同一瞬间恰好有
-/// 别的会话被心跳判死（`running_lost`）、判死者是另一会话，RunAborted 也不是判死
-/// 来源。保持简单、与另外两处口径对齐（`derive` 里 RunAborted 先于判死收光、
-/// `sound_key_for` 里手动中止永远不响）：「手动中止不提醒」，音/光优先级必须一致。
-///
-/// 子代理（`is_subagent`）的完成/失败**同样不 burst**：这是通知与音效早有的
-/// `is_subagent` 门在特效通道的同款补齐——一个任务拆出十几个子代理，逐个收尾
-/// 会逐个放绿屏/红屏（DSH 实测「主 agent 等待时弹绿色完成特效」即此）。
-/// 例外是 `running_lost`（心跳判死）：它是一次合并后的**会话级**意外终止，
-/// 与子代理自己的终态无关，照常补放失败色。
-fn burst_for_event(kind: EventKind, running_lost: bool, is_subagent: bool) -> Option<GlowState> {
-    if is_subagent && !running_lost {
+/// 只有根会话的明确完成/失败触发全屏特效；中止与子代理终态不触发。
+fn burst_for_event(kind: EventKind, is_subagent: bool) -> Option<GlowState> {
+    if is_subagent {
         return None;
     }
     match kind {
         EventKind::RunCompleted => Some(GlowState::Completed),
         EventKind::RunFailed => Some(GlowState::Failed),
         EventKind::RunAborted => None,
-        // 任意事件捎带的心跳判死 = 意外终止（agent 进程没了）→ 失败色补放
-        _ if running_lost => Some(GlowState::Failed),
         _ => None,
     }
 }
@@ -380,7 +367,7 @@ fn burst_for_event(kind: EventKind, running_lost: bool, is_subagent: bool) -> Op
 ///   payload 里的 state/color/hold_ms 原样带回当前边缘态，前端只多看到
 ///   burst 序号变了 + 特效色是事件角色色；
 /// - **边缘窗口不存在时不建窗**：懒创建原则——不为一次 3 秒的特效点亮整个
-///   覆盖层。已知代价：托盘「重置流光」或关开关收掉窗口后，若仍有会话在跑且
+///   覆盖层。已知代价：关闭光效开关收掉窗口后，若仍有会话在跑且
 ///   紧接着来了终态事件，这一次雾散会被丢掉（`apply` 因边缘状态没变而早退，
 ///   窗口也不会重建）。取舍见上：不值得为一次特效重建常驻覆盖层；
 ///   顶部模式下的**特效窗口**例外——它本就是按需创建、播完即毁的（见
@@ -438,30 +425,32 @@ pub fn sync_task_state(app: &AppHandle, state: &Arc<AppState>) {
     restore(app, state, desired_state(state).unwrap_or(GlowState::Idle));
 }
 
-/// **无事件版本**：心跳判死巡检用（见 `state::sweep_stale_sessions`）。
-///
-/// agent 被杀或回合被中断之后可能**再也不发任何事件**，只靠事件路径改流光就会一直停在
-/// 思考色。这里借「中性事件」`Activity` 走同一个 `derive`——它只对 `RunCompleted` /
-/// `RunFailed` / `running_lost` 特殊处理，正好表达「只看会话表 + 是否判死」：
-/// 还有活跃会话就按它们显示（等待/思考优先），一个不剩且判死了思考中的会话才转失败色，
-/// 否则保持不动（判死一个等待中的会话不该把终态色掐掉）。
-pub fn refresh_from_sessions(app: &AppHandle, state: &Arc<AppState>, running_lost: bool) {
-    let desired = desired_state(state);
-    // 判死发生在还有别的活跃会话时：边缘不动（继续表达它们），但「意外终止」
-    // 是事件，失败色全屏照放（对称于显式的 RunFailed，见 burst_only 的双通道说明）。
-    if running_lost && desired.is_some() {
-        burst_only(app, state, GlowState::Failed);
-    }
-    let Some(next) = derive(desired, EventKind::Activity, running_lost) else {
-        return;
-    };
-    apply(app, state, next);
+/// 来源核验只校正已有覆盖层的状态，不枚举显示器、不重放特效、不结束用户预览。
+pub fn reconcile(app: &AppHandle, state: &Arc<AppState>) {
+    let app = app.clone();
+    let state = state.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        if lock(&state.glow_preview).is_some() { return; }
+        let desired = desired_state(&state);
+        let current = current(&state);
+        // 无会话时，让已有终态按原来的计时淡出。
+        let next = desired.unwrap_or(if current.is_terminal() { current } else { GlowState::Idle });
+        if next == current { return; }
+        *lock(&state.glow) = next;
+        let cfg = read(&state.config).glow.sanitize();
+        if cfg.enabled { emit(&app, &cfg, &payload(&cfg, next)); }
+    });
+}
+
+/// 接入关闭等状态表清理后的光效同步。
+pub fn refresh_from_sessions(app: &AppHandle, state: &Arc<AppState>) {
+    if let Some(next) = desired_state(state) { apply(app, state, next); }
 }
 
 /// 纯函数版推导（便于测试）。`desired` 为 None 表示此刻没有任何活跃会话。
 /// 返回 None = 保持当前状态不变——`session_start` 这类中间事件不该把刚亮起的
 /// 终态色掐掉（会话开始后紧跟的心跳会立刻切到思考色）。
-fn derive(desired: Option<GlowState>, kind: EventKind, running_lost: bool) -> Option<GlowState> {
+fn derive(desired: Option<GlowState>, kind: EventKind) -> Option<GlowState> {
     match desired {
         Some(s) => Some(s),
         None => match kind {
@@ -470,8 +459,6 @@ fn derive(desired: Option<GlowState>, kind: EventKind, running_lost: bool) -> Op
             // 用户主动中止：没有别的会话在跑就**直接收起流光**——不亮失败色（不是失败）
             // 也不亮完成色（没跑完）。还有别的会话在跑时走上面那个分支，照常显示它们的状态。
             EventKind::RunAborted => Some(GlowState::Idle),
-            // 心跳超时被判死 = agent 进程没了（被杀时不会有 Stop 事件）→ 意外终止
-            _ if running_lost => Some(GlowState::Failed),
             _ => None,
         },
     }
@@ -514,7 +501,7 @@ fn apply_inner(app: &AppHandle, state: &Arc<AppState>, next: GlowState, new_trig
     let app = app.clone();
     let state = state.clone();
     if let Err(e) = app.clone().run_on_main_thread(move || {
-        // 真实事件 / 托盘重置 / 保存配置都会走到这里：预览到此结束。
+        // 真实事件 / 本地会话移除 / 保存配置都会走到这里：预览到此结束。
         // 清掉会话之后，挂着的预览恢复定时器会因为序号对不上而自动作废。
         *lock(&state.glow_preview) = None;
         let cfg = read(&state.config).glow.sanitize();
@@ -575,10 +562,8 @@ fn apply_action(cur: GlowState, next: GlowState, enabled: bool) -> ApplyAction {
     }
 }
 
-/// 托盘「重置流光」：无条件销毁覆盖窗并复位状态机。
-/// 用于驱散卡住的颜色（等待中的会话没有心跳，agent 崩溃后既无终态事件、
-/// 会话表条目也要等 10 分钟僵死判定才消失），或任何残留的覆盖层。
-/// 下一次事件到来时按正常逻辑重新点亮。
+/// 销毁覆盖窗并复位状态机，供关闭光效/清空会话等内部动作使用。
+/// 托盘检测走 state::recheck_sessions，不无条件清空光效。
 pub fn reset(app: &AppHandle, state: &Arc<AppState>) {
     *lock(&state.glow_preview) = None;
     *lock(&state.glow) = GlowState::Idle;
@@ -1509,7 +1494,7 @@ mod tests {
             assert_eq!(desired_from_phases(phases.iter()), Some(GlowState::Waiting));
         }
         // 最后一个子代理结束后只有等待汇总的父行，不得亮完成色。
-        assert_eq!(derive(desired_from_phases([Settling].iter()), edge_kind(EventKind::RunCompleted, true), false), Some(GlowState::Idle));
+        assert_eq!(derive(desired_from_phases([Settling].iter()), edge_kind(EventKind::RunCompleted, true)), Some(GlowState::Idle));
     }
 
     /// 锁配色：四个角色 ↔ 四个色值。
@@ -1750,67 +1735,54 @@ mod tests {
     #[test]
     fn derive_prefers_active_sessions_over_terminal_events() {
         // A 完成但 B 还在跑 → 边缘保持思考色（全屏另有完成色事件通道，见 burst_only）
-        assert_eq!(derive(Some(GlowState::Running), EventKind::RunCompleted, false), Some(GlowState::Running));
+        assert_eq!(derive(Some(GlowState::Running), EventKind::RunCompleted), Some(GlowState::Running));
         // 等待确认优先于思考：需要人去点一下
-        assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunFailed, false), Some(GlowState::Waiting));
+        assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunFailed), Some(GlowState::Waiting));
         // 无活跃会话 + 终态事件 → 完成 / 失败
-        assert_eq!(derive(None, EventKind::RunCompleted, false), Some(GlowState::Completed));
-        assert_eq!(derive(None, EventKind::RunFailed, false), Some(GlowState::Failed));
-        // 心跳超时判死 → 意外终止
-        assert_eq!(derive(None, EventKind::Activity, true), Some(GlowState::Failed));
+        assert_eq!(derive(None, EventKind::RunCompleted), Some(GlowState::Completed));
+        assert_eq!(derive(None, EventKind::RunFailed), Some(GlowState::Failed));
         // 会话开始这类中间事件不许掐掉刚亮起的终态
-        assert_eq!(derive(None, EventKind::SessionStart, false), None);
+        assert_eq!(derive(None, EventKind::SessionStart), None);
     }
 
     #[test]
     fn user_abort_hides_glow_unless_other_sessions_run() {
         // 用户自己按的停止：没有别的会话在跑 → **收起流光**（不亮失败色、不亮完成色）
-        assert_eq!(derive(None, EventKind::RunAborted, false), Some(GlowState::Idle));
+        assert_eq!(derive(None, EventKind::RunAborted), Some(GlowState::Idle));
         // 还有别的会话在跑 → 照常显示它们的状态（思考 / 等待优先）
-        assert_eq!(derive(Some(GlowState::Running), EventKind::RunAborted, false), Some(GlowState::Running));
-        assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunAborted, false), Some(GlowState::Waiting));
-        // 中止不是心跳判死，不许被 running_lost 覆盖成失败色
-        assert_eq!(derive(None, EventKind::RunAborted, true), Some(GlowState::Idle));
+        assert_eq!(derive(Some(GlowState::Running), EventKind::RunAborted), Some(GlowState::Running));
+        assert_eq!(derive(Some(GlowState::Waiting), EventKind::RunAborted), Some(GlowState::Waiting));
     }
 
     /// §1.3 回归 + 音/光对称（对齐 state.rs 的 `sound_key_follows_event_roles`）：
-    /// 用户主动中止**永远**不放失败色全屏特效，即便同一瞬间恰好有别的会话被判死
-    /// （running_lost=true、判死者是另一会话）——手动中止不提醒，音/光优先级必须一致
+    /// 用户主动中止**永远**不放失败色全屏特效；其他会话的状态不改变该事件的角色
     #[test]
-    fn abort_never_bursts_even_with_running_lost() {
-        assert_eq!(burst_for_event(EventKind::RunAborted, false, false), None);
-        assert_eq!(burst_for_event(EventKind::RunAborted, true, false), None, "判死者是另一会话也不 burst");
-        // 普通终态按事件角色补放
-        assert_eq!(burst_for_event(EventKind::RunCompleted, false, false), Some(GlowState::Completed));
-        assert_eq!(burst_for_event(EventKind::RunFailed, false, false), Some(GlowState::Failed));
-        // 任意事件捎带的心跳判死 = 意外终止 → 失败色（与音效 "failed" 同口径）
-        assert_eq!(burst_for_event(EventKind::Activity, true, false), Some(GlowState::Failed));
-        assert_eq!(burst_for_event(EventKind::SessionStart, true, false), Some(GlowState::Failed));
-        assert_eq!(burst_for_event(EventKind::ToolFinished, true, false), Some(GlowState::Failed));
-        // 中性事件、不带判死：不补放
-        assert_eq!(burst_for_event(EventKind::Activity, false, false), None);
-        assert_eq!(burst_for_event(EventKind::SessionStart, false, false), None);
+    fn only_explicit_root_terminals_burst() {
+        for kind in [EventKind::RunAborted, EventKind::Activity, EventKind::SessionStart,
+            EventKind::ToolFinished, EventKind::ToolFailed] {
+            assert_eq!(burst_for_event(kind, false), None);
+        }
+        assert_eq!(burst_for_event(EventKind::RunCompleted, false), Some(GlowState::Completed));
+        assert_eq!(burst_for_event(EventKind::RunFailed, false), Some(GlowState::Failed));
     }
 
     /// 子代理终态是**任务内事件**，不是任务级终态：不补放全屏、不接管边缘
     /// （通知与音效早有 is_subagent 门，这里是特效通道的同款补齐）。
-    /// 心跳判死（running_lost）例外——那是会话级意外终止，照常补放失败色。
     #[test]
     fn subagent_terminals_never_burst_or_take_over_edge() {
-        assert_eq!(burst_for_event(EventKind::RunCompleted, false, true), None, "子代理完成不绿屏");
-        assert_eq!(burst_for_event(EventKind::RunFailed, false, true), None, "子代理失败不红屏");
-        assert_eq!(burst_for_event(EventKind::Activity, true, true), Some(GlowState::Failed), "判死照常补放");
+        assert_eq!(burst_for_event(EventKind::RunCompleted, true), None, "子代理完成不绿屏");
+        assert_eq!(burst_for_event(EventKind::RunFailed, true), None, "子代理失败不红屏");
 
         // 收光口径：子代理终态映射成 RunAborted 语义——表空时直接收起（不绿不红）
         assert_eq!(edge_kind(EventKind::RunCompleted, true), EventKind::RunAborted);
         assert_eq!(edge_kind(EventKind::RunFailed, true), EventKind::RunAborted);
-        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, true), false), Some(GlowState::Idle));
+        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, true)), Some(GlowState::Idle));
         // 根会话终态不映射：完成色照常
         assert_eq!(edge_kind(EventKind::RunCompleted, false), EventKind::RunCompleted);
-        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, false), false), Some(GlowState::Completed));
+        assert_eq!(derive(None, edge_kind(EventKind::RunCompleted, false)), Some(GlowState::Completed));
         // 有活跃会话时边缘照常表达它们（desired 优先），子代理终态改不动
         assert_eq!(
-            derive(Some(GlowState::Running), edge_kind(EventKind::RunCompleted, true), false),
+            derive(Some(GlowState::Running), edge_kind(EventKind::RunCompleted, true)),
             Some(GlowState::Running)
         );
     }

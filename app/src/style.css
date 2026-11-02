@@ -751,7 +751,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .event-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
 .event-item:last-child { border-bottom: none; }
 .event-time { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
-.event-msg { font-size: 13px; margin-top: 3px; white-space: pre-wrap; word-break: break-all; user-select: text; }
+.event-msg {
+  font-size: 13px;
+  line-height: 1.5;
+  max-height: 12em; /* 8 行 × 1.5 行高；保留完整正文供滚动和复制 */
+  overflow-y: auto;
+  overscroll-behavior-y: auto;
+  margin-top: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
 
 /* ---- 子代理行（事件流 / 运行中会话区共用，类名由 api.ts 的 sessionRowClass 产出）----
    记号是行首的「↳」（.sub-tree），层级靠 .sub-indent-N 的 padding-left 表达。

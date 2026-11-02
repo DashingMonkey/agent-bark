@@ -23,9 +23,9 @@ use tokio::sync::mpsc;
 //
 // 白名单与各窗口入口的**实际 invoke 调用面**一一对应（前端 grep 核对）：
 // - "main"（index.html → main.ts → App.vue + pages）：save_config / set_agent_enabled /
-//   test_channel / test_sound / glow_preview / glow_preview_burst / glow_off；
-// - "main" + "tray-menu"（menu.html → menu.ts 直接 invoke）：reset_glow / toggle_mute / quit_app；
-// - "widget"（widget.html → widget.ts）：save_widget_position / set_widget_pinned / set_widget_auto_hide / close_widget；
+//   test_channel / test_sound / glow_preview / glow_preview_burst / glow_off / dismiss_session；
+// - "main" + "tray-menu"（menu.html → menu.ts 直接 invoke）：recheck_sessions / toggle_mute / quit_app；
+// - "widget"（widget.html → widget.ts）：start_widget_drag / save_widget_position / set_widget_pinned / take_widget_reveal / close_widget；
 // - 任意窗口：show_main_panel（App.vue / widget.ts 都调）与只读命令
 //   （agent_statuses / needs_agent_setup / get_config / diagnostics / list_events /
 //   clear_events / list_active_sessions / list_monitors / check_update / open_release_page）；
@@ -300,7 +300,6 @@ pub struct ConfigPatch {
 #[serde(deny_unknown_fields)]
 struct WidgetPatch {
     enabled: Option<bool>,
-    auto_hide: Option<bool>,
 }
 
 impl ConfigPatch {
@@ -320,9 +319,6 @@ impl ConfigPatch {
         if let Some(value) = self.widget {
             if let Some(enabled) = value.enabled {
                 current.widget.enabled = enabled;
-            }
-            if let Some(auto_hide) = value.auto_hide {
-                current.widget.auto_hide = auto_hide;
             }
         }
     }
@@ -369,30 +365,52 @@ pub async fn save_config(
     .map_err(|e| e.to_string())?
 }
 
+/// 原生拖动完成信号：Windows 上必须等左键实际释放，不能把 Tauri 的启动回执当成松手。
+#[tauri::command]
+pub async fn start_widget_drag(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    require_window(&webview, WIDGET_ONLY)?;
+    if crate::state::read(&state.config).widget.pinned { return Ok(false); }
+    let window = app.get_webview_window(crate::widget::WIDGET_LABEL).ok_or("悬浮窗不存在")?;
+    crate::widget::drag(window).await
+}
+
 /// 悬浮窗位置记忆（拖动松手后上报，低频）。
 ///
 /// 只写 widget 段、不走页面分区保存：位置上报与用户在主窗口的编辑并发，
 /// 整份落盘会互相覆盖。口径见 widget.rs 模块注释（x/y = 卡片左上角，逻辑像素）。
 #[tauri::command]
-pub async fn save_widget_position(webview: Webview, state: State<'_, Arc<AppState>>, x: f64, y: f64) -> Result<(), String> {
+pub async fn save_widget_position(
+    webview: Webview,
+    state: State<'_, Arc<AppState>>,
+    x: f64,
+    y: f64,
+    dock_side: Option<bark_core::WidgetDockSide>,
+    dock_monitor: Option<String>,
+) -> Result<(), String> {
     require_window(&webview, WIDGET_ONLY)?;
+    if !x.is_finite() || !y.is_finite() {
+        return Err("悬浮窗位置必须是有限数值".into());
+    }
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         ensure_config_writable(&state)?;
         // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
         let _write_guard = crate::state::lock(&state.config_write);
-        let mut cfg = crate::state::write(&state.config);
-        cfg.widget.x = x;
-        cfg.widget.y = y;
-        cfg.save(&state.config_path)
+        let mut next = crate::state::read(&state.config).clone();
+        next.widget.x = x;
+        next.widget.y = y;
+        next.widget.dock_side = if next.widget.pinned { None } else { dock_side };
+        next.widget.dock_monitor = if next.widget.dock_side.is_some() { dock_monitor } else { None };
+        next.save(&state.config_path)
             .map_err(|e| format!("保存悬浮窗位置失败: {e:#}"))?;
+        *crate::state::write(&state.config) = next;
         Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// 悬浮窗右键菜单「固定位置」：只写 widget.pinned（并发考量同 save_widget_position）
+/// 悬浮窗右键菜单「固定位置」：固定时同时取消停靠（并发考量同 save_widget_position）
 #[tauri::command]
 pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>, pinned: bool) -> Result<(), String> {
     require_window(&webview, WIDGET_ONLY)?;
@@ -401,40 +419,29 @@ pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>
         ensure_config_writable(&state)?;
         // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
         let _write_guard = crate::state::lock(&state.config_write);
-        let mut cfg = crate::state::write(&state.config);
-        cfg.widget.pinned = pinned;
-        cfg.save(&state.config_path)
+        let mut next = crate::state::read(&state.config).clone();
+        next.widget.pinned = pinned;
+        if pinned {
+            next.widget.dock_side = None;
+            next.widget.dock_monitor = None;
+        }
+        next.save(&state.config_path)
             .map_err(|e| format!("保存固定状态失败: {e:#}"))?;
+        *crate::state::write(&state.config) = next;
         Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// 悬浮窗菜单只允许修改自己的自动隐藏开关，不开放主窗口的整份配置写权限。
+/// 订阅展开事件后领取请求；窗口尚在加载时的托盘单击也不会丢失。
 #[tauri::command]
-pub async fn set_widget_auto_hide(
+pub fn take_widget_reveal(
     webview: Webview,
-    app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    auto_hide: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     require_window(&webview, WIDGET_ONLY)?;
-    let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        ensure_config_writable(&state)?;
-        let _write_guard = crate::state::lock(&state.config_write);
-        let mut next = crate::state::read(&state.config).clone();
-        next.widget.auto_hide = auto_hide;
-        next.save(&state.config_path).map_err(|e| format!("保存自动隐藏失败: {e:#}"))?;
-        *crate::state::write(&state.config) = next;
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    // 设置页与悬浮窗共享这次已落盘的结果。
-    let _ = app.emit("bark://widget-config", serde_json::json!({ "auto_hide": auto_hide }));
-    Ok(())
+    Ok(crate::widget::take_reveal(state.inner()))
 }
 
 /// 悬浮窗右键菜单「关闭悬浮窗」：等价于把开关关掉（落盘 + 销毁窗口）。
@@ -582,6 +589,15 @@ pub fn list_active_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionStatu
     crate::state::sessions_for_ui(state.inner())
 }
 
+/// 只移除本应用中的显示条目，不向 Agent 发送停止指令。
+#[tauri::command]
+pub async fn dismiss_session(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>,
+    agent: String, session_id: String, expected_started_at: i64, expected_last_activity: i64) -> Result<(), String> {
+    require_window(&webview, MAIN)?;
+    crate::state::dismiss_session(&state, &app, &agent, &session_id,
+        expected_started_at, expected_last_activity).await
+}
+
 /// 渠道测试用的本次生效配置（跨模块契约，前端 api.ts 的 testChannel 已按此传参）。
 enum TestTarget {
     Bark(BarkChannelConfig),
@@ -691,12 +707,11 @@ pub fn show_main_panel(app: AppHandle) {
     crate::show_main(&app);
 }
 
-/// 托盘菜单「重置流光」：无条件熄灭（销毁覆盖窗 + 状态机复位），
-/// 卡住的异常颜色一键驱散，下一次事件重新点亮。
+/// 托盘菜单「检测运行状态」：触发来源核验，并按当前会话恢复光效。
 #[tauri::command]
-pub fn reset_glow(webview: Webview, app: AppHandle) -> Result<(), String> {
+pub fn recheck_sessions(webview: Webview, app: AppHandle) -> Result<(), String> {
     require_window(&webview, MAIN_OR_TRAY)?;
-    glow::reset(&app, &app.state::<Arc<AppState>>());
+    crate::state::recheck_sessions(&app.state::<Arc<AppState>>(), &app);
     Ok(())
 }
 
@@ -754,7 +769,7 @@ mod tests {
     }
 
     /// §2.18 回归：命令调用方窗口白名单与各窗口入口的实际 invoke 调用面一致。
-    /// 托盘菜单（menu.ts 直接调 reset_glow / toggle_mute / quit_app）不能被弄坏，
+    /// 托盘菜单（menu.ts 直接调 recheck_sessions / toggle_mute / quit_app）不能被弄坏，
     /// 悬浮窗专属命令不许主窗口（反之亦然）。
     #[test]
     fn command_window_whitelist_matches_frontend_call_sites() {
@@ -838,6 +853,8 @@ mod tests {
         current.widget.x = -1920.0;
         current.widget.y = 60.0;
         current.widget.pinned = true;
+        current.widget.dock_side = Some(bark_core::WidgetDockSide::Left);
+        current.widget.dock_monitor = Some("display-2".into());
         current.set_agent_enabled("kimi-code", true);
         let token = current.server.token.clone();
         let patches = [
@@ -853,6 +870,8 @@ mod tests {
         assert_eq!(current.widget.x, -1920.0);
         assert_eq!(current.widget.y, 60.0);
         assert!(current.widget.pinned);
+        assert_eq!(current.widget.dock_side, Some(bark_core::WidgetDockSide::Left));
+        assert_eq!(current.widget.dock_monitor.as_deref(), Some("display-2"));
         assert!(current.agent_enabled("kimi-code"));
         assert_eq!(current.server.token, token);
         assert_eq!(current.channels.bark.unwrap().url, "https://example.com");

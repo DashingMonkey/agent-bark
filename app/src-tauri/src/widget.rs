@@ -3,23 +3,24 @@
 //! 与 glow 同一套窗口套路：透明、无边框、置顶、不进任务栏、**不可聚焦**
 //! （绝不抢用户编辑器的焦点，但鼠标事件正常接收——这是与 glow 唯一的区别，
 //! glow 是彻底点击穿透）。页面本体是 `app/widget.html` + `src/widget.ts`，
-//! 拖动 / 右键菜单 / 位置上报都在前端完成；Rust 侧只负责：
+//! 右键菜单 / 位置上报都在前端完成；Rust 侧负责：
+//! - 发起原生拖动并等待 Windows 左键释放，回报最终位移；
 //! - 按配置建窗 / 销毁（`sync`，配置开关翻转与启动时调用）；
 //! - 按记住的位置落位，初始参数经 initialization_script 注入
 //!   （窗口建好时 emit 的事件会丢，和 glow 同理）。
 //!
 //! 位置记忆的口径：`config.widget.{x,y}` 存卡片左上角（逻辑像素），
 //! `pinned` 存「固定位置」（固定后前端不响应拖动，右键菜单里切换）。
+//! `dock_side` 记住靠边隐藏方向；x/y 始终是展开位置，窄边几何由前端计算。
 //!
-//! 自动隐藏（`widget.auto_hide`）：隐藏/弹出是**前端可见性状态机**的事
-//! （widget.ts 的 `evaluateVisibility`，安静去抖后 hide、有关注行立即 show），
-//! Rust 侧只做两件事：auto_hide 开着时**建窗即隐藏**（登录不闪一下卡片），
-//! 以及配置热更新时把 `bark://widget-config` 推给已存在的窗口（不重建）。
+//! 自由悬浮时常驻；停靠恢复时先隐藏窗口，等前端布置好窄边再显示。
+//! 托盘单击通过可领取的请求临时展开，前端负责五秒计时和悬停保持。
 
 use crate::state::{read, AppState};
-use bark_core::WidgetConfig;
+use bark_core::{WidgetConfig, WidgetDockSide};
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 悬浮窗窗口 label（capabilities/widget.json 按它授权）
@@ -30,6 +31,29 @@ pub const CARD_W: f64 = 280.0;
 /// 空闲态（无进行中会话）高度（逻辑像素，首帧兜底；内容变化后由前端 set_size 跟随）
 pub const IDLE_H: f64 = 44.0;
 
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(vkey: i32) -> i16;
+}
+
+/// Tauri start_dragging 只投递开始移动的消息，并不等待 Windows 的移动循环退出。
+/// 在后台等待物理左键释放，再读取最终位置；WebView2 是否收到 mouseup 不影响收尾。
+pub async fn drag(window: tauri::WebviewWindow) -> Result<bool, String> {
+    let before = window.outer_position().map_err(|e| e.to_string())?;
+    window.start_dragging().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        while unsafe { GetAsyncKeyState(0x01) } < 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+        // 松手消息先交给原生窗口处理，再取位置；同时让最后一批 moved 事件到达前端。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let after = window.outer_position().map_err(|e| e.to_string())?;
+    Ok(before != after)
+}
+
 /// 建窗时注入的初始参数（见模块注释的「位置记忆口径」）
 #[derive(Serialize)]
 struct WidgetInit {
@@ -37,19 +61,41 @@ struct WidgetInit {
     y: f64,
     width: f64,
     pinned: bool,
-    auto_hide: bool,
+    dock_side: Option<WidgetDockSide>,
+}
+
+fn request_reveal(state: &AppState) -> bool {
+    if !read(&state.config).widget.enabled { return false; }
+    state.widget_reveal_pending.store(true, Ordering::SeqCst);
+    true
+}
+
+pub fn take_reveal(state: &AppState) -> bool {
+    let pending = state.widget_reveal_pending.swap(false, Ordering::SeqCst);
+    pending && read(&state.config).widget.enabled
+}
+
+/// 只找回已启用的悬浮窗；事件负责即时送达，pending 负责覆盖前端尚未就绪的时段。
+pub fn reveal(app: &AppHandle) {
+    let state = app.state::<Arc<AppState>>();
+    if !request_reveal(&state) { return; }
+    sync(app, &state);
+    if let Err(error) = app.emit_to(WIDGET_LABEL, "bark://widget-reveal", ()) {
+        tracing::warn!("发送悬浮窗展开请求失败: {error}");
+    }
 }
 
 /// 对齐窗口与配置（配置开关翻转 / 保存配置后调用）：
-/// 关闭 → 销毁；开启 → 不在就按记住的位置建窗，在就把配置变化推给它。
+/// 关闭 → 销毁；开启 → 不在就按记住的位置建窗。
 pub fn sync(app: &AppHandle, state: &Arc<AppState>) {
-    let enabled = read(&state.config).widget.enabled;
     let app = app.clone();
     let state = state.clone();
     // 建窗/销毁必须主线程（WebviewWindowBuilder 非线程安全，同 glow）
     if let Err(e) = app.clone().run_on_main_thread(move || {
+        let cfg = read(&state.config).widget.clone();
         let exists = app.get_webview_window(WIDGET_LABEL).is_some();
-        if !enabled {
+        if !cfg.enabled {
+            state.widget_reveal_pending.store(false, Ordering::SeqCst);
             if exists {
                 if let Some(w) = app.get_webview_window(WIDGET_LABEL) {
                     let _ = w.destroy();
@@ -58,20 +104,10 @@ pub fn sync(app: &AppHandle, state: &Arc<AppState>) {
             return;
         }
         if !exists {
-            let cfg = read(&state.config).widget.clone();
             if let Err(e) = create(&app, &cfg) {
                 tracing::warn!("悬浮窗创建失败: {e}");
             }
-            return;
         }
-        // 窗口已在：只推配置变化（目前是 auto_hide 热更新），不重建窗口——
-        // 重建会闪一下、还会丢右键菜单等前端瞬时状态
-        let auto_hide = read(&state.config).widget.auto_hide;
-        let _ = app.emit_to(
-            WIDGET_LABEL,
-            "bark://widget-config",
-            serde_json::json!({ "auto_hide": auto_hide }),
-        );
     }) {
         tracing::warn!("悬浮窗同步失败（主线程不可用？）: {e}");
     }
@@ -94,15 +130,21 @@ fn default_position(app: &AppHandle) -> (f64, f64) {
 /// Tauri 的 Monitor 全是物理像素，按各屏 scale_factor 折算成逻辑桌面空间后
 /// 再做包含判定——配置里存的 x/y 是逻辑坐标，两边必须同口径。
 /// scale_factor 统一经 [`crate::glow::scale_or_one`] 防御（§2.18）。
-fn monitor_containing(app: &AppHandle, x: f64, y: f64) -> (f64, f64, f64, f64) {
+fn monitor_containing(app: &AppHandle, x: f64, y: f64, preferred: Option<&str>) -> (f64, f64, f64, f64, f64) {
     if let Ok(mons) = app.available_monitors() {
-        for m in mons {
+        // 混合缩放时各屏的逻辑坐标范围可能重叠，优先用保存的显示器名称。
+        let selected = preferred.and_then(|name| mons.iter().find(|m| m.name().map(String::as_str) == Some(name)))
+            .or_else(|| mons.iter().find(|m| {
+                let s = crate::glow::scale_or_one(m.scale_factor());
+                let (lx, ly) = (m.position().x as f64 / s, m.position().y as f64 / s);
+                let (lw, lh) = (m.size().width as f64 / s, m.size().height as f64 / s);
+                x >= lx && x < lx + lw && y >= ly && y < ly + lh
+            }));
+        if let Some(m) = selected {
             let s = crate::glow::scale_or_one(m.scale_factor());
             let (lx, ly) = (m.position().x as f64 / s, m.position().y as f64 / s);
             let (lw, lh) = (m.size().width as f64 / s, m.size().height as f64 / s);
-            if x >= lx && x < lx + lw && y >= ly && y < ly + lh {
-                return (lx, ly, lw, lh);
-            }
+            return (lx, ly, lw, lh, s);
         }
     }
     match app.primary_monitor() {
@@ -113,9 +155,10 @@ fn monitor_containing(app: &AppHandle, x: f64, y: f64) -> (f64, f64, f64, f64) {
                 m.position().y as f64 / s,
                 m.size().width as f64 / s,
                 m.size().height as f64 / s,
+                s,
             )
         }
-        _ => (0.0, 0.0, 1920.0, 1080.0),
+        _ => (0.0, 0.0, 1920.0, 1080.0, 1.0),
     }
 }
 
@@ -131,7 +174,8 @@ fn has_saved_position(cfg: &WidgetConfig) -> bool {
 fn create(app: &AppHandle, cfg: &WidgetConfig) -> tauri::Result<()> {
     // 记住的位置；没放置过则用主屏右上角
     let (px, py) = if has_saved_position(cfg) { (cfg.x, cfg.y) } else { default_position(app) };
-    let (mx, my, mw, mh) = monitor_containing(app, px, py);
+    let preferred = cfg.dock_monitor.as_deref().filter(|_| cfg.dock_side.is_some() && !cfg.pinned);
+    let (mx, my, mw, mh, scale) = monitor_containing(app, px, py, preferred);
     // 位置夹回所在屏（屏分辨率变了不至于整卡落在屏外）
     let x = px.clamp(mx, (mx + mw - CARD_W).max(mx));
     let y = py.clamp(my, (my + mh - IDLE_H).max(my));
@@ -140,11 +184,11 @@ fn create(app: &AppHandle, cfg: &WidgetConfig) -> tauri::Result<()> {
         y,
         width: CARD_W,
         pinned: cfg.pinned,
-        auto_hide: cfg.auto_hide,
+        dock_side: if cfg.pinned { None } else { cfg.dock_side },
     })
     .unwrap_or_else(|_| "null".to_string());
 
-    WebviewWindowBuilder::new(app, WIDGET_LABEL, WebviewUrl::App("widget.html".into()))
+    let window = WebviewWindowBuilder::new(app, WIDGET_LABEL, WebviewUrl::App("widget.html".into()))
         .title("agent-bark 悬浮窗")
         .transparent(true)
         .decorations(false)
@@ -158,21 +202,38 @@ fn create(app: &AppHandle, cfg: &WidgetConfig) -> tauri::Result<()> {
         .visible_on_all_workspaces(true)
         // 不可聚焦：悬停/点击都不把焦点从用户的编辑器里抢走（鼠标事件照常）
         .focusable(false)
-        // 自动隐藏开着就建窗即隐藏：安静时登录不该闪一下卡片，
-        // 有需要关注的事件时由前端状态机（widget.ts）show 出来
-        .visible(!cfg.auto_hide)
+        // 记住的停靠状态也先隐藏，等前端布置好窄边再显示，避免整卡闪现。
+        .visible(cfg.pinned || cfg.dock_side.is_none())
         .disable_drag_drop_handler()
         .position(x, y)
         .inner_size(CARD_W, IDLE_H)
         .initialization_script(format!("window.__WIDGET_INIT__={init};"))
         .build()?;
-    tracing::info!("悬浮窗已创建（x={x}, y={y}, pinned={}, auto_hide={}）", cfg.pinned, cfg.auto_hide);
+    if cfg.dock_side.is_some() && !cfg.pinned {
+        window.set_position(tauri::PhysicalPosition::new((x * scale).round() as i32, (y * scale).round() as i32))?;
+    }
+    tracing::info!("悬浮窗已创建（x={x}, y={y}, pinned={}, dock_side={:?}）", cfg.pinned, cfg.dock_side);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_survives_frontend_loading_and_is_consumed_once() {
+        let state = AppState::new(bark_core::BarkConfig::default(), "config.json".into());
+        assert!(!take_reveal(&state));
+        assert!(request_reveal(&state));
+        assert!(take_reveal(&state));
+        assert!(!take_reveal(&state));
+        assert!(request_reveal(&state));
+        crate::state::write(&state.config).widget.enabled = false;
+        assert!(!take_reveal(&state));
+        assert!(!request_reveal(&state));
+        crate::state::write(&state.config).widget.enabled = true;
+        assert!(!take_reveal(&state), "disabled clicks must not carry over to the next enable");
+    }
 
     fn placed(x: f64, y: f64) -> bool {
         let mut cfg = WidgetConfig::default(); // 默认即哨兵 (-1, -1)

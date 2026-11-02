@@ -23,6 +23,21 @@ const historyLoaded = ref(false);
 const historyError = ref("");
 const clearError = ref("");
 const clearing = ref(false);
+const dismissError = ref("");
+const dismissing = ref<string | null>(null);
+async function dismiss(s: SessionStatus) {
+  if (dismissing.value) return;
+  dismissing.value = `${s.agent}|${s.session_id}`;
+  dismissError.value = "";
+  try {
+    await api.dismissSession(s);
+    await loadSessions();
+  } catch (e) {
+    dismissError.value = `移除失败：${e}`;
+    await loadSessions();
+  } finally { dismissing.value = null; }
+}
+
 const filter = ref<string>("");
 
 const filteredEvents = computed(() =>
@@ -116,7 +131,7 @@ function startTimers() {
   tickTimer = window.setInterval(() => {
     now.value = Date.now();
   }, 5000);
-  // 周期对账：补推可能丢失的快照，也让僵死会话（心跳静止超时）被惰性淘汰
+  // 周期对账：补推可能丢失的快照；来源核验由后台独立执行
   reconcileTimer = window.setInterval(loadSessions, 15000);
 }
 
@@ -204,6 +219,7 @@ async function clear() {
       </div>
     </div>
 
+    <div v-if="dismissError" class="warn-box mb-14" role="alert">{{ dismissError }}</div>
     <div v-if="!historyLoaded" class="empty">加载历史事件…</div>
 
     <template v-else>
@@ -217,6 +233,9 @@ async function clear() {
             <input type="checkbox" v-model="showIds" />
             显示 ID
           </label>
+        </div>
+        <div v-if="store.sessions.length >= 64" class="warn-box mb-14">
+          已达到 64 个会话的显示上限。新会话暂不加入此列表，可移除已停止的条目腾出位置。
         </div>
         <div
           v-for="row in runningRows"
@@ -242,8 +261,11 @@ async function clear() {
             <span v-if="isSubagentSession(row.session) && !row.placeholder" class="kin">← …{{ parentTail(row.session.parent!) }}</span>
             <span class="grow"></span>
             <span class="event-time">{{ row.placeholder ? "" : durationLabel(row.session) }}</span>
+            <button v-if="!row.placeholder" class="ghost" :disabled="dismissing !== null"
+              title="仅从本应用移除，不会停止 Agent；新的真实活动会恢复显示"
+              @click="dismiss(row.session)">移除</button>
           </div>
-          <div v-if="row.session.prompt" class="event-msg">{{ row.session.prompt }}</div>
+          <div v-if="row.session.prompt" class="event-msg" tabindex="0" role="region" aria-label="可滚动的事件正文">{{ row.session.prompt }}</div>
           <!-- 占位行没有统计数据（它不在快照里，数字全是 0），别显示成「0 回合」 -->
           <div v-if="!row.placeholder" class="hint mt-8">{{ statsLabel(row.session) }}</div>
           <!-- 「显示 ID」：daemon 实际下发的会话 id 与它声明的父 id。
@@ -294,7 +316,7 @@ async function clear() {
             <span class="grow"></span>
             <span class="event-time">{{ formatTime(e.timestamp) }}</span>
           </div>
-          <div v-if="e.message" class="event-msg">{{ e.message }}</div>
+          <div v-if="e.message" class="event-msg" tabindex="0" role="region" aria-label="可滚动的事件正文">{{ e.message }}</div>
         </div>
       </div>
     </template>

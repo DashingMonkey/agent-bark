@@ -21,7 +21,7 @@ const tabs = [
   { id: "events", label: "事件流", comp: EventsPage },
   { id: "agents", label: "Agents 接入", comp: AgentsPage },
   { id: "settings", label: "设置", comp: SettingsPage },
-  // 「悬浮窗」紧跟「设置」：同类偏好设置，独立成页放启用开关与自动隐藏
+  // 「悬浮窗」紧跟「设置」：同类偏好设置，独立成页放启用开关与停靠说明
   { id: "widget", label: "悬浮窗", comp: WidgetPage },
   { id: "notify", label: "通知", comp: NotifyPage },
   { id: "channels", label: "第三方通知", comp: ChannelsPage },

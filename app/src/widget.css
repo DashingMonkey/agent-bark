@@ -38,9 +38,9 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
 body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; color: var(--fg); user-select: none; cursor: default; }
-#app { position: absolute; left: 0; top: 0; width: var(--card-w); transition: opacity 160ms ease; }
-#app.fade { opacity: 0; }
-.card { width: var(--card-w); padding: 5px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; }
+#app { position: absolute; left: 0; top: 0; width: var(--card-w); }
+.card, #edge-handle::before { width: var(--card-w); border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.card { padding: 5px; overflow: hidden; }
 .session-list { max-height: var(--list-max-h); overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 .row-item { position: relative; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 7px; border-radius: 5px; }
 .row-item:hover { background: var(--hover); }
@@ -84,6 +84,22 @@ body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, san
 .ctx-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 8px; border: 0; border-radius: 5px; background: transparent; color: var(--fg); font: 11px "Segoe UI", "Microsoft YaHei", sans-serif; text-align: left; cursor: default; }
 .ctx-item:hover, .ctx-item:focus-visible { background: var(--hover); }
 .ctx-item:disabled { opacity: .5; }
+.ctx-item[hidden] { display: none; }
+#edge-handle { display: none; position: absolute; inset: 0; overflow: hidden; }
+/* Match the exact slice of the card left on screen, including its translucent background and corners. */
+#edge-handle::before { content: ""; position: absolute; box-sizing: border-box; height: var(--card-h, 44px); }
+[data-edge="left"] #edge-handle { width: 6px; right: auto; }
+[data-edge="right"] #edge-handle { width: 6px; left: auto; }
+[data-edge="top"] #edge-handle { height: 6px; bottom: auto; }
+[data-edge="left"] #edge-handle::before { right: 0; top: 0; }
+[data-edge="right"] #edge-handle::before { left: 0; top: 0; }
+[data-edge="top"] #edge-handle::before { left: 0; bottom: 0; }
+.edge-moving #app { will-change: transform; }
+.edge-collapsed #app { visibility: hidden; }
+.edge-collapsed #edge-handle { display: block; }
+.card[data-dock-preview="top"] { border-top-color: var(--blue); }
+.card[data-dock-preview="left"] { border-left-color: var(--blue); }
+.card[data-dock-preview="right"] { border-right-color: var(--blue); }
 .ctx-check { width: 12px; flex-shrink: 0; text-align: center; color: var(--green); }
 .ctx-item.checked .ctx-check::before { content: "✓"; }
 .ctx-separator { height: 1px; margin: 4px; background: var(--line); }

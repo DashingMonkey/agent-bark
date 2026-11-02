@@ -28,8 +28,8 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
             }
             let scan = tail.poll(&dir);
             // 存活心跳先行：日志活动 = 会话还活着（子代理行向父会话传播，见
-            // `LogLine::parent_session_id`），刷新 last_activity 防长静默被
-            // 判死巡检误判成意外终止。只刷已有条目、不建档（陈年会话不留痕）。
+            // `LogLine::parent_session_id`），刷新 last_activity
+            // 以反映真实日志进展。只刷已有条目、不建档（陈年会话不留痕）。
             for sid in &scan.alive_sessions {
                 crate::state::touch_session(&state, "zcode", sid);
             }

@@ -33,7 +33,7 @@ test("cached settings pages only submit their own sections", async () => {
     server: { port: 36573, token: "unchanged" }, agents: [{ kind: "kimi-code", enabled: true }],
     channels: { bark: { enabled: true, url: "old" }, webhook: null },
     rules: { aggregate_window_ms: 1500, quiet_hours: [] },
-    widget: { enabled: true, auto_hide: false, x: 10, y: 20, pinned: true },
+    widget: { enabled: true, x: 10, y: 20, pinned: true },
     notify: { enabled: true, ...Object.fromEntries(["thinking", "waiting", "completed", "failed"].map((k) => [k, { effect: "", plays: 1 }])) },
     glow: { enabled: true, monitors: "all" },
   };
@@ -65,10 +65,11 @@ test("cached settings pages only submit their own sections", async () => {
   assert.equal(saved.notify.enabled, false);
   assert.equal(saved.server.token, "unchanged");
   assert.equal(saved.agents[0].enabled, true);
-  // Even if a window closes before its event reaches this cached page, another
-  // widget setting must not restore its stale enabled flag.
-  widget.config.value.widget.enabled = true;
-  await widget.toggle("auto_hide", true);
-  assert.deepEqual(submitted.at(-1), { widget: { auto_hide: true } });
-  assert.equal(saved.widget.enabled, false);
+  // Enabling from a cached page must not restore old position/pinning fields.
+  saved.widget.x = 35;
+  saved.widget.pinned = false;
+  await widget.toggle("enabled", true);
+  assert.deepEqual(submitted.at(-1), { widget: { enabled: true } });
+  assert.equal(saved.widget.x, 35);
+  assert.equal(saved.widget.pinned, false);
 });

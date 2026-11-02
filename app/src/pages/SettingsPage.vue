@@ -13,7 +13,7 @@ const autostartError = ref("");
 const loadError = ref("");
 const errorMsg = ref("");
 
-/** 「免打扰时段」标签旁感叹号的悬停提示（与悬浮窗页的自动隐藏说明同一套） */
+/** 「免打扰时段」标签旁感叹号的悬停提示（使用统一的帮助提示样式） */
 const QUIET_TIP = "未设置，事件全天推送";
 
 // ---- 未保存提示（本页表单只在「保存」时落盘；页面被 KeepAlive 保活，切页不丢但也不落盘）----
@@ -233,7 +233,7 @@ async function toggleAutostart(on: boolean) {
   await loadAutostart();
 }
 
-// 悬浮窗的启用 / 自动隐藏已移入「悬浮窗」页（WidgetPage），本页不再管理
+// 悬浮窗的启用开关已移入「悬浮窗」页（WidgetPage），本页不再管理
 
 function stopDiagTimer() {
   if (diagTimer !== null) {
@@ -289,7 +289,7 @@ onUnmounted(stopDiagTimer);
           <button class="ghost" @click="loadAutostart">重试</button>
         </div>
       </div>
-      <!-- 悬浮窗的启用 / 自动隐藏已移入侧边栏「悬浮窗」页 -->
+      <!-- 悬浮窗的启用开关已移入侧边栏「悬浮窗」页 -->
     </div>
 
     <div class="card">

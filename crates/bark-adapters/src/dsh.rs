@@ -46,7 +46,7 @@
 //! - **回合内**：`tool/call` → 带 tool_name 的 `activity`；`tool/result` → 不节流的
 //!   `tool_finished`（不带 keepalive，允许解除等待）。其余允许上报的事件折叠为
 //!   5s 节流保活（`keepalive: true`，只续命、不改相位、不建档）；长静默另有 20s
-//!   周期保活兜底判死。等待只由真实工具活动或回合终态解除；
+//!   周期保活刷新已有条目。等待只由真实工具活动或回合终态解除；
 //! - **收尾**：`turn/end` 记下 `reason.kind` 与回合号，**静止边沿**（`agent/status: idle`
 //!   且没有回合开着）经 `reportAtRest` 报一次终态，正文取会话日志里最后一条
 //!   `assistant/message` 的 text 块，按**回合号**去重（`markSettled(keys, turn)`）；
@@ -59,7 +59,7 @@
 //! - `approval/request`（waterfall，观察完必须 `next()`）→ `permission_required`；
 //!   `user-questions/request` → `input_required`；
 //! - `agent/disposed` → 补一条 `run_aborted` 把 daemon 的条目收掉（否则被关闭的会话
-//!   要挂到 10 分钟判死才消失）。
+//!   会长期残留在显示中）。
 //!
 //! 这套选型 = DSH 官方插件规范（`cordis-plugin-development` 技能的 practices.md：
 //! 「session log 是唯一真源」「不要 poll `agent/status`」「每会话状态用 sessionProjections
@@ -593,8 +593,8 @@ const pendingTerminal = new Map();
 /**
  * 终态投递的重试节奏：本地 daemon 正常毫秒级返回，失败只可能是瞬时的
  * （事件通道打满返回 503、daemon 正在重启、连接被拒）。1s→2s→4s→8s→16s
- * 共 5 次重投，覆盖约 31 秒——远小于 daemon 侧 10 分钟判死线，也远大于任何
- * 一次 GC / 建窗 / 主线程卡顿。全部失败后放弃：状态表最终由判死巡检收场。
+ * 共 5 次重投，覆盖约 31 秒，容忍短暂的 GC / 建窗 / 主线程卡顿。
+ * 全部失败后放弃：保留最后已知状态，等待后续可靠信号或本地移除。
  */
 const TERMINAL_RETRY_BASE_MS = 1000;
 const TERMINAL_RETRY_MAX_MS = 16000;
@@ -647,8 +647,8 @@ const LIVENESS_MIN_MS = 5000;
  * DSH 0.1.5-rc.3 起，web 打开一个工作区就**预创建一个空会话**（实测 2026-09-28：
  * 会话日志只有 header，但 agent 照样走 agent/status: running，甚至还会发零星的
  * 生命周期类 session/event——第一版门槛「任何事件都算」挡不住，ProNet 实测幻影
- * 依旧）。不挡的话 daemon 凭空建档「思考中」：该条目永远没有终态，挂满 10 分钟
- * 被判死巡检清掉（红光 + 失败音，不弹通知）。
+ * 依旧）。不挡的话 daemon 凭空建档「思考中」：该条目永远没有终态，
+ * 会持续显示错误的运行状态。
  *
  * ⚠️ 三个类型名里两个（tool/call、assistant/message）在插件别处已在使用、
  * turn/start 与已验证的 turn/end 同族——三个同时被 DSH 改名的概率很低。
@@ -952,7 +952,7 @@ function keepAliveIfOpen(session, keys, open) {
   return open;
 }
 
-/** 静默期保活心跳的节奏：回合开着就定期补，别让长工具 / 长子代理被 daemon 判死。 */
+/** 静默期保活心跳的节奏：回合开着就定期补，刷新长工具 / 长子代理的活动时间。 */
 const HEARTBEAT_INTERVAL_MS = 20000;
 /**
  * 静止边沿的宽限窗：`turn/end` 与 `agent/status: idle` 是两条通道，帧序没有保证
@@ -973,7 +973,7 @@ const lastError = new Map();
  * 回合开着时的周期保活心跳。
  *
  * 存在理由：父会话等子代理 / 等审批 / 等回答可以静默十几分钟，其间没有任何会话事件；
- * daemon 侧「心跳静止 10 分钟判死」会把这条行误判成意外终止（红光 + 失败音），
+ * 周期补充可以让最后活动时间反映插件仍在观测开放回合，
  * 心跳带 `keepalive: true`：只续命，保留等待相位且绝不建档。
  * 等待结束由真实 tool/result / tool/call 或回合终态确认，不能从计时器推断。
  *
@@ -1302,7 +1302,7 @@ function eventBody(f) {
   const toolName = asText(o.toolName);
   if (toolName) body.tool_name = toolName;
   // 血缘：daemon 侧据此把存活心跳向祖先递归传播（state::touch_ancestors），
-  // 子代理干活时父会话才不会被「心跳静止判死」误杀
+  // 使父会话的最后活动时间也反映子代理进展
   const parent = asText(o.parentSessionId);
   if (parent) body.parent_session_id = parent;
   // 纯保活心跳：daemon 侧只续命、**绝不建档**（见 bark-core NormalizedEvent::keepalive）。
@@ -1369,7 +1369,7 @@ function finishTerminal(sessionId) {
   markSettled(keys, turn);
 }
 
-/** 重投一次待发终态；仍失败则排下一次，重试次数用尽就放弃（交给 daemon 判死收场）。 */
+/** 重投一次待发终态；仍失败则排下一次，重试次数用尽就放弃（保留最后已知状态）。 */
 async function retryTerminal(sessionId) {
   const job = pendingTerminal.get(sessionId);
   if (!job) return; // 已被新回合取消 / 已送达
@@ -1392,7 +1392,7 @@ async function retryTerminal(sessionId) {
  * 投递一条终态（run_completed / run_failed / run_aborted）并等它有着落。
  *
  * 与心跳的本质区别：心跳丢了下一跳会补上，终态**只报一次**——丢了 daemon 就再也
- * 不知道这个回合结束了（「运行中」条目挂到判死、流光停在思考蓝，用户实测过）。
+ * 不知道这个回合结束了（「运行中」条目一直保留、流光停在思考蓝，用户实测过）。
  * 因此这里必须等结果：首次投递失败就进重投队列，成功了才置「已终态」。
  * 返回 Promise 是为了让 turn-stopping 这个 serial 监听把首投等完（不阻塞 DSH 收尾，
  * 只保证「报过没有」这件事在回合收尾前有确定结论）。
@@ -1774,7 +1774,7 @@ export function apply(ctx) {
 
   // 7) 会话销毁：**先补一条「已中止」把 daemon 的条目收掉**，再清记忆表
   //    （长驻 dsh 进程里这几张表必须有界）。
-  //    少了这条收尾，被关闭的会话会一直挂在 daemon 的「运行中」表里，直到 10 分钟判死
+  //    少了这条收尾，被关闭的会话会一直挂在 daemon 的「运行中」表里
   //    ——用户实测症状之一：关掉会话后卡片还留着一条「思考中」。
   ctx.on("agent/disposed", (payload) => observe(() => {
     const agent = payload && payload.agent;
@@ -2003,7 +2003,7 @@ mod tests {
     /// 回归的是用户实测的「回合早已结束、流光仍是思考蓝、面板卡在『执行工具』」：
     /// 旧的 `settle()` 先 `markSettled()` 再 fire-and-forget POST，一次瞬时失败
     /// （事件通道打满 503 / daemon 重启 / 连接被拒）就把这条终态永久丢掉，idle 兜底
-    /// 也被「已终态」挡住，daemon 的「运行中」条目只能等 10 分钟判死。
+    /// 也被「已终态」挡住，daemon 的「运行中」条目会一直残留。
     /// 这里锁住修复后的三条不变量：看状态码、失败重投、送达才置位。
     #[test]
     fn generated_plugin_terminal_delivery_is_acknowledged_and_retried() {
@@ -2108,7 +2108,7 @@ mod tests {
             "血缘字段与读取兜底必须在: {js}"
         );
         // 5) 建档门槛：空会话（DSH rc.3+ 开屏预创建、零事件）不发心跳——
-        //    否则「思考中」幻影挂 10 分钟后被判死（红光 + 失败音）。
+        //    否则会留下没有终态的「思考中」幻影。
         //    门槛分三层：官方回合投影（turnBoundary）→ 本进程日志推理（turn/start…turn/end）
         //    → 最老版本的 running / 见过回合级事件。**绝不**用「最近有没有事件」推断。
         assert!(

@@ -4,6 +4,10 @@
 
 改 adapter 之前请先读这里。**文档与实测冲突时以实测为准**——文中每处结论都标了实测日期/版本，官方文档滞后是常态（已有两例：Qoder CN 的配置路径、Qoder 的授权事件）。
 
+**2026-10-29 状态策略更新**：取消公共层及 Kimi Work、豆包工作降级分支的静默超时终止。每 5 分钟与托盘「检测运行状态」触发来源核验；缺少可靠证据时保留最后已知状态。下文历史排障记录中的「10 分钟判死」「15 分钟静默中止」不再是当前行为。首次启动仍避免重放陈旧历史会话。事件流可「移除」本地会话显示，不停止宿主、不生成终态或通知；缓存心跳不会立即复活它，真实新活动可恢复。Kimi Work 与豆包工作降级分支在日志连续 5 分钟无增长后停发合成心跳，保留最后状态。
+
+Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`（含命名空间前缀）归为等待确认。同步回答由工具返回解除；异步 `accepted=true` 仅表示问题提交，等待真实用户消息或终态才解除。本地 JSONL 补偿按会话、回合和时间戳过滤提问/回答、完成、失败及中止；SQLite 只用于定位 rollout 文件，不以文件停止增长推断终止。新增测试使用脱敏的本机记录结构。
+
 ---
 
 ## 0. 统一的接入模型
@@ -32,7 +36,7 @@
 
 所有接入共用 `NormalizedEvent / EventKind → state.rs 会话状态机 → 事件流、悬浮窗、流光和通知`。适配器负责把宿主信号翻译为统一事件，并补齐结束原因；状态机负责跃迁、移除运行态和抑制重复终态。正常完成、明确取消、执行失败分别为 `run_completed`、`run_aborted`、`run_failed`，不应仅凭宿主字段名 `completed` 就认定成功。前端事件流和悬浮窗共用事件标签，取消统一展示「已终止」。
 
-> **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败仍由回合结束信号 + 心跳判死兜底。
+> **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败只由明确失败信号确认；Codex 异步提问未回答时保留等待相位，工具事件仍正常记录。
 
 > **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 要从回合记录区分取消与完成、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
 
@@ -47,7 +51,7 @@
 | OpenCode | `session.error` 带 `MessageAbortedError`（社区插件实证，未实测） | 立即释放（run_aborted，其后的 idle 被压制） |
 | WorkBuddy | 回合 JSONL 的 assistant/incomplete + skipRun + `Interrupted by user`；运行中被归档也视为终止 | 下一轮轮询释放（约 5 秒） |
 | TraeWork | `chat_turn.turn_status=canceled`（实测） | 立即释放（run_aborted） |
-| TraeCode | **无官方事件**；补读本地 renderer.log 的 canceled 终态 | 秒级清除运行态；日志不可用时退回 10 分钟判死 |
+| TraeCode | **无官方事件**；补读本地 renderer.log 的 canceled 终态 | 秒级清除运行态；日志不可用时保留最后已知状态，可本地移除 |
 | Codex | `Interrupt` / `SessionEnd`（当前 hooks 映射） | 收到信号后释放（需要已信任对应 hooks） |
 | Grok CLI | `StopCancelled`（官方事件，未实测） | **立即释放**——显式的用户取消信号，比 Claude 系干净 |
 | Kimi Code | `Interrupt`（官方事件，未实测） | **立即释放**（显式中断信号） |
@@ -56,7 +60,7 @@
 | Cursor | `stop.status=aborted`；`sessionEnd.reason` 按完成/取消/失败分类 | 收到信号后释放；已做载荷测试，未现场实测 |
 | Copilot CLI | `sessionEnd.reason=abort/user_exit` 释放；complete 为完成，error/timeout 为失败 | 会话级信号；未现场验证每次取消是否触发 |
 | Gemini CLI / Qwen Code / Factory Droid | `SessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
-| Antigravity | **无**（官方就没有会话级/中断事件） | 卡原状态到 10 分钟判死；继续对话则刷新 |
+| Antigravity | **无**（官方就没有会话级/中断事件） | 保留最后已知状态；继续对话则刷新，可本地移除 |
 
 **三条硬约束**（见 `crates/bark-cli/src/lib.rs` 模块注释，改 hook 逻辑必须守住）：
 1. 永远退出码 0——绝不能阻塞 agent；
@@ -78,7 +82,7 @@
 - **残留只有我们自己的痕迹**：上面那个 `.bak`，以及「文件原本不存在、由我们创建」时留下的空壳（如 `{"hooks":{}}`）。重新开启是幂等的，不会重复追加条目；
 - **关闭 ≠ 宿主立即停止上报**：插件型（DSH / OpenCode）删的是磁盘文件，宿主进程里已加载的插件仍在内存中继续 POST，必须重启宿主才彻底停止。在宿主重启前，daemon 会按开关忽略该 agent 的事件（只进事件流与历史，不参与状态机、不亮流光、不通知——见 `run_pipeline` 里「已关闭接入的 agent」那道门），所以不会有残留通知；
 - **关闭即从「运行中会话」面板消失**：管道那道门要等该 agent 的下一条事件才清表，而 hook 型 agent 关掉后可能再也不上报，所以关闭开关时会立刻摘掉它的会话条目并推一次快照（`drop_agent_sessions_and_sync`，两条路径共用），`list_active_sessions` 也按开关过滤（页面 15s 对账一次）；
-- **摘完会话必须把流光重新对齐**：同一个 `drop_agent_sessions_and_sync` 会在表空时收回光效（终态绿/红除外，它们自己淡出）、表非空时按剩余会话重新推导——否则关掉正在跑的最后一个 agent 会留下一盏熄不掉的灯（它的事件从此被门丢弃，判死巡检也因表已空而无变化、不会触发收回），或把僵尸橙色（等待指示）留在屏幕上；
+- **摘完会话必须把流光重新对齐**：同一个 `drop_agent_sessions_and_sync` 会在表空时收回光效（终态绿/红除外，它们自己淡出）、表非空时按剩余会话重新推导——否则关掉正在跑的最后一个 agent 会留下一盏熄不掉的灯（它的事件从此被门丢弃，后续核验也无法再从该接入取得事件），或把僵尸橙色（等待指示）留在屏幕上；
 - `pending.jsonl`（离线兜底队列）里可能还有关闭前落盘的事件，会在下次启动补投一次（与开关无关；靠事件 id 去重，不会重复通知）。
 
 ---
@@ -97,7 +101,7 @@
 
 **中止信号（2026-09 按官方文档补齐，⚠️ 本机未安装 Claude Code，未实测）**：官方 hooks 文档（code.claude.com/docs/en/hooks，33 事件）明确 **Stop 在用户中断（Esc）时不触发**——中断的回合收不到完成信号。归途有二：
 - `SessionEnd`（reason: clear / logout / prompt_input_exit / other）：会话级结束。中断回合后**退出会话**就靠它释放「运行中」条目（归一成 run_aborted，不通知不亮失败色）；正常回合 Stop 之后紧跟的 SessionEnd 落在 10s 终态回声宽限窗内被抑制，更晚退出会记一条「已中止」（会话确实结束了，语义成立）。
-- **中断后不退出、也不再继续**的会话仍无信号，只能等 10 分钟判死（能力边界，非遗漏）。
+- **中断后不退出、也不再继续**的会话仍无信号，保留最后已知状态，可从事件流移除本地显示（能力边界，非遗漏）。
 另：`StopFailure`（回合因 API 错误结束）是 Claude Code 唯一的回合真失败信号，较新版本才有；若老版本对未知事件键严格校验会丢整份 hooks——真遇到就关掉开关回退，事件流可观测。
 
 ---
@@ -117,7 +121,7 @@
 - TRAE 的 `Notification` 包括 `permission_prompt`（权限确认）、`ask_user_question` / `document_review` / `browser_interaction`（输入等待），以及 `idle_prompt`（任务完成）。完成由 `Stop` 上报，不能将 `idle_prompt` 重新解释为等待。
 - 首次或更新配置后，检查 **设置 > Hooks** 的全局配置已启用，且运行方式为 **本地自动运行**；同页可打开 **Agent Hooks** 执行日志。说明在启用接入后的 message 和卡片提示中显示，接入页不再显示顶部「接入更新提醒」。
 - TRAE **没有失败事件**，所以收不到 `run_failed`；
-- **手动中止不发 Hook**：2026-10-14 本机日志确认只有 SessionStart / UserPromptSubmit，但 `renderer.log` 的 `[DoneHandler] Stream done event received` 带 `status: "canceled"` 和准确的 sessionId。GUI 每秒增量读取国内版/国际版最新启动目录下各窗口日志，合成 RunAborted（静默移除运行态，不报任务失败）。日志时间早于会话最新活动时忽略，管道消费时再次校验，防止旧中止清掉新回合。此补充机制依赖非官方日志格式，日志缺失或版本变化时仍由 10 分钟判死兜底；
+- **手动中止不发 Hook**：2026-10-14 本机日志确认只有 SessionStart / UserPromptSubmit，但 `renderer.log` 的 `[DoneHandler] Stream done event received` 带 `status: "canceled"` 和准确的 sessionId。GUI 每秒增量读取国内版/国际版最新启动目录下各窗口日志，合成 RunAborted（静默移除运行态，不报任务失败）。日志时间早于会话最新活动时忽略，管道消费时再次校验，防止旧中止清掉新回合。此补充机制依赖非官方日志格式，日志缺失或版本变化时保留最后已知状态；
 - `PreToolUse` 是阻塞型 hook，我们的子命令恒为放行（exit 0、不输出 stdout），不影响工具执行；
 - 心跳（activity）是「思考中 / 执行工具」实时状态的来源，缺了它流光只会亮等待 / 完成 / 失败色，不会亮思考色。
 
@@ -190,7 +194,7 @@
 
 2026-10-15 本机确认额度耗尽时只留下 `task_complete.error.codex_error_info = "usage_limit_exceeded"`，没有结束 hook。daemon 每秒增量读取已跟踪会话的 transcript，将带明确 `error` 的 `task_complete` 补为 `run_failed`，额度不足显示「额度已用完」。日志路径优先取 hook 的 `transcript_path`，缺失时只读查询 `CODEX_HOME`（默认 `~/.codex`）下 `state_5.sqlite` 的对应会话。只匹配当前 `turn_id`，不重放历史错误；普通工具错误和可重试错误不触发回合失败。失败事件进入原有历史、通知、流光和音效管道。
 
-桌面端 `composer_predictions` 会自动请求下一句输入建议，也会触发 hooks。按已验证的内部 prompt 前缀标记并过滤该回合的后续事件，避免生成额外「思考中」行。已结束回合按 `turn_id` 拦截迟到工具事件，不再只依赖 10 秒回声窗口；用户的新回合正常接入。上述日志格式、数据库和内部 prompt 都是非官方补充信号，格式变化、缺少回合标识或日志不可读时仍由原有超时机制兜底。
+桌面端 `composer_predictions` 会自动请求下一句输入建议，也会触发 hooks。按已验证的内部 prompt 前缀标记并过滤该回合的后续事件，避免生成额外「思考中」行。已结束回合按 `turn_id` 拦截迟到工具事件，不再只依赖 10 秒回声窗口；用户的新回合正常接入。上述日志格式、数据库和内部 prompt 都是非官方补充信号，格式变化、缺少回合标识或日志不可读时保留最后已知状态；异步等待不吞掉工具活动与失败，只有回答、明确工具错误或回合终态解除；必要时可本地移除。
 
 Windows PowerShell 下命令使用 `& 'D:/path/AgentBark.exe' hook ...`。2026-10-14 本机复现旧双引号路径写法报 `Unexpected token 'hook'`；启动对齐会修正旧命令，保留用户其他 hooks。
 
@@ -237,7 +241,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 - **`matcher` 键整个省略**：文档说缺省/空串/`*` 都是「匹配全部」，但有严格解析器会把空串当非法、进而丢弃整份来源；
 - **`PermissionRequest` 是阻塞型，hook 可以返回 Allow/Deny**，而且**同事件 hook 串行执行、后写的决定覆盖先写的**（一个放行 hook 能悄悄盖掉别人写的 deny）。我们只通知：**永远不输出决定**（stdout 为空、退出 0），任何异常都 fail-closed 回 ZCode 自己的权限流程；条目 `timeoutMs` 也只给 5000（同类实现给这个事件配到 600000，是因为它真的要替用户做决定）。代价：授权提示会多等我们一下——daemon 在跑是毫秒级，daemon 未运行最坏约 2 秒（bark-cli 读 stdin 的 2s 超时）；
 - **只有 7 个事件**，没有 `Notification`、`SessionEnd`、子代理生命周期事件。**实测：手动终止（停止按钮 / Esc）一个 hook 都不发**——两种时机都验过：① 模型思考中中断，探针停在 `PostToolUse`；② **工具正在执行时中断**（让它跑 `sleep 180`，在 130 秒内中断），探针停在 `PreToolUse`。更细的一层：ZCode 内部其实**试图**调 `PostToolUseFailure`，但 1ms 内就把 hook 进程取消了（日志里是 `hook.run.failed`），所以我们什么都收不到；文档里的 `is_interrupt` 字段在当前版本的中断路径上从未出现。
-  **对策（非官方）**：daemon 会**每秒增量读一次 ZCode 的本地日志**（`~/.zcode/cli/log/zcode-<日期>.jsonl`），识别中断记录后合成一条 **`run_aborted`（中止）**——效果是**按停止后约 1 秒内**会话清出列表、流光在没有别的会话在跑时直接收起（不亮失败色、不亮完成色、不通知；与 Qoder 的 `SessionEnd`、DSH 的 `aborted` 统一到同一类）。判据见下文「中断信号」；应用升级改了日志格式时会自然退化回判死超时，不会误报。不想让它读日志，关掉 ZCode 接入开关即可（那时它完全不工作）。
+  **对策（非官方）**：daemon 会**每秒增量读一次 ZCode 的本地日志**（`~/.zcode/cli/log/zcode-<日期>.jsonl`），识别中断记录后合成一条 **`run_aborted`（中止）**——效果是**按停止后约 1 秒内**会话清出列表、流光在没有别的会话在跑时直接收起（不亮失败色、不亮完成色、不通知；与 Qoder 的 `SessionEnd`、DSH 的 `aborted` 统一到同一类）。判据见下文「中断信号」；应用升级改了日志格式时保留最后已知状态，不推断结束。不想让它读日志，关掉 ZCode 接入开关即可（那时它完全不工作）。
   「等你输入」只覆盖走 `PreToolUse`/`PermissionRequest` 的提问（`AskUserQuestion`），计划模式批准（`ExitPlanMode`）按「需要确认」通知——这类交互本身**不能**由 hook 代替你回答；
 - **`PostToolUse` 注册为 `tool_finished`（工具收尾）**：它是**等待状态解除的唯一信号**——答完 `AskUserQuestion` / 批完权限后，agent 要先思考一段时间才可能调下一个工具，这期间没有 `PreToolUse`（下一次工具开始才有）、没有 `UserPromptSubmit`（新回合才有）。曾经以「进程开销翻倍」为由不注册它，实测代价算错了方向：每轮多 3 次起进程（毫秒级）几乎无感，而「答完问题后等待色卡几十秒、直到下一个工具才开始」是用户每天可见的（实测复现）。它当心跳处理：相位回落思考中、会话留在表里；不通知、不入历史、不响音效（与 `activity` 同口径的纯状态信号）。注意收尾时点=工具结束：被批准工具**执行期间**相位仍是等待中（那段时间本来就没有事件），收尾才解除；乱序晚到（Stop 之后才到）由状态机的回声防护抑制，不会复活刚结束的会话。
 - **子代理不触发任何 hook（2026-10-21 实测，3.16.2）**：派生一个只读子代理跑完整回合，`Stop` / `SessionStart` 零投递（daemon 侧事件 id 落盘零增量），同一时刻主会话 hook 照常工作——hook 通道对子代理**全盲**。子代理的识别与显示全部走日志通道（见下文「子代理语义」）；hook 载荷路径仍保留防御式判定（显式布尔 `is_subagent`/`subagent` 与 `sess_subagent_*` 命名——旧代确实发过子代理 hook，未来版本也可能恢复），但「`agent_type` 非空即判子代理」的通用启发式对 ZCode 会误伤主会话（`agent_type` 是 `SessionStart` 的可选普通字段），适配器里已显式覆盖；
@@ -258,13 +262,13 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 
 **中断信号**（看门狗用的判据，跨 4 天日志实测 12 次中断 1:1 对应）：`v4.stop.foreground_execution_inspected` 且 `runtimeStopKind == "stopped"`，或一条**顶层没有 `event` 字段**的 warn 记录其 `context.error` 含 `cancelled`。**不能**用 `turn.failed` 判：实测 20 条里只有 12 条是中断，其余是真实的模型/工具失败（那种情况 hook 正常上报，再合成一条就重复了）。看门狗还有两道保险：只对「会话表里还在跑」的会话生效（正常回合的 `Stop` 已清表 → 不重复通知），同一会话 30 秒内只合成一次（两条记录相隔 25ms）。
 
-**会话 id 单版本口径**（2026-10-21 收敛）：只认现行格式——主会话 `session_<32hex>`（3.16.2 起实测，日志、artifacts、SQLite 同源）、子代理 `sess_subagent_agent_<uuid>`（**子代理不换前缀**：bundle 里 `sess_` 前缀与 `subagent_agent_` 标记是两个独立常量，前缀更名只施加于主会话；曾推定 `session_subagent_*`，实测不存在）。历史背景：2026-10-20 曾因 `session_` 不含 `sess_` 前缀（第 5 个字符是 `i` 不是 `_`）整行丢弃新版日志——当日 GLM 额度耗尽连写 5 条 `status:"failed"` 的 `turn.failed`（`cause.message = "exceed quota limit"`，providerCode 1005），零通知、会话卡「思考中」直到心跳判死兜底。旧代 `sess_<uuid>` 主会话不再支持：ZCode 全量自动更新，没有停在旧版的用户；真出现旧版日志时行为是退回判死超时，不误报。
+**会话 id 单版本口径**（2026-10-21 收敛）：只认现行格式——主会话 `session_<32hex>`（3.16.2 起实测，日志、artifacts、SQLite 同源）、子代理 `sess_subagent_agent_<uuid>`（**子代理不换前缀**：bundle 里 `sess_` 前缀与 `subagent_agent_` 标记是两个独立常量，前缀更名只施加于主会话；曾推定 `session_subagent_*`，实测不存在）。历史背景：2026-10-20 曾因 `session_` 不含 `sess_` 前缀（第 5 个字符是 `i` 不是 `_`）整行丢弃新版日志——当日 GLM 额度耗尽连写 5 条 `status:"failed"` 的 `turn.failed`（`cause.message = "exceed quota limit"`，providerCode 1005），零通知、会话卡「思考中」直到心跳判死兜底。旧代 `sess_<uuid>` 主会话不再支持：ZCode 全量自动更新，没有停在旧版的用户；真出现旧版日志时保留最后已知状态，不推断结束。
 
 **子代理语义**（ZCode 版，2026-10-21 实测 + 实现）：子代理会话**不触发任何 hook**，识别与显示全部由日志看门狗完成——子代理行的 `turn.started` / `tool.call.started` / `turn.completed`（都带 `context.parentSessionId` 血缘与 `context.toolName`）被折成合成事件塞进管道：`Activity`（思考中/执行工具，建档）与 `RunCompleted`（摘表），带 `parent_session_id` 与 `is_subagent`。建档、挂树（悬浮窗 `↳` 缩进 + 「子代理」标记，与 DSH 同一套前端）、向父会话传播存活全部复用既有机制；通知 / 音效 / 全屏特效三道 `is_subagent` 门拦着，纯显示不扰人。子代理的 `turn.failed` 走与主会话相同的终态信号路径（cancelled → 中止、其余 → 失败），照常合成以收掉会话条目——早年「子代理失败不合成」的拒绝是因为特效通道还没有门，如今门已齐（`burst_for_event` / `edge_kind`）。缺血缘的子代理行不折活动（挂不了树，宁可不显示）；`turn.completed` 摘表后若同一子代理被 `SendMessage` 续开新回合，下一条 `turn.started` 会重新建档。
 
 另外两条**通用**的加载/行为规则值得记住：
 - **hooks 配置里任何一条不合规，整份配置都会被拒**（`config.file.invalid`，日志给出精确路径如 `hooks.events.PostToolUse.0: Invalid input: expected object, received null`），不是只有那一条失效——BOM 那次是同一个机制；
-- ZCode 的 Bash 调用会带**自己声明的超时**（上例 `tool_input.timeout = 200000` 毫秒），理论上可用来「按工具真实预期时长」自适应判断静默是否合理（当前实现没有用，仍按固定时长判死）。
+- ZCode 的 Bash 调用会带**自己声明的超时**（上例 `tool_input.timeout = 200000` 毫秒），理论上可用来「按工具真实预期时长」自适应判断静默是否合理（当前实现没有使用；静默不用于推断终止）。
 
 ---
 
@@ -318,7 +322,7 @@ Z.ai（智谱 GLM）的编程 Agent（Electron 桌面应用 `ZCode.exe`；**实�
 | `agent/error` | emit | 只记正文 | 请求级错误 DSH 会重试；真正的失败落在 `turn/end` 的 `reason=error`。没有 reason 却又出过错时，收尾按失败报（不谎报完成） |
 | `approval/request` | waterfall | `permission_required` | `toolName：reason`；观察完必须 `next()` |
 | `user-questions/request` | waterfall | `input_required` | 首个问题的 `header：question`；同样必须 `next()` |
-| `agent/disposed` | emit | `run_aborted` | 会话被关闭时把 daemon 的条目收掉（否则要挂到 10 分钟判死才消失），随后清记忆表 |
+| `agent/disposed` | emit | `run_aborted` | 会话被关闭时把 daemon 的条目收掉（避免缺失结束事件时显示一直残留），随后清记忆表 |
 
 **回合状态怎么判（2026-09-30 重写，这是本节的核心）**：
 
@@ -350,7 +354,7 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
   接入协议、事件顺序和已知边界见 [父子任务状态](task-lifecycle.md)。
 - **子代理活动驱动流光、也在界面上可见，但不打扰人**：子代理心跳照发（`is_subagent` 门在 daemon
   侧只挡通知/音效/全屏特效/悬浮窗弹出），并经 `parent_session_id` 向祖先递归传播存活（daemon 侧
-  `touch_ancestors_at`）——否则子代理跑 20 分钟、父会话零心跳会被判死误亮失败色。
+  `touch_ancestors_at`）——让父行最后活动时间反映后代仍在工作。
   同一条 `parent_session_id` 血缘边还**下发到前端**（`SessionStatus.parent` = 父会话 id 本体，
   展示时才截尾 6 位），悬浮窗与事件流据此渲染 `↳` 层级 + 「子代理」标记（悬浮窗的标签是
   `X 子代理`，口径见 doc/configuration.md 的「子代理怎么显示」）；
@@ -446,9 +450,9 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
 
 | 契约点 | 失效症状 | 插件侧位置 |
 | --- | --- | --- |
-| **读服务必须走 `ctx.get("sessionProjections")`**（属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上直接抛 `cannot get property … without inject`，Cordis 4.x） | 「等待输入/等待确认」**答完不解除**（一直橙到终态才变完成）；长回合被 daemon 判死误亮红光；派生/长工具静默期没有续命 | `projectionsOf`（唯一读点）/ `startHeartbeat` 的闸门 |
+| **读服务必须走 `ctx.get("sessionProjections")`**（属性访问 `ctx.sessionProjections` 在**未声明 `inject` 的插件**上直接抛 `cannot get property … without inject`，Cordis 4.x） | 「等待输入/等待确认」**答完不解除**（一直橙到终态才变完成）；派生/长工具的活动时间无法刷新 | `projectionsOf`（唯一读点）/ `startHeartbeat` 的闸门 |
 | **`agent/disposed` 会在回合还开着时到达**（agent 生命周期被释放，例如 owner fiber 卸载后重新附着同一会话）；它**不保证**随后有 `turn/start` | 重新附着后保活链消失，长回合可能被 daemon 错误判为失联；等待解除另由真实工具活动负责 | `keepAliveIfOpen`（`busyOf` 的返回值上补排）/ `agent/status: running` 分支的 `busyOf(session, keys)` |
-| `sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），或静默期被 daemon 判死误亮失败色 | `boundaryOf` / `turnOpenOf` |
+| `sessionProjections.stateOf(session, "turnBoundary").openTurnStartSeq` | 回合收尾不再发生（面板永远「思考中」），且无法确认后续回合边界 | `boundaryOf` / `turnOpenOf` |
 | `agent/status` 的边沿语义（`idle` = 没有驱动器还在排队或运行） | 完成通知不来、或提前来；**边沿还可能根本不出现**（2026-09-30 实测：DSH 重启后连续两个回合收尾都没有 idle）——所以收尾**不能只挂在它上面**，插件用 `turn/end` + `REST_GRACE_MS` 宽限窗兜底 | `agent/status` 监听 + `scheduleRest` |
 | `tool/result` 为真实工具收尾，纯保活不改相位 | `tool/result` 缺失时答完仍等待；把定时器当真实活动则会在未回答时误解除等待 | `session/event` 的 `resumed` / `postLiveness` / daemon 的 `ToolFinished` 分支 |
 | `session/event` 的 `turn/start` / `turn/end`（后者带 `data.turn` 与 `data.reason.kind`） | 完全不建档（面板空白）、或按回合去重失效（重复通知） | `session/event` 监听 |
@@ -473,7 +477,7 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
 **坑**：
 - 非官方方案：**应用升级可能失效**（已在 2.137.1 实测校准状态机），UI 上标「监控型」；
 - 读库采用「先复制 db 与 `-wal` 到临时目录再打开」，避免与宿主写锁冲突；两次复制无法保证同一时点，极端情况下会读到撕裂快照（单轮失败可接受，下轮自愈）；
-- 监控型拿不到每回合的 `UserPromptSubmit`/`PreToolUse`，所以靠周期性心跳（activity）维持「运行中」——否则 daemon 侧 10 分钟无活动会把会话判死，流光永远不亮思考色。**「接入成功但流光不亮」多半就是心跳没发出去**。
+- 监控型拿不到每回合的 `UserPromptSubmit`/`PreToolUse`，因此首次运行信号负责建档点亮，周期性心跳（activity、keepalive）只刷新已有会话的活动时间，不建档或改变相位。相同数据库状态无法证明宿主仍在线；没有明确终态时保留最后状态，可本地移除。
 - 状态跃迁映射：`working/planning` → `pending` = 等输入；→ `completed` 默认完成；→ `terminated`/`error` 默认失败；运行中被 `archived` = `run_aborted`。在完成/失败跃迁前，用回合记录中明确的取消原因覆盖为 `run_aborted`，再交给统一状态机。
 - **2026-10-14 取消误报完成修复**：本机 WorkBuddy 手动停止时 SDK 写 `TURN_COMPLETED / stopReason=cancelled`，会话库却仍为 `completed`。对应 JSONL 写 `type=message, role=assistant, status=incomplete, providerData.skipRun=true, providerData.error.message="Interrupted by user"`。仅检查最后一条有效回合记录（跳过 session-meta/file-history-snapshot），且记录时间必须在会话 `updated_at` 前 5 秒内，避免旧取消、工具失败、正文提及取消、继续对话之后的历史记录被误用。每次终态跃迁最多读取 256 KiB 尾部；记录缺失/格式不匹配时保留原数据库映射，不能保证识别取消。
 
@@ -503,7 +507,7 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
 - **非官方机制，TraeWork 升级可能失效**（换密钥常量 / 改 schema）：可用性探针（HMAC 校验 + 解密 + 查询，重试 3 次）失败时 UI 给出具体原因；核对工具 `tools/traework-probe.mjs`（`verify` / `strings` / `decrypt` / `dump` / `sql` 子命令，`strings` 扫 `ai_agent.dll` 判断密钥常量是否变更，用法见文件头注释），以及本机冒烟测试 `cargo test -p bark-adapters --lib -- --ignored`；
 - **`-wal` 必须一起看**（2026-09-24 事故教训）：宿主是 SQLite WAL 模式，新提交先落 `database.db-wal`、checkpoint 后才进主库，实测 `-wal` 常驻 4-5MB（上千帧）——旧实现只解主库、轮询指纹也只看主库，导致 checkpoint 之前的新回合**全程不可见**（当天两次提问均无光效，事件一个都没发）。现在 `decrypt_db` 按 SQLite WAL 恢复语义把 `-wal` 帧叠回明文库（checksum 链 + 页级 HMAC + 只到最后提交帧，RESTART checkpoint 残留的陈旧尾帧被链式校验排除），轮询指纹同样盯住 `-wal`；
 - 每轮把整库读入内存再解密（75MB 级，AES-NI 下几十毫秒），结果写临时文件后 rusqlite 只读查询；
-- 与 WorkBuddy 同款「先快照再推断」：撕裂快照单轮失败可接受、下轮自愈（连续失败每 12 轮 warn 一次）；运行中回合的行从库里消失（会话被删）时主动发 `run_aborted` 闭环，不让 daemon 侧 10 分钟后僵死判死误亮失败色。
+- 与 WorkBuddy 同款「先快照再推断」：撕裂快照单轮失败可接受、下轮自愈（连续失败每 12 轮 warn 一次）；运行中回合的行从库里消失（会话被删）时主动发 `run_aborted` 闭环，避免已经删除的会话长期残留在显示中。
 
 **备选路线（未采用，供后续参考）**：TraeWork 个人版支持 **MCP**（设置里手动配置 stdio/HTTP server；或项目级 `.trae/mcp.json`，需在 设置 > MCP 打开「启用项目级 MCP」）与 **Skill**（`SKILL.md` 放 `%userprofile%/.trae-cn/skills/` 全局生效，或项目 `.trae/skills/`；规则可用全局规则或 `AGENTS.md`）。组合方式：做一个 notify 型 MCP 工具 + Skill/规则要求模型在关键节点调用。缺点：**模型可能忘调**（可靠性不如库轮询）、事件粒度糙、拿不到干净的中止信号。适合做补充（如回合内的细节信号），不适合做主路线。
 
@@ -511,7 +515,7 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
 
 ## 11. Gemini CLI
 
-> **2026-09 广度扩展**：以下 9 节（§11–§19）均基于**官方 hooks 文档 + AgentPet / lazyagent / tokscale 等开源实现交叉验证**接入，标注「未实测」的映射没有实机验证过；写错的事件名或路径由启动自愈 + 10 分钟判死兜底，实机探针（§23）核对后请回填实测结论。
+> **2026-09 广度扩展**：以下 9 节（§11–§19）均基于**官方 hooks 文档 + AgentPet / lazyagent / tokscale 等开源实现交叉验证**接入，标注「未实测」的映射没有实机验证过；配置路径由启动自愈检查；未知事件不推断终态，实机探针（§23）核对后请回填实测结论。
 
 | 项 | 值 |
 | --- | --- |
@@ -549,7 +553,7 @@ Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格*
 | 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`Notification`→**input_required**（权限/审批请求或 60s 空闲）、`Stop`→run_completed、`SessionEnd`→run_aborted |
 | 需要你做 | Droid 启动时快照 hooks，外部修改需在会话内 `/hooks` 面板**审核确认** |
 
-官方 9 个事件，Claude 同构嵌套 + snake_case payload（AgentPet 实现与官方一致，**未实测**）。官方事件表里没有 `StopFailure`，回合失败只有判死兜底。
+官方 9 个事件，Claude 同构嵌套 + snake_case payload（AgentPet 实现与官方一致，**未实测**）。官方事件表里没有 `StopFailure`，无明确失败信号时不会推断回合失败。
 
 ---
 
@@ -563,7 +567,7 @@ Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格*
 | 注册事件 | `UserPromptSubmit`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`PostToolUseFailure`→tool_failed、`Notification`→input_required、`Stop`→run_completed、`StopFailure`→run_failed、`StopCancelled`→**run_aborted**、`SessionEnd`→run_aborted |
 | 需要你做 | 无信任环节（官方仅**项目级** hooks 需要 `/hooks-trust`，用户级 `~/.grok/hooks` 直接加载） |
 
-官方 15 个事件的子集（**未实测**）。payload 是 **camelCase 键**（`sessionId`/`toolName`/`workspaceRoot`），且 `hookEventName` 携带 snake_case 值——事件名走 `--event` 参数不受影响，字段靠归一化层的别名兜底。`StopCancelled` 是显式的用户取消信号，中断回合**立即释放**，不用等判死——这是全部接入里最干净的中止信号。
+官方 15 个事件的子集（**未实测**）。payload 是 **camelCase 键**（`sessionId`/`toolName`/`workspaceRoot`），且 `hookEventName` 携带 snake_case 值——事件名走 `--event` 参数不受影响，字段靠归一化层的别名兜底。`StopCancelled` 是显式的用户取消信号，中断回合**立即释放**，无需其他信号补充。
 
 ---
 
@@ -577,7 +581,7 @@ Qwen Code 是 Gemini CLI 的 fork，但事件名已全面转向 **Claude 风格*
 | 注册事件 | `beforeSubmitPrompt`/`preToolUse`→activity、`postToolUse`→**tool_finished**；`stop.status` 与 `sessionEnd.reason` 区分完成/终止/失败 |
 | 需要你做 | 无信任环节 |
 
-官方 18 个 agent 事件的子集（**未实测**）；payload 用 `conversation_id` + `workspace_roots`（数组）。**没有等待类钩子**（官方无 Notification 类事件）——Cursor 只有运行/完成两态，权限等待退化为事件静止 + 判死。本节覆盖 IDE 端；Cursor CLI（`cursor-agent`）对 hooks 的支持官方未文档化，不承诺。
+官方 18 个 agent 事件的子集（**未实测**）；payload 用 `conversation_id` + `workspace_roots`（数组）。**没有等待类钩子**（官方无 Notification 类事件）——Cursor 只有运行/完成两态，权限等待无法单独识别，保留最后已知状态。本节覆盖 IDE 端；Cursor CLI（`cursor-agent`）对 hooks 的支持官方未文档化，不承诺。
 
 ---
 
@@ -611,7 +615,7 @@ Windsurf 已按用户要求移除检测、接入入口和适配器；旧 agent i
 | 注册事件 | `PreInvocation`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`Stop`→run_completed |
 | 需要你做 | 在 Antigravity **设置中开启 Hooks** |
 
-官方 5 个事件里取 4 个（`PostInvocation` 与 `Stop` 重合，不重复注册）（**未实测**）。两个形态细节：`PreToolUse`/`PostToolUse` 是 matcher 事件，需要 `{"matcher": "*", "hooks": [...]}` 包装；`PreInvocation`/`Stop` 是裸 handler 列表。payload 为 camelCase（`conversationId`/`workspacePaths`/`toolCall.name`）且**没有事件名字段**——事件名由 hook 命令的 `--event` 参数提供，不受影响。没有会话级/中断事件，中止退化为判死。
+官方 5 个事件里取 4 个（`PostInvocation` 与 `Stop` 重合，不重复注册）（**未实测**）。两个形态细节：`PreToolUse`/`PostToolUse` 是 matcher 事件，需要 `{"matcher": "*", "hooks": [...]}` 包装；`PreInvocation`/`Stop` 是裸 handler 列表。payload 为 camelCase（`conversationId`/`workspacePaths`/`toolCall.name`）且**没有事件名字段**——事件名由 hook 命令的 `--event` 参数提供，不受影响。没有会话级/中断事件，缺少中止信号时保留最后已知状态，可本地移除。
 
 ---
 
@@ -648,12 +652,12 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 - `turn.cancel` 是显式用户中止，立即释放；
 - 通知正文用 `state.json` 的会话标题（wire 里只有流式分片，不拼装正文）；
 - 首次发现会话，仅当文件修改时间和尾部最新 `time` 时间戳都在最近 2 分钟内，才从未收尾记录恢复运行态；历史日志或缺少可识别时间戳的日志只记录读取位置，不重放活动。之后新增的真实任务记录仍正常处理。
-- 短时静默每 60s 发一次运行态心跳，但心跳不算日志增长。连续 10 分钟没有真实日志增长，发一次 `run_aborted` 释放会话并停止心跳；后续新增 `turn.prompt` / `step.begin` / `tool.call` / `content.part` 可以恢复运行态。持续有流式日志的长任务不受总时长限制。
-- 真实 `end_turn` / `turn.cancel` 与静默超时分开处理：真实终态之后的迟到分片和工具结果不能重新点亮，只有下一条 `turn.prompt` 才能开启新回合。启动读取只消费完整行，并以本轮观测的文件长度为界；未写完的行或中文字符等补齐后再处理，避免漏读或重复消费。豆包工作的 JSONL 读取也遵循此规则。
+- 短时静默每 60s 发一次运行态心跳，但心跳不算日志增长。连续 5 分钟没有真实日志增长时停止合成心跳，保留会话与光效；后续真实日志增长恢复心跳。只有明确终态释放会话，长任务不受总时长限制。
+- 真实 `end_turn` / `turn.cancel` 才收尾：真实终态之后的迟到分片和工具结果不能重新点亮，只有下一条 `turn.prompt` 才能开启新回合。启动读取只消费完整行，并以本轮观测的文件长度为界；未写完的行或中文字符等补齐后再处理，避免漏读或重复消费。豆包工作的 JSONL 读取也遵循此规则。
 
 **为什么不做 Hook 型**：内核读的 `runtime/kimi-code/config.toml` 是**应用托管生成**的（内含 Daimon 权限规则、设备元数据，随应用启动重写），写入的 `[[hooks]]` 活不过一次 Kimi Work 重启；Watch 型零写盘，不受影响。
 
-**已知边界**：只看主 agent（`agents/main/wire.jsonl`），Agent Swarm 子智能体不出事件；协议 1.3 只有审批**解决**记录没有**请求**记录，「等待确认」相位推不出来（表现为执行工具直到审批完成）。纯日志监控无法区分超过 10 分钟的真实静默任务与已经退出的宿主，因此前者也会暂时移除，日志恢复后重新显示。数据布局按 2026-07 版本（daimon-bundle 0.5.36 / X-Msh-Version 0.22.3）校准，应用大版本升级可能导致监控失效。
+**已知边界**：只看主 agent（`agents/main/wire.jsonl`），Agent Swarm 子智能体不出事件；协议 1.3 只有审批**解决**记录没有**请求**记录，「等待确认」相位推不出来（表现为执行工具直到审批完成）。纯日志监控无法区分真实静默任务与已经退出的宿主，因此静默只停发合成心跳、保留显示；确认宿主已退出时可本地移除。数据布局按 2026-07 版本（daimon-bundle 0.5.36 / X-Msh-Version 0.22.3）校准，应用大版本升级可能导致监控失效。
 
 ---
 
@@ -679,14 +683,14 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 - `interaction.ask` 是运行时**提问工具**：提问后回合挂起等用户回答（IndexedDB 条目保留），答完以 `role=tool` 结果恢复循环；
 - 工具失败（如 `image_gen` 报错）只留 `role=tool` 的错误文本，回合继续跑——**不是 run_failed**；
 - 运行中可以连发多条消息排队，trajectory 里表现为连续多条 `role=user`，每条都刷新任务文案；
-- 云端生图 / 长思考期间本地零事件，靠 60s 运行态心跳保活（远小于 10 分钟判死线）；
+- 云端生图 / 长思考期间本地零事件，每 60s 刷新已知运行状态；缓存心跳不会新建会话或改变等待相位；
 - **完成后不允许旧信号复活回合**：完成标记阻止缓存的 `running=true` 继续发心跳，迟到的工具记录也不能重新点亮。IndexedDB 已确认空闲时，后续 trajectory 的 user/工具记录只消费读取位置，不上报活动；新 user 文案暂存，待 IndexedDB 下一次 `false→true` 确认运行后再开启。无 IndexedDB 空闲结论时，新的 user 记录仍可开启下一轮。
 - `interaction.ask` 清除条目的宽限期内，真实 tool 回答及其后续工具仍可继续当前回合；空 trajectory 也不等于已完成，IndexedDB 确认运行的云端任务仍正常保活。首次读到空闲状态时，若之前仅凭轨迹点亮，也会收场。
 - 通知正文用最近一次任务文案，项目目录取自 IndexedDB 的 `agent_task_param.workspace`。
 
 **为什么不做 Hook 型**：豆包工作没有 hooks / CLI 扩展点；Watch 型零写盘。
 
-**已知边界**：只看主 agent（`assignment.md` 头部 `Role: main`），子智能体不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）；**失败原因仍不可见**；取消日志缺失/格式漂移，或未观测到对应运行消息 ID 时，条目清除仍回退为完成（可能把停止或失败误报为完成），数据源失效时退化为事件静止 + 10 分钟判死；IndexedDB 不可读时降级为 trajectory 单源（完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场，不亮失败色、下次活动自动恢复）；完成/运行种子覆盖 LevelDB WAL 与 SST；无法从数据库读到种子的会话按 trajectory 文件停摆时长兜底——超过 15 分钟无文件活动按空闲建档（不点亮、不心跳，否则每次重启历史会话都会被重新点亮一遍），后续任何真实事件照常接管；数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效——失效时退化为 10 分钟判死，不误报。
+**已知边界**：只看主 agent（`assignment.md` 头部 `Role: main`），子智能体不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）；**失败原因仍不可见**；取消日志缺失/格式漂移，或未观测到对应运行消息 ID 时，条目清除仍回退为完成（可能把停止或失败误报为完成），数据源失效时保留最后已知状态；IndexedDB 不可读时降级为 trajectory 单源（完成信号缺失，轨迹停止增长 5 分钟后停止合成心跳，保留会话，后续真实增长恢复心跳）；完成/运行种子覆盖 LevelDB WAL 与 SST；无法从数据库读到种子的会话按 trajectory 文件停摆时长兜底——超过 15 分钟无文件活动按空闲建档（不点亮、不心跳，否则每次重启历史会话都会被重新点亮一遍），后续任何真实事件照常接管；数据布局按 2026-10 版本（2.32.3）校准，应用大版本升级可能失效——失效时保留最后已知状态，不推断终态。
 
 ---
 
@@ -732,10 +736,10 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 **回合结束后流光一直停在思考色、「运行中会话」列表里那条不消失**：说明这次回合结束的信号没被我们收到。已知情形：
 - Qoder / Qoder CN **用户主动中断**时只有 `SessionEnd`、没有 `Stop`（见 §4，已注册处理 → `run_aborted`）；
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
-- 其它 agent 若进程被直接杀掉，不会有任何终态事件——这种情况靠**心跳静止判死**兜底（流光转失败色、条目清出列表）。
-- **判死时长**默认 10 分钟，由后台巡检每 30s 检查一次（不需要等下一条事件到来——早期版本只在有新事件时才算判死，所以会一直卡在思考色，已修）。想让中断后的反馈更快，用环境变量 `BARK_STALE_AFTER_MS`（毫秒，最小 5000）覆盖，例如 `BARK_STALE_AFTER_MS=60000` = 静默 1 分钟即判死；代价是**长时间跑单个工具**时可能被误判成「意外终止」。
-- **ZCode 不受长静默误判**：它的日志看门狗在读终态信号之余还做**存活心跳**——任何带会话 id 的日志行（含子代理行经 `parentSessionId` 向父会话传播）都会刷新 `last_activity`，判死口径是「无 hook **且** 无日志活动」。长工具 / 长子代理 / 长思考期间 hook 静默但日志还在写，不会被误判成意外终止；进程被杀后日志同步停写，判死照常。同一通道还负责**子代理显示**（子代理不触发 hook，见上文「子代理语义」）。其余 hook 型 agent 没有这层信号，仍按 hook 心跳静止判死。
-- **不想等**：托盘菜单 →「重置流光」立刻驱散当前颜色（下一次事件到来时按正常逻辑重新点亮），会话条目也会在下一次快照时消失。
+- **定期核验**：每 5 分钟主动请求各来源检测。Codex 重读当前回合的有限 JSONL 尾部；WorkBuddy、TraeWork、Kimi Work、豆包工作唤醒已有监控线程；ZCode 与 TRAE Code 日志观察器继续按秒读取。
+- **证据不足时保留**：没有终态事件、数据库不可读、日志静默或暂不支持核验，都不再推断失败/中止。进程仍存在也不能证明某个具体回合仍在执行。
+- **立即核验**：托盘菜单 →「检测运行状态」，核验结果经原事件管道更新会话和光效，不再无条件熄灭。`BARK_STALE_AFTER_MS` 已移除。
+
 
 **手动中止后流光为什么不亮失败色也不亮完成色**：这是刻意的。用户主动中止归一成 `run_aborted`——不是失败（不亮失败色、不弹「任务失败」）也不是完成（不亮完成色、不谎报跑完）；没有别的会话在跑时**直接收起光效**，还有别的会话在跑就照常显示它们的状态。若你看到某个 agent 中止后仍亮完成 / 失败色，说明它的中止信号还没被归到这一类（见 §0 的说明与各 agent 的「注册事件」一行）。
 

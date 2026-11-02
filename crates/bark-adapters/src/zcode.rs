@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 /// （如编辑前没先读文件），agent 下一步就会重试——按回合失败处理会让一次瞬时
 /// 失败也亮失败色全屏特效 + 弹「任务失败」（实测纯噪音）。真回合失败不发任何 hook
 /// （实测 2026-09-19：模型请求致命失败时 7 个事件一个都不触发），由看门狗读日志的
-/// `turn.failed` 合成，见下方「中断与回合失败推断」一节；心跳判死仍是最后兜底，
+/// `turn.failed` 合成，见下方「中断与回合失败推断」一节；没有明确证据时保留状态，
 /// 见 `EventKind::ToolFailed` 的文档。
 pub const EVENTS: &[(&str, EventKind)] = &[
     ("SessionStart", EventKind::SessionStart),
@@ -328,7 +328,7 @@ fn is_ask_user_question(raw: &Value) -> bool {
 /// `sess_subagent_agent_<uuid>`（bundle 里 `sess_` 前缀与 `subagent_agent_` 标记
 /// 是两个独立常量，前缀更名只施加于主会话）。旧代 `sess_<uuid>` 主会话**不再
 /// 支持**：ZCode 全量自动更新，没有停在旧版的用户（2026-10-20 的两代兼容
-/// 旋即收敛；若真出现旧版日志，行为是退回判死超时，不误报）。
+/// 旋即收敛；若真出现旧版日志，行为是保留最后已知状态，不推断终态）。
 fn is_session_id(s: &str) -> bool {
     s.starts_with("session_") || is_subagent_session_id(s)
 }
@@ -797,7 +797,7 @@ impl HookAdapter for ZcodeAdapter {
 /// 2. **回合致命失败**（2026-09-19 实测 Captcha 超时 / 订阅权限 1311）：模型请求
 ///    不可重试地失败时写一条 `turn.failed`，**进程不退出、不发 hook、会话停在
 ///    输入框等用户手动继续**——对 agent-bark 来说会话相位永远卡在「思考中」，
-///    只能等心跳判死。日志里它与中断可机械区分（两天 11 条样本实测）：
+///    需要明确日志信号才能收尾。日志里它与中断可机械区分（两天 11 条样本实测）：
 ///    中断的 `error.message` 是 "Turn was cancelled."（顶层 `status: "cancelled"`，
 ///    cause.code = `model_request_cancelled` / "v4 session stopped"），
 ///    致命失败是 "Turn execution failed"（`status: "failed"`，cause.code =
@@ -919,7 +919,7 @@ pub struct LogLine {
     pub session_id: String,
     /// 子代理行里的 `context.parentSessionId`：子代理的日志活动同样证明父会话
     /// 的回合还活着——父会话在子代理运行期间不写自己的日志（实测 `Agent` 工具
-    /// 单次可跑 27 分钟、父会话静默 21 分钟），不向父传播会被心跳判死误杀
+    /// 单次可跑 27 分钟、父会话静默 21 分钟），向父传播可反映后代进展
     pub parent_session_id: Option<String>,
     /// 回合终态信号；无关记录是 `None`（但它仍是存活心跳）
     pub signal: Option<LogSignal>,
@@ -1178,7 +1178,7 @@ pub struct TailScan {
     pub signals: Vec<LogSignal>,
     /// 本次有过日志活动的会话 id（去重；含不构成信号的普通行，以及子代理行
     /// 传播上来的父会话 id）——看门狗据此做存活心跳（刷新 `last_activity`，
-    /// 防长静默被判死误杀，见 app 侧 `state::touch_session`）
+    /// 使最后活动时间反映真实日志进展，见 app 侧 `state::touch_session`）
     pub alive_sessions: Vec<String>,
     /// 新发现的子代理生命周期活动（见 [`SubagentEvent`]）：看门狗据此合成
     /// 子代理事件（带血缘）塞进管道——这是子代理在界面上可见的唯一通道
@@ -1239,7 +1239,7 @@ impl AbortLogTail {
         // 重建后**超过旧 offset** 的新文件不被识别，从旧 offset 读进去会把新文件
         // 拦腰切成半行垃圾/错位行；created 不可用的平台退回 len < offset 兜底。
         // **不能**从头重放：同上，历史行的陈年失败会批量误杀正在跑的会话。
-        // 代价是「重建与新追加落在同一次写入里」的新事件会被跳过，交给判死兜底
+        // 代价是「重建与新追加落在同一次写入里」的新事件会被跳过，只能等待后续可靠信号或本地移除
         // （与跨天换文件「从末尾开始」同一口径）。
         let recreated = matches!((self.created, created), (Some(old), Some(now)) if old != now);
         if recreated || len < self.offset {
@@ -1913,7 +1913,7 @@ mod tests {
 
     /// 会话 id 单版本口径（2026-10-21 收敛）：只认现行 `session_<32hex>` 主会话与
     /// `sess_subagent_agent_*` 子代理（实测子代理**不换前缀**）；旧代 `sess_<uuid>`
-    /// 主会话不再解析——出现时退回判死超时，不误报。
+    /// 主会话不再解析——出现时保留最后已知状态，不推断终态。
     #[test]
     fn single_generation_session_ids_are_enforced() {
         // 致命失败：额度耗尽（"exceed quota limit"）必须合成 Failed 信号
@@ -1932,7 +1932,7 @@ mod tests {
             other => panic!("应判为致命失败: {other:?}"),
         }
 
-        // 普通行：无终态信号，但必须算存活心跳（长静默回合靠它防心跳判死误杀）
+        // 普通行：无终态信号，但必须算存活心跳（用它更新最近活动时间）
         let l = parse_log_line(NEW_PLAIN_LINE).expect("现行格式普通行必须算会话活动");
         assert_eq!(l.session_id, NEW_SID);
         assert_eq!(l.parent_session_id, None);

@@ -2,8 +2,8 @@
 //!
 //! 原生托盘菜单（tauri::menu）是系统绘制的，无法换肤；这里用一个小 WebView
 //! 窗口渲染 menu.html，面板样式直接搬 widget.html 的 `#ctx-menu`（深浅主题
-//! 跟随系统）。菜单项与旧原生菜单一致：显示主窗口 / 重置流光 / 静音 / 退出，
-//! 动作经 commands.rs 的命令回传（show_main_panel / reset_glow / toggle_mute / quit_app）。
+//! 跟随系统）。菜单项与旧原生菜单一致：显示主窗口 / 检测运行状态 / 静音 / 退出，
+//! 动作经 commands.rs 的命令回传（show_main_panel / recheck_sessions / toggle_mute / quit_app）。
 //!
 //! 生命周期：**懒创建 + 常驻**。第一次点托盘才建窗（同 glow 的懒创建思路，
 //! 不白吃一个 WebView），之后一直隐藏复用——每次点击只做落位 + 显示 + 聚焦，

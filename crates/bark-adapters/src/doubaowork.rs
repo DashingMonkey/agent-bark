@@ -53,12 +53,12 @@
 //! 已知边界：
 //! - **失败原因仍不可见**；取消日志缺失/格式漂移，或未观测到对应运行消息 ID 时，
 //!   IndexedDB 条目清除仍回退为完成，失败或停止的任务可能误报「任务完成」；
-//!   数据源失效时退化为事件静止 + 10 分钟判死（不误报）
+//!   数据源失效时保留最后已知状态；日志静默 5 分钟停发合成心跳
 //! - 只看主 agent（`assignment.md` 头部 `Role: main`）；子智能体的 trajectory
 //!   不出事件（它们的「完成」不是任务的完成，且没有后续事件能收档）
 //! - IndexedDB 不可读时（目录缺失 / schema 漂移）降级为 trajectory 单源：
-//!   完成信号缺失，轨迹停止增长 15 分钟后按「中止」收场（不亮失败色），
-//!   下次活动自动恢复——不会永远卡思考色
+//!   完成信号缺失时保留最后已知状态，不再按轨迹静默时长推断中止，
+//!   后续真实活动或明确终态继续更新；来源长期不可用时可能保留旧状态
 //! - 已确认完成后停止心跳并屏蔽迟到工具记录；IndexedDB 已确认空闲的会话，
 //!   需等下一次运行跃迁再开启，避免迟落盘的旧 user 消息复活已结束回合。
 //! - 数据布局按 2026-10 版本校准（2.32.3 存储；2.32.6 取消日志），应用大版本升级可能失效
@@ -324,9 +324,11 @@ fn bootstrap_tail(tail: &str) -> BootstrapTail {
 
 /// 轮询周期与节流常量
 const POLL_SECS: u64 = 3;
-/// 运行态无新记录时的心跳重发间隔：60s 远小于 daemon 侧 10 分钟判死线
+/// 运行态无新记录时的心跳重发间隔：60s，仅刷新已有会话
 /// （云端生图 / 长思考期间没有任何本地事件，靠它保活）
 const HEARTBEAT_MS: i64 = 60_000;
+/// 没有新来源证据时停发合成心跳，但不生成终态或删除显示。
+const HEARTBEAT_QUIET_MS: i64 = 5 * 60_000;
 /// 首见会话时的回看窗口（字节）
 const BOOTSTRAP_TAIL: u64 = 64 * 1024;
 /// 跨轮残行缓冲上限：单条消息不应超过；超限视为异常，放弃本行
@@ -340,10 +342,6 @@ const WARN_EVERY_ROUNDS: u32 = 20;
 const ASK_CLEAR_GRACE_MS: i64 = 60_000;
 // 数据库空闲可能先于取消确认日志到达，留两个轮询周期供日志补齐。
 const COMPLETE_GRACE_MS: i64 = 6_000;
-/// 降级模式（IndexedDB 不可读）的停摆判定：轨迹停止增长这么久按「中止」收场
-/// （RunAborted 不通知不亮失败色；下次活动自动恢复）。长云端静默阶段在降级模式下
-/// 会被误收场，但降级本身已无完成信号，两害取其轻。
-const STALL_ABORT_MS: i64 = 15 * 60_000;
 /// 首见时无 IndexedDB 种子的停摆判定：trajectory 这么久没有文件活动视为空闲
 /// （不点亮、running=false；后续任何真实事件照常接管）。种子只覆盖当前 .log
 /// 里出现过的会话，compaction 会把老会话的最新状态挪进 .ldb 读不到，靠它兜底。
@@ -433,7 +431,7 @@ struct ScanCtx<'a> {
     idb_tails: &'a [IdbTails],
     /// IndexedDB 会话状态表（跨轮持久）：首轮扫描先于建档，种子必须留到
     /// tracker 建档时用——否则重启后已完成会话会被 trajectory 引导点亮，
-    /// 10 分钟后被判死误亮失败色
+    /// 留下没有后续终态的残留显示
     idb_state: &'a mut HashMap<String, (bool, String, Vec<String>)>,
 }
 
@@ -479,7 +477,7 @@ fn poll_round(
             };
             for agent in agent_dirs.flatten() {
                 // 子智能体（Role: 非 main）整路跳过：它们的「完成」不是任务的完成，
-                // 且没有后续事件能收档，建档必然走到 10 分钟判死亮红光
+                // 且没有后续事件能收档，建档会留下无主运行态
                 if !is_main_agent(&agent.path()) {
                     continue;
                 }
@@ -527,7 +525,7 @@ fn poll_round(
             let (mut events, mut running, waiting, completed) =
                 bootstrap_tail(bootstrap_sample(&full, BOOTSTRAP_TAIL as usize));
             // IndexedDB 种子：会话已结束（条目空）时不发引导点亮——否则重启后
-            // 全部历史会话被点亮一轮、10 分钟后被判死误亮失败色。等回答态同理
+            // 全部历史会话被重新点亮且长期残留。等回答态同理
             // （条目保留才是在等；条目已清说明早不是活会话）。
             let seeded = ctx.idb_state.get(&sid).cloned();
             let idb_running = seeded.as_ref().map(|(r, _, _)| *r);
@@ -685,15 +683,16 @@ fn poll_round(
             }
         }
 
-        // 运行态心跳：云端生图 / 长思考期间没有任何本地事件，靠它保活到判死线之外。
+        // 运行态心跳：云端生图 / 长思考期间没有任何本地事件，只用它刷新已有条目的观测时间。
         // IndexedDB 可用时以它为准（完成后的条目清除会顺带停掉心跳）；
-        // 不可用时退回 trajectory 视角（见 STALL_ABORT_MS 的降级兜底）。
+        // 不可用时保留 trajectory 的最后已知状态，静默不代表中止。
         let heartbeats = match tracker.idb_running {
             Some(r) => r && !tracker.waiting_ask,
-            None => tracker.running && !tracker.waiting_ask,
+            None => tracker.running && !tracker.waiting_ask
+                && now.saturating_sub(tracker.last_growth_ms) < HEARTBEAT_QUIET_MS,
         };
         if !tracker.settled && heartbeats && now - tracker.last_emit_ms > HEARTBEAT_MS {
-            emit(
+            crate::watch::emit_keepalive(
                 stop,
                 tx,
                 kind,
@@ -705,33 +704,11 @@ fn poll_round(
             );
             tracker.last_emit_ms = now;
         }
-
-        // 降级兜底：IndexedDB 不可读 + trajectory 停摆 → 按「中止」收场
-        // （不通知不亮失败色；完成信号缺失时至少不让会话永远卡在思考色）
-        if tracker.idb_running.is_none()
-            && tracker.running
-            && !tracker.waiting_ask
-            && now - tracker.last_growth_ms > STALL_ABORT_MS
-        {
-            tracker.running = false;
-            tracker.settled = true;
-            emit(
-                stop,
-                tx,
-                kind,
-                EventKind::RunAborted,
-                &sid,
-                &tracker.workspace,
-                "轨迹停止更新且无法读取会话状态，按中止收场",
-                None,
-            );
-            tracker.last_emit_ms = now;
-        }
     }
 
     // 「trajectory 从会话树里消失」的闭环（§1.12a 同一口径）：运行中的会话被删除
-    // 不会有终态跃迁，主动发 RunAborted 收档（不通知、不亮失败色），别等 daemon
-    // 侧 10 分钟僵死判死在随机时刻亮失败色。终态/等待态的条目直接静默移除。
+    // 不会有终态跃迁，主动发 RunAborted 收档（不通知、不亮失败色），避免已删除会话长期残留。
+    // 终态/等待态的条目直接静默移除。
     trackers.retain(|key, t| {
         if seen_keys.iter().any(|k| k == key) {
             return true;
@@ -905,6 +882,23 @@ mod tests {
 
     impl Drop for PollFixture {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+    }
+
+    #[test]
+    fn unreadable_database_and_quiet_trajectory_do_not_abort_active_task() {
+        let mut f = PollFixture::new();
+        f.append(json!({"role":"user", "content":"long task"}));
+        f.poll();
+        assert!(!f.trackers.is_empty());
+        for tracker in f.trackers.values_mut() {
+            tracker.idb_running = None;
+            tracker.running = true;
+            tracker.settled = false;
+            tracker.last_growth_ms = 0;
+        }
+        f.make_heartbeat_due();
+        assert!(f.poll().is_empty(), "静默仅停止合成心跳，不生成终态");
+        assert!(f.trackers.values().all(|t| t.running && !t.settled));
     }
 
     #[test]

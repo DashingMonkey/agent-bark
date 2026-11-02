@@ -173,6 +173,15 @@ fn default_webhook_template() -> String {
     r#"{"title": "{title}", "body": "{body}", "agent": "{agent}"}"#.to_string()
 }
 
+/// 靠边隐藏的停靠方向；卡片始终保持横向布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetDockSide {
+    Top,
+    Left,
+    Right,
+}
+
 /// 桌面悬浮窗配置（当前活动会话的小卡片：左图标右状态，可拖动、可固定位置）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -184,15 +193,15 @@ pub struct WidgetConfig {
     pub y: f64,
     /// 固定位置：true 时卡片不响应拖动（悬浮窗右键菜单里切换）
     pub pinned: bool,
-    /// 自动隐藏：安静即隐、有事即现（具体口径与隐藏时长见前端 widget.ts 的
-    /// 「自动隐藏」一节，时长是前端固定值、不做配置项）。
-    /// 默认开：隐藏只是展示态、不影响 `enabled`，不想要到「悬浮窗」页关掉即可。
-    pub auto_hide: bool,
+    /// 停靠方向；x/y 始终保存展开位置，None 表示自由悬浮。
+    pub dock_side: Option<WidgetDockSide>,
+    /// 停靠显示器名称，消除混合 DPI 下逻辑坐标区间重叠的歧义。
+    pub dock_monitor: Option<String>,
 }
 
 impl Default for WidgetConfig {
     fn default() -> Self {
-        Self { enabled: true, x: -1.0, y: -1.0, pinned: false, auto_hide: true }
+        Self { enabled: true, x: -1.0, y: -1.0, pinned: false, dock_side: None, dock_monitor: None }
     }
 }
 
@@ -843,20 +852,32 @@ system = false
     }
 
     #[test]
-    fn widget_missing_auto_hide_defaults_on_and_roundtrips() {
-        // 老配置没有 widget 段 / 没有 auto_hide 键：解析成功且默认开——
-        // 「安静即隐、有事即现」是悬浮窗的默认体验
+    fn widget_docking_defaults_off_and_roundtrips() {
+        let legacy: WidgetConfig = serde_json::from_str(r#"{"x":-1920,"y":60}"#).unwrap();
+        assert_eq!(legacy.dock_side, None);
+        assert_eq!(legacy.dock_monitor, None);
+        for side in [WidgetDockSide::Top, WidgetDockSide::Left, WidgetDockSide::Right] {
+            let cfg = WidgetConfig { x: -1920.0, y: 60.0, dock_side: Some(side), dock_monitor: Some("display-2".into()), ..WidgetConfig::default() };
+            let restored: WidgetConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(restored.dock_side, Some(side));
+            assert_eq!(restored.dock_monitor.as_deref(), Some("display-2"));
+            assert_eq!((restored.x, restored.y), (-1920.0, 60.0));
+        }
+        assert!(serde_json::from_str::<WidgetConfig>(r#"{"dock_side":"bottom"}"#).is_err());
+    }
+
+    #[test]
+    fn widget_legacy_auto_hide_is_ignored_without_losing_position_or_enabled() {
         let cfg: BarkConfig = serde_json::from_str(r#"{"agents":[]}"#).unwrap();
         assert!(cfg.widget.enabled);
-        assert!(cfg.widget.auto_hide);
-        let cfg: BarkConfig =
-            serde_json::from_str(r#"{"widget":{"enabled":false,"x":10,"y":20,"pinned":true}}"#).unwrap();
-        assert!(!cfg.widget.enabled);
-        assert!(cfg.widget.auto_hide);
-        assert_eq!((cfg.widget.x, cfg.widget.y, cfg.widget.pinned), (10.0, 20.0, true));
-        // 显式 false 能存能读（「悬浮窗」页把「自动隐藏」关掉后的形态）
-        let cfg: BarkConfig = serde_json::from_str(r#"{"widget":{"auto_hide":false}}"#).unwrap();
-        assert!(!cfg.widget.auto_hide);
+        for legacy in [true, false] {
+            let cfg: BarkConfig = serde_json::from_value(serde_json::json!({
+                "widget": {"enabled": false, "x": 10, "y": 20, "pinned": true, "auto_hide": legacy}
+            })).unwrap();
+            assert!(!cfg.widget.enabled);
+            assert_eq!((cfg.widget.x, cfg.widget.y, cfg.widget.pinned), (10.0, 20.0, true));
+            assert!(serde_json::to_value(&cfg.widget).unwrap().get("auto_hide").is_none());
+        }
     }
 
     #[test]

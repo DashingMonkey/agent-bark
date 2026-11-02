@@ -32,8 +32,8 @@
 //! 活不过一次 Kimi Work 重启；Watch 型零写盘，不受托管重写影响。
 //!
 //! 已知边界（运行态未实测）：
-//! - 历史缺失终态不代表仍在运行：仅回看最近 2 分钟更新的日志；持续 10 分钟无新增
-//!   则按中止收场。纯日志监控无法区分超长静默任务与已经退出的宿主，后续新记录可恢复。
+//! - 历史缺失终态不代表仍在运行：仅回看最近 2 分钟更新的日志；持续 5 分钟无新增
+//!   则停发合成心跳、保留状态。纯日志监控无法区分静默任务与退出宿主，真实增长恢复心跳。
 //! - 只看 `agents/main/wire.jsonl`（主 agent）；Agent Swarm 子智能体不出事件
 //! - 协议 1.3 只有审批**解决**记录（`permission.record_approval_result`），没有
 //!   审批**请求**记录——「等待确认」相位推不出来，表现为执行工具直到审批完成
@@ -211,10 +211,11 @@ fn session_title(session_dir: &Path) -> String {
 
 /// 轮询周期与节流常量
 const POLL_SECS: u64 = 3;
-/// 短时静默保活；只允许在真实日志增长后的有限窗口内重发。
+/// 已知运行状态的定期重发；静默不代表中止。
 const HEARTBEAT_MS: i64 = 60_000;
+/// 没有新来源证据时停发合成心跳，但不生成终态或删除显示。
+const HEARTBEAT_QUIET_MS: i64 = 5 * 60_000;
 const BOOTSTRAP_FRESH_MS: i64 = 2 * 60_000;
-const STALL_ABORT_MS: i64 = 10 * 60_000;
 /// 首见会话时的回看窗口（字节）
 const BOOTSTRAP_TAIL: u64 = 64 * 1024;
 /// 跨轮残行缓冲上限：单条 wire 记录不应超过；超限视为异常，放弃本行
@@ -475,16 +476,10 @@ fn poll_round(
             tracker.pending.clear();
             tracker.offset = size;
         }
-        // 合成心跳不是宿主存活证据；无真实增长到期后静默收场，避免无限续命。
-        if tracker.running && now.saturating_sub(tracker.last_growth_ms) >= STALL_ABORT_MS {
-            tracker.running = false;
-            emit(stop, tx, kind, EventKind::RunAborted, &sid, &cwd,
-                "会话日志持续未更新，停止推断运行状态", None);
-            tracker.last_emit_ms = now;
-        }
-        // 短时静默可以保活，但不更新 last_growth_ms。
-        if tracker.running && now - tracker.last_emit_ms > HEARTBEAT_MS {
-            emit(
+        // 保留最后已知运行状态；只有明确终态才能收档。
+        if tracker.running && now.saturating_sub(tracker.last_growth_ms) < HEARTBEAT_QUIET_MS
+            && now - tracker.last_emit_ms > HEARTBEAT_MS {
+            crate::watch::emit_keepalive(
                 stop,
                 tx,
                 kind,
@@ -528,6 +523,7 @@ fn read_increment(path: &Path, offset: u64) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    const TEST_LONG_SILENCE_MS: i64 = 24 * 60 * 60_000;
     use super::*;
     use serde_json::json;
 
@@ -615,24 +611,24 @@ mod tests {
     }
 
     #[test]
-    fn poll_bounds_synthetic_heartbeats_and_resumes_on_real_growth() {
+    fn poll_retains_quiet_task_until_explicit_completion() {
         let mut f = PollFixture::new();
         let start = now_millis();
         f.append(turn_prompt("live task"), start);
         assert_eq!(f.poll(start), vec![EventKind::Activity]);
         assert_eq!(f.poll(start + HEARTBEAT_MS + 1), vec![EventKind::Activity]);
-        assert_eq!(f.poll(start + STALL_ABORT_MS), vec![EventKind::RunAborted]);
-        assert!(f.poll(start + 2 * STALL_ABORT_MS).is_empty());
-        assert!(!f.trackers["session"].running);
+        assert!(f.poll(start + TEST_LONG_SILENCE_MS).is_empty());
+        assert!(f.poll(start + 2 * TEST_LONG_SILENCE_MS).is_empty());
+        assert!(f.trackers["session"].running);
 
-        let resumed = start + 2 * STALL_ABORT_MS + 1;
+        let resumed = start + 2 * TEST_LONG_SILENCE_MS + 1;
         f.append(loop_event("tool.call", json!({"name": "Bash"})), resumed);
         assert_eq!(f.poll(resumed), vec![EventKind::Activity]);
         assert!(f.trackers["session"].running);
         assert_eq!(f.trackers["session"].last_growth_ms, resumed);
         f.append(loop_event("step.end", json!({"finishReason": "end_turn"})), resumed + 1);
         assert_eq!(f.poll(resumed + 1), vec![EventKind::RunCompleted]);
-        assert!(f.poll(resumed + STALL_ABORT_MS).is_empty());
+        assert!(f.poll(resumed + TEST_LONG_SILENCE_MS).is_empty());
     }
 
     #[test]
@@ -642,7 +638,7 @@ mod tests {
         f.append(turn_prompt("streaming task"), start);
         assert_eq!(f.poll(start), vec![EventKind::Activity]);
         for step in 1..=4 {
-            let now = start + step * (STALL_ABORT_MS - 1);
+            let now = start + step * (TEST_LONG_SILENCE_MS - 1);
             f.append(loop_event("content.part", json!({"part": {"type": "think"}})), now);
             assert_eq!(f.poll(now), vec![EventKind::Activity]);
             assert!(f.trackers["session"].running);
@@ -653,13 +649,13 @@ mod tests {
     fn poll_old_session_can_start_a_new_turn() {
         let mut f = PollFixture::new();
         let now = now_millis();
-        f.append(turn_prompt("old"), now - STALL_ABORT_MS);
+        f.append(turn_prompt("old"), now - TEST_LONG_SILENCE_MS);
         assert!(f.poll(now).is_empty());
         f.append(turn_prompt("new"), now + 1);
         assert_eq!(f.poll(now + 1), vec![EventKind::Activity]);
         f.append(json!({"type": "turn.cancel"}), now + 2);
         assert_eq!(f.poll(now + 2), vec![EventKind::RunAborted]);
-        assert!(f.poll(now + STALL_ABORT_MS).is_empty());
+        assert!(f.poll(now + TEST_LONG_SILENCE_MS).is_empty());
     }
 
     #[test]

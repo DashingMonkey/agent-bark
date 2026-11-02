@@ -1,6 +1,6 @@
-//! Codex 错误终态补偿（非官方 transcript 格式，2026-10-15 本机验证）。
-//! 只跟踪 hook 已建档的会话，只将 task_complete.error 视为回合失败。
-//! 普通 error / 工具失败 / token_count 不是终态，不据此推断失败。
+//! Codex 本地状态核验（非官方 transcript 格式，2026-10-29 本机验证）。
+//! SQLite 只定位 rollout；按精确回合读取提问、回答与明确终态。
+//! 日志静默、读取失败、普通工具错误均不代表回合结束。
 
 use crate::state::{lock, read, session_key, AppState};
 use bark_core::event::CodexContext;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 
-pub const EVENT_PREFIX: &str = "codex-transcript-failed:";
+pub const EVENT_PREFIX: &str = "codex-transcript:";
 const MAX_READ: u64 = 512 * 1024;
 const MAX_TURNS: usize = 4096;
 
@@ -25,6 +25,9 @@ struct Turn {
     closed: bool,
     background: bool,
     is_subagent: bool,
+    awaiting_async_input: Option<i64>,
+    first_observed_at: i64,
+    observed_at: i64,
 }
 
 /// 回合身份独立于通用的 10 秒回声窗口：长工具收尾可能迟到数分钟。
@@ -77,6 +80,9 @@ impl Turns {
                         closed: false,
                         background: context.is_background,
                         is_subagent: event.is_subagent,
+                        awaiting_async_input: None,
+                        first_observed_at: event.timestamp,
+                        observed_at: event.timestamp,
                     },
                 );
             }
@@ -95,6 +101,27 @@ impl Turns {
         if event.id.starts_with(EVENT_PREFIX) && event.timestamp < turn.started_at {
             return false;
         }
+        if event.id.starts_with(EVENT_PREFIX)
+            && event.timestamp < turn.awaiting_async_input.unwrap_or(turn.observed_at)
+            && matches!(
+                event.kind,
+                EventKind::PermissionRequired | EventKind::ToolFinished
+            )
+        {
+            return false;
+        }
+        if context.is_user_prompt || event.tool_name.as_deref() == Some("__user_input_answered") {
+            turn.awaiting_async_input = None;
+        }
+        if event.kind == EventKind::PermissionRequired
+            && event
+                .tool_name
+                .as_deref()
+                .is_some_and(|name| name.rsplit('.').next() == Some("request_user_input_async"))
+        {
+            turn.awaiting_async_input = Some(event.timestamp);
+        }
+        turn.observed_at = turn.observed_at.max(event.timestamp);
         if matches!(
             event.kind,
             EventKind::RunCompleted | EventKind::RunFailed | EventKind::RunAborted
@@ -113,6 +140,17 @@ impl Turns {
         true
     }
 
+    /// 等待仅约束显示相位。活动、统计、工具失败仍进入事件管道。
+    pub fn preserve_wait(&self, event: &NormalizedEvent) -> bool {
+        self.current.get(&event.session_id).is_some_and(|turn| !turn.closed
+            && turn.awaiting_async_input.is_some()
+            && matches!(event.kind, EventKind::Activity | EventKind::ToolFinished | EventKind::ToolFailed))
+    }
+
+    fn lower_bound(turn: &Turn) -> i64 {
+        if turn.started_at > 0 { turn.started_at } else { turn.first_observed_at }
+    }
+
     fn watching(&self) -> Vec<(String, Turn)> {
         self.current
             .iter()
@@ -123,7 +161,7 @@ impl Turns {
 }
 
 /// 某些 Codex hook 未给出 transcript_path；按精确会话 id 查本机会话索引。
-/// 不遍历全部历史，也不创建或修改 Codex 数据库；schema 变更时回退超时回收。
+/// 不遍历全部历史，也不创建或修改 Codex 数据库；schema 变更时保留当前状态。
 fn lookup_transcript(database: &Path, sid: &str) -> Option<PathBuf> {
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -140,20 +178,53 @@ fn lookup_transcript(database: &Path, sid: &str) -> Option<PathBuf> {
 }
 
 #[derive(Debug)]
-struct Failure {
+struct Signal {
+    kind: EventKind,
+    suffix: String,
+    tool: Option<String>,
     turn_id: String,
     timestamp: i64,
     message: String,
 }
 
-fn parse_line(line: &str) -> Option<Failure> {
+fn parse_line(line: &str) -> Option<Signal> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("type")?.as_str()? != "event_msg" {
         return None;
     }
     let payload = value.get("payload")?;
-    if payload.get("type")?.as_str()? != "task_complete" {
+    let ty = payload.get("type")?.as_str()?;
+    if !matches!(ty, "task_complete" | "turn_aborted") {
         return None;
+    }
+    let turn_id = payload.get("turn_id")?.as_str()?.trim();
+    if turn_id.is_empty() {
+        return None;
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value.get("timestamp")?.as_str()?)
+        .ok()?
+        .timestamp_millis();
+    if ty == "turn_aborted" || payload.get("error").is_none_or(Value::is_null) {
+        return Some(Signal {
+            kind: if ty == "turn_aborted" {
+                EventKind::RunAborted
+            } else {
+                EventKind::RunCompleted
+            },
+            suffix: ty.into(),
+            tool: None,
+            turn_id: turn_id.into(),
+            timestamp,
+            message: if ty == "turn_aborted" {
+                "用户已中止 Codex 回合".into()
+            } else {
+                payload
+                    .get("last_agent_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex 回合已完成")
+                    .into()
+            },
+        });
     }
     let error = payload.get("error")?.as_object()?;
     let code = error
@@ -168,13 +239,6 @@ fn parse_line(line: &str) -> Option<Failure> {
     if code.is_empty() && message.is_empty() {
         return None;
     }
-    let turn_id = payload.get("turn_id")?.as_str()?.trim();
-    if turn_id.is_empty() {
-        return None;
-    }
-    let timestamp = chrono::DateTime::parse_from_rfc3339(value.get("timestamp")?.as_str()?)
-        .ok()?
-        .timestamp_millis();
     let message = if code == "usage_limit_exceeded" {
         if message.is_empty() {
             "额度已用完（usage_limit_exceeded）".into()
@@ -186,31 +250,46 @@ fn parse_line(line: &str) -> Option<Failure> {
     } else {
         message.to_owned()
     };
-    Some(Failure {
+    Some(Signal {
+        kind: EventKind::RunFailed,
+        suffix: String::new(),
+        tool: None,
         turn_id: turn_id.into(),
         timestamp,
         message,
     })
 }
 
-impl Failure {
+impl Signal {
     fn event(
         &self,
         sid: &str,
         turn: &Turn,
         session: &crate::state::SessionStatus,
     ) -> Option<NormalizedEvent> {
-        if self.turn_id != turn.id || self.timestamp < turn.started_at {
+        if self.turn_id != turn.id || self.timestamp < Turns::lower_bound(turn) {
+            return None;
+        }
+        // 重读尾部时，旧提问/回答不得覆盖更新的 hook 状态。
+        if matches!(
+            self.kind,
+            EventKind::PermissionRequired | EventKind::ToolFinished
+        ) && self.timestamp < turn.awaiting_async_input.unwrap_or(session.last_activity)
+        {
             return None;
         }
         let mut event = NormalizedEvent::from_raw(
             "codex",
-            EventKind::RunFailed,
+            self.kind,
             &json!({
                 "session_id": sid, "cwd": session.cwd, "message": self.message,
             }),
         );
         event.id = format!("{EVENT_PREFIX}{sid}:{}", self.turn_id);
+        if !self.suffix.is_empty() {
+            event.id.push_str(&format!(":{}", self.suffix));
+        }
+        event.tool_name = self.tool.clone();
         event.timestamp = self.timestamp;
         event.is_subagent = turn.is_subagent || session.parent.is_some();
         event.codex = Some(CodexContext {
@@ -228,18 +307,159 @@ struct Tail {
     initialized: bool,
     carry: Vec<u8>,
     skip_line: bool,
+    turn_id: Option<String>,
+    // 大文件尾部可能没有 task_started；仅用已知起点之后的记录补齐回合身份。
+    turn_hint: Option<(String, i64)>,
+    // call_id -> (tool_name, timestamp)。异步 accepted 不移除，直到用户消息出现。
+    questions: HashMap<String, (String, i64)>,
 }
 
 impl Tail {
-    fn poll(&mut self, path: &Path) -> std::io::Result<Vec<Failure>> {
+    fn parse(&mut self, line: &str) -> Option<Signal> {
+        if let Some(signal) = parse_line(line) {
+            self.questions.clear();
+            return Some(signal);
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        let payload = value.get("payload")?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(value.get("timestamp")?.as_str()?)
+            .ok()?
+            .timestamp_millis();
+        let ty = payload.get("type")?.as_str()?;
+        if self.turn_id.is_none() {
+            self.turn_id = self
+                .turn_hint
+                .as_ref()
+                .filter(|(_, started)| *started > 0 && timestamp >= *started)
+                .map(|(id, _)| id.clone());
+        }
+        if value.get("type")?.as_str()? == "event_msg" {
+            if ty == "task_started" {
+                self.turn_id = payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.questions.clear();
+            } else if ty == "user_message" && !self.questions.is_empty() {
+                self.questions.clear();
+                return Some(Signal {
+                    kind: EventKind::ToolFinished,
+                    suffix: format!("answer:{timestamp}"),
+                    tool: Some("__user_input_answered".into()),
+                    turn_id: self.turn_id.clone()?,
+                    timestamp,
+                    message: String::new(),
+                });
+            }
+            return None;
+        }
+        if value.get("type")?.as_str()? != "response_item" {
+            return None;
+        }
+        // 桌面端的异步回答实测只追加 role=user 的 response_item，未必有 user_message。
+        // 有来源标记时必须是真用户，避免系统注入/代理消息误解除等待。
+        if ty == "message"
+            && payload.get("role").and_then(Value::as_str) == Some("user")
+            && !self.questions.is_empty()
+            && payload
+                .pointer("/internal_chat_message_metadata_passthrough/content_item_metadata")
+                .and_then(Value::as_array)
+                .is_none_or(|items| {
+                    items.iter().any(|item| {
+                        item.pointer("/provenance/type").and_then(Value::as_str) == Some("user")
+                    })
+                })
+        {
+            self.questions.clear();
+            return Some(Signal {
+                kind: EventKind::ToolFinished,
+                suffix: format!("answer:{timestamp}"),
+                tool: Some("__user_input_answered".into()),
+                turn_id: self.turn_id.clone()?,
+                timestamp,
+                message: String::new(),
+            });
+        }
+        let call = payload.get("call_id")?.as_str()?;
+        if ty == "function_call" {
+            let name = payload.get("name")?.as_str()?;
+            if !bark_adapters::claude_style::is_codex_input_tool(name) {
+                return None;
+            }
+            let turn_id = self.turn_id.clone()?;
+            // 有界缓存；超限保留等待，不凭缓存溢出推断用户回答。
+            if self.questions.len() >= 64 {
+                return None;
+            }
+            self.questions.insert(call.into(), (name.into(), timestamp));
+            let args: Value = serde_json::from_str(payload.get("arguments")?.as_str()?).ok()?;
+            let message = args
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|q| {
+                            q.get("question")
+                                .or_else(|| q.get("title"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| "请选择或回答问题".into());
+            return Some(Signal {
+                kind: EventKind::PermissionRequired,
+                suffix: format!("question:{call}"),
+                tool: Some(name.into()),
+                turn_id,
+                timestamp,
+                message,
+            });
+        }
+        if ty == "function_call_output" {
+            let (name, _) = self.questions.get(call)?;
+            let output = payload.get("output")?;
+            let parsed: Value = if let Some(s) = output.as_str() {
+                serde_json::from_str(s).unwrap_or(Value::Null)
+            } else {
+                output.clone()
+            };
+            if name.rsplit('.').next() == Some("request_user_input_async")
+                && parsed.get("accepted").and_then(Value::as_bool) == Some(true)
+            {
+                return None;
+            }
+            self.questions.remove(call);
+            if !self.questions.is_empty() {
+                return None;
+            }
+            return Some(Signal {
+                kind: EventKind::ToolFinished,
+                suffix: format!("answer:{call}"),
+                tool: Some("__user_input_answered".into()),
+                turn_id: self.turn_id.clone()?,
+                timestamp,
+                message: String::new(),
+            });
+        }
+        None
+    }
+
+    fn poll(&mut self, path: &Path) -> std::io::Result<Vec<Signal>> {
         let mut file = std::fs::File::open(path)?;
         let meta = file.metadata()?;
         let recreated = matches!((self.created, meta.created().ok()), (Some(a), Some(b)) if a != b);
-        if !self.initialized || recreated || meta.len() < self.offset {
+        let replaced = recreated || meta.len() < self.offset;
+        if !self.initialized || replaced {
             // 只读有限尾部；按 turn_id + 时间戳过滤旧回合，启动时不补发历史失败。
             self.offset = meta.len().saturating_sub(MAX_READ);
             self.skip_line = self.offset > 0;
             self.carry.clear();
+            if replaced {
+                self.questions.clear();
+                self.turn_id = None;
+            }
             self.created = meta.created().ok();
             self.initialized = true;
         }
@@ -252,8 +472,9 @@ impl Tail {
         for byte in bytes {
             if byte == b'\n' {
                 if !self.skip_line {
-                    if let Ok(line) = std::str::from_utf8(&self.carry) {
-                        if let Some(failure) = parse_line(line) {
+                    let line = std::mem::take(&mut self.carry);
+                    if let Ok(line) = std::str::from_utf8(&line) {
+                        if let Some(failure) = self.parse(line) {
                             failures.push(failure);
                         }
                     }
@@ -272,6 +493,14 @@ impl Tail {
     }
 }
 
+fn replaces_pending(old: &NormalizedEvent, event: &NormalizedEvent) -> bool {
+    let terminal = |e: &NormalizedEvent| matches!(e.kind,
+        EventKind::RunCompleted | EventKind::RunFailed | EventKind::RunAborted);
+    // 同会话的新回合可以替换旧回合终态；同回合则终态优先、取最后状态。
+    old.codex.as_ref().and_then(|c| c.turn_id.as_ref()) != event.codex.as_ref().and_then(|c| c.turn_id.as_ref())
+        || ((terminal(event) || !terminal(old)) && event.timestamp >= old.timestamp)
+}
+
 pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
     // 文件 IO 在独立线程中执行，不阻塞 Tauri/tokio 的事件管道。
     let result = std::thread::Builder::new().name("codex-terminal-watch".into()).spawn(move || {
@@ -279,8 +508,15 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
             .unwrap_or_else(|| bark_adapters::InstallEnv::detect().home.join(".codex"));
         let database = home.join("state_5.sqlite");
         let mut tails: HashMap<PathBuf, Tail> = HashMap::new();
+        let mut generation = bark_adapters::watch::recheck_generation();
         let mut pending: HashMap<String, NormalizedEvent> = HashMap::new();
         while !tx.is_closed() {
+            let requested = bark_adapters::watch::recheck_generation();
+            if requested != generation {
+                // 主动核验重读有限尾部，补偿漏收事件；事件 id 与回合封口负责去重。
+                for tail in tails.values_mut() { tail.initialized = false; }
+                generation = requested;
+            }
             if !read(&state.config).agent_disabled("codex") {
                 let watching = lock(&state.codex_turns).watching();
                 let sessions = lock(&state.active_sessions).clone();
@@ -295,13 +531,19 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
                     }
                     let Some(path) = &turn.path else { continue };
                     paths.insert(path.clone());
-                    match tails.entry(path.clone()).or_default().poll(path) {
+                    let tail = tails.entry(path.clone()).or_default();
+                    tail.turn_hint = Some((turn.id.clone(), Turns::lower_bound(&turn)));
+                    match tail.poll(path) {
                         Ok(failures) => for failure in failures {
                             if let Some(event) = failure.event(&sid, &turn, session) {
-                                pending.insert(event.id.clone(), event);
+                                // 同批只提交最后一个状态，避免已答完的历史问题闪橙色。
+                                if pending.get(&sid).is_none_or(|old| replaces_pending(old, &event))
+                                {
+                                    pending.insert(sid.clone(), event);
+                                }
                             }
                         },
-                        Err(error) => tracing::debug!(?path, %error, "Codex transcript 读取失败，超时回收兜底"),
+                        Err(error) => tracing::debug!(?path, %error, "Codex transcript 读取失败，保留当前状态，等待可靠信号"),
                     }
                 }
                 tails.retain(|path, _| paths.contains(path));
@@ -322,7 +564,7 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
         }
     });
     if let Err(error) = result {
-        tracing::warn!(%error, "Codex 终态监控启动失败，超时回收兜底");
+        tracing::warn!(%error, "Codex 终态监控启动失败，保留当前状态，等待可靠信号");
     }
 }
 
@@ -361,7 +603,16 @@ mod tests {
         }
         let mut normal: Value = serde_json::from_str(FAILURE).unwrap();
         normal["payload"]["error"] = Value::Null;
-        assert!(parse_line(&normal.to_string()).is_none());
+        assert_eq!(
+            parse_line(&normal.to_string()).unwrap().kind,
+            EventKind::RunCompleted
+        );
+        normal["payload"]["type"] = json!("turn_aborted");
+        assert_eq!(
+            parse_line(&normal.to_string()).unwrap().kind,
+            EventKind::RunAborted
+        );
+        normal["payload"]["type"] = json!("task_complete");
         normal["payload"]["error"] = json!({});
         assert!(parse_line(&normal.to_string()).is_none());
         normal["payload"]["error"] = json!({"message": "Authentication failed"});
@@ -369,6 +620,198 @@ mod tests {
             parse_line(&normal.to_string()).unwrap().message,
             "Authentication failed"
         );
+    }
+
+    fn record(ty: &str, payload: Value) -> String {
+        json!({"timestamp":"2026-10-29T03:00:00Z", "type":ty, "payload":payload}).to_string()
+    }
+
+    #[test]
+    fn question_waits_for_answer_and_async_acceptance_does_not_resume() {
+        for name in ["request_user_input", "functions.request_user_input_async"] {
+            let mut tail = Tail::default();
+            tail.parse(&record(
+                "event_msg",
+                json!({"type":"task_started", "turn_id":"t1"}),
+            ));
+            let question = tail
+                .parse(&record(
+                    "response_item",
+                    json!({
+                        "type":"function_call", "name":name, "call_id":"q1",
+                        "arguments":r#"{"questions":[{"question":"请选择部署环境"}]}"#,
+                    }),
+                ))
+                .unwrap();
+            assert_eq!(question.kind, EventKind::PermissionRequired);
+            assert_eq!(question.message, "请选择部署环境");
+            assert_eq!(question.turn_id, "t1");
+            if name.ends_with("async") {
+                assert!(tail.parse(&record("response_item", json!({
+                    "type":"function_call_output", "call_id":"q1", "output":"{\"accepted\":true}",
+                }))).is_none());
+                let answer = tail
+                    .parse(&record("event_msg", json!({"type":"user_message"})))
+                    .unwrap();
+                assert_eq!(answer.kind, EventKind::ToolFinished);
+            } else {
+                assert!(tail
+                    .parse(&record(
+                        "response_item",
+                        json!({
+                            "type":"function_call_output", "call_id":"unrelated", "output":"{}",
+                        })
+                    ))
+                    .is_none());
+                let answer = tail.parse(&record("response_item", json!({
+                    "type":"function_call_output", "call_id":"q1", "output":"{\"answers\":{}}",
+                }))).unwrap();
+                assert_eq!(answer.kind, EventKind::ToolFinished);
+            }
+            assert!(tail.questions.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_question_call_releases_wait_and_new_turn_drops_old_question() {
+        let mut tail = Tail::default();
+        tail.parse(&record(
+            "event_msg",
+            json!({"type":"task_started", "turn_id":"t1"}),
+        ));
+        let call = record(
+            "response_item",
+            json!({"type":"function_call", "name":"request_user_input_async",
+            "call_id":"q1", "arguments":"{}"}),
+        );
+        tail.parse(&call).unwrap();
+        assert_eq!(
+            tail.parse(&record(
+                "response_item",
+                json!({"type":"function_call_output",
+            "call_id":"q1", "output":"tool unavailable"})
+            ))
+            .unwrap()
+            .kind,
+            EventKind::ToolFinished
+        );
+        tail.parse(&call).unwrap();
+        tail.parse(&record(
+            "event_msg",
+            json!({"type":"task_started", "turn_id":"t2"}),
+        ));
+        assert!(tail.questions.is_empty());
+        assert!(tail
+            .parse(&record(
+                "response_item",
+                json!({"type":"function_call_output",
+            "call_id":"q1", "output":"{}"})
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn desktop_async_answer_resumes_but_injected_message_does_not() {
+        let mut tail = Tail {
+            turn_hint: Some(("t1".into(), 1)),
+            ..Default::default()
+        };
+        tail.parse(&record(
+            "response_item",
+            json!({"type":"function_call",
+            "name":"request_user_input_async", "call_id":"q1", "arguments":"{}"}),
+        ))
+        .unwrap();
+        for source in ["system", "user"] {
+            let answer = tail.parse(&record(
+                "response_item",
+                json!({"type":"message", "role":"user",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata":[{"provenance":{"type":source}}]
+                    }
+                }),
+            ));
+            if source == "system" {
+                assert!(answer.is_none());
+            } else {
+                assert_eq!(answer.unwrap().kind, EventKind::ToolFinished);
+            }
+        }
+        assert!(tail.questions.is_empty());
+    }
+
+    #[test]
+    fn known_turn_start_allows_bounded_tail_without_replaying_older_questions() {
+        let mut tail = Tail {
+            turn_hint: Some(("t1".into(), 1)),
+            ..Default::default()
+        };
+        let call = record(
+            "response_item",
+            json!({"type":"function_call", "name":"request_user_input",
+            "call_id":"q1", "arguments":"{}"}),
+        );
+        assert_eq!(tail.parse(&call).unwrap().turn_id, "t1");
+        for started in [0, i64::MAX] {
+            let mut tail = Tail {
+                turn_hint: Some(("t1".into(), started)),
+                ..Default::default()
+            };
+            assert!(tail.parse(&call).is_none());
+        }
+    }
+
+    #[test]
+    fn async_wait_survives_background_activity_until_user_answers() {
+        let mut turns = Turns::default();
+        turns.accept(&hook("UserPromptSubmit", "t1", 1000, "work"));
+        let mut question = hook("PermissionRequest", "t1", 2000, "");
+        question.tool_name = Some("functions.request_user_input_async".into());
+        assert!(turns.accept(&question));
+        assert!(turns.accept(&hook("PreToolUse", "t1", 3000, "")));
+        assert!(turns.preserve_wait(&hook("PreToolUse", "t1", 3000, "")));
+        assert!(turns.accept(&hook("PostToolUse", "t1", 4000, "")));
+        let mut answer = hook("PostToolUse", "t1", 5000, "");
+        answer.tool_name = Some("__user_input_answered".into());
+        assert!(turns.accept(&answer));
+        assert!(turns.accept(&hook("PreToolUse", "t1", 6000, "")));
+        question.timestamp = 6500;
+        assert!(turns.accept(&question));
+        assert!(turns.accept(&hook("Stop", "t1", 7000, "")));
+    }
+
+    #[test]
+    fn pending_terminal_cannot_hide_question_from_next_turn() {
+        let terminal = hook("Stop", "t1", 2000, "");
+        let old_question = hook("PermissionRequest", "t1", 1000, "");
+        let new_question = hook("PermissionRequest", "t2", 3000, "");
+        assert!(!replaces_pending(&terminal, &old_question));
+        assert!(replaces_pending(&old_question, &terminal));
+        assert!(replaces_pending(&terminal, &new_question));
+    }
+
+    #[test]
+    fn midturn_observation_supplies_hint_and_delayed_answer_survives_background_activity() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-29T03:00:00Z").unwrap().timestamp_millis();
+        let mut question = hook("PreToolUse", "t1", at, "");
+        question.codex.as_mut().unwrap().transcript_path = None;
+        question.kind = EventKind::PermissionRequired;
+        question.tool_name = Some("request_user_input_async".into());
+        let mut turns = Turns::default();
+        assert!(turns.accept(&question));
+        assert!(turns.accept(&hook("PreToolUse", "t1", at + 2000, "")));
+        let turn = &turns.current["s1"];
+        assert_eq!(turn.started_at, 0);
+        assert_eq!(Turns::lower_bound(turn), at);
+        let mut tail = Tail { turn_hint: Some((turn.id.clone(), Turns::lower_bound(turn))), ..Default::default() };
+        assert_eq!(tail.parse(&record("response_item", json!({
+            "type":"function_call", "name":"request_user_input_async", "call_id":"q", "arguments":"{}"
+        }))).unwrap().turn_id, "t1");
+        let mut answer = hook("PostToolUse", "t1", at + 1000, "");
+        answer.id = format!("{EVENT_PREFIX}s1:t1:answer");
+        answer.tool_name = Some("__user_input_answered".into());
+        assert!(turns.accept(&answer), "回答晚到不应被较新的后台活动挡掉");
+        assert!(!turns.preserve_wait(&hook("PreToolUse", "t1", at + 3000, "")));
     }
 
     #[test]

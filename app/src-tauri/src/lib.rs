@@ -37,6 +37,7 @@ pub fn run() {
             commands::list_events,
             commands::clear_events,
             commands::list_active_sessions,
+            commands::dismiss_session,
             commands::test_channel,
             commands::test_sound,
             commands::diagnostics,
@@ -45,11 +46,12 @@ pub fn run() {
             commands::glow_off,
             commands::list_monitors,
             commands::save_widget_position,
+            commands::start_widget_drag,
             commands::set_widget_pinned,
-            commands::set_widget_auto_hide,
+            commands::take_widget_reveal,
             commands::close_widget,
             commands::show_main_panel,
-            commands::reset_glow,
+            commands::recheck_sessions,
             commands::toggle_mute,
             commands::quit_app,
             update::check_update,
@@ -185,18 +187,19 @@ pub fn run() {
             // 悬浮窗：开关开着就按记住的位置建窗（sync 内部会派发到主线程）
             widget::sync(&app.handle(), &state);
 
-            // 心跳判死巡检：agent 被杀 / 回合被用户中断之后可能**再也不发任何事件**，
-            // 只靠「下一条事件」来判死会让流光一直停在思考色（实测 ZCode 手动终止即如此）。
-            // 每 30s 清一次僵死会话并据结果改流光——判死阈值本身是 10 分钟，
-            // 周期取小值只是让失败色亮得及时，不改变判死口径。
+            // 5 分钟主动核验一次；显示器布局维护仍保持 30 秒周期。
             {
                 let handle = app.handle().clone();
                 let sweep_state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+                    let mut last_recheck = std::time::Instant::now();
                     loop {
                         tokio::time::sleep(SWEEP_INTERVAL).await;
-                        state::sweep_stale_sessions(&sweep_state, &handle);
+                        if last_recheck.elapsed() >= state::RECHECK_INTERVAL {
+                            state::recheck_sessions(&sweep_state, &handle);
+                            last_recheck = std::time::Instant::now();
+                        }
                         // 流光窗口随巡检对齐显示器布局：热插拔 / 改分辨率后自愈
                         // （对齐是差量的：布局没变时只是枚举一遍显示器）
                         glow::maintain(&handle, &sweep_state);
@@ -222,7 +225,8 @@ pub fn run() {
 
             // 托盘（B15：默认图标缺失时降级为系统默认，不再 panic）。
             // 右键单击弹出 tray_menu 的自绘菜单——样式与悬浮窗右键菜单同一套；
-            // 双击左键直接开面板。主面板只从这里（双击托盘 / 菜单「显示主窗口」）
+            // 左键单击临时展开已启用的悬浮窗，双击左键直接开面板。
+            // 主面板只从这里（双击托盘 / 菜单「显示主窗口」）
             // 和悬浮窗双击打开，启动时不再自动显示——唯一例外：本机一个 agent 都没接上时，
             // 前端会主动引导弹出并停在「Agents 接入」页（commands::needs_agent_setup）。
             let mut tray = TrayIconBuilder::with_id("main-tray");
@@ -235,15 +239,19 @@ pub fn run() {
             tray
                 .tooltip("AgentBark")
                 .on_tray_icon_event(|tray, event| match event {
-                    // 双击（左键）：直接开面板。Windows 双击序列是 DOWN/UP/DBLCLK/UP，
-                    // 两侧的 Click(Up) 是左键、走不到下面的右键分支，无需额外压制。
+                    // 双击仍打开面板；其中的左键单击也可临时展开悬浮窗。
                     tauri::tray::TrayIconEvent::DoubleClick {
                         button: tauri::tray::MouseButton::Left,
                         ..
                     } => {
                         show_main(tray.app_handle());
                     }
-                    // 右键抬起弹菜单（原生菜单同款时机）；左键单击不做事
+                    tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } => widget::reveal(tray.app_handle()),
+                    // 右键抬起弹菜单（原生菜单同款时机）。
                     tauri::tray::TrayIconEvent::Click {
                         position,
                         rect,

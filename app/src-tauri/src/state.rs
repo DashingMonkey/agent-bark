@@ -74,40 +74,12 @@ pub struct SessionStatus {
     pub parent_key: Option<String>,
 }
 
-/// 心跳静止超过该时长的会话视为僵死（agent 被杀时不会有 Stop 事件），
-/// 读取/处理新事件时淘汰，防止状态永远卡在「运行中」
-pub const STALE_AFTER_MS: i64 = 10 * 60 * 1000;
-/// 覆盖判死时长的环境变量名（见 `stale_after_ms`）
-pub const STALE_ENV: &str = "BARK_STALE_AFTER_MS";
-/// 覆盖值的下限：低于这个值误杀风险太大（正常工具调用也会有几十秒静默）
-const STALE_MIN_MS: i64 = 5_000;
-
-/// 运行时的判死时长：默认 [`STALE_AFTER_MS`]，可用 `BARK_STALE_AFTER_MS`（毫秒）覆盖。
-///
-/// 存在的理由：有的 agent 被用户中断时**一个事件都不发**（实测 ZCode 7 个事件全埋探针、
-/// 手动终止后零事件），我们只能靠「心跳静止」推断它已经停了——10 分钟是防「长工具调用
-/// 被误判」的保守值，但对着屏幕等 10 分钟才变红也很难受。需要更快反馈就把这个值调小
-/// （代价是长时间跑单个工具时可能被误判成「意外终止」）。
-///
-/// 只在进程内解析一次：prune 在事件路径上是热路径，不该每次都读环境。
-pub fn stale_after_ms() -> i64 {
-    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var(STALE_ENV)
-            .ok()
-            .and_then(|v| parse_stale_override(&v))
-            .unwrap_or(STALE_AFTER_MS)
-    })
-}
-
-/// 解析覆盖值（纯函数，便于测试）：必须是 ≥5s 的整数毫秒，否则忽略
-fn parse_stale_override(raw: &str) -> Option<i64> {
-    raw.trim()
-        .parse::<i64>()
-        .ok()
-        .filter(|v| *v >= STALE_MIN_MS)
-}
-/// 状态表上限：超出时淘汰最久未活动的（防泄漏，正常同时活跃会话远达不到）
+/// 离线补投状态有效期：旧事件不改会话表、不驱动光效/音效，历史与通知仍保留。
+/// 不限制活跃任务的运行时长。
+const REPLAY_MAX_AGE_MS: i64 = 10 * 60 * 1000;
+/// 主动核验周期；实际来源观察器仍按自己的秒级周期持续读取。
+pub const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// 状态表上限：满时拒绝新建显示条目，绝不淘汰正在执行的旧任务。
 const ACTIVE_SESSIONS_CAP: usize = 64;
 /// 回合刚结束后的「空闲回声」宽限窗：TraeCode 实测每回合 Stop 后都会立即跟一条
 /// Notification（空闲类），若按打断处理，流光会在完成色后误转等待色。宽限窗内的
@@ -142,6 +114,8 @@ pub struct AppState {
     pub history: Mutex<VecDeque<NormalizedEvent>>,
     /// 会话实时状态表（key = agent|session_id，由心跳事件推导）
     pub active_sessions: Mutex<HashMap<String, SessionStatus>>,
+    /// 用户移除的显示条目：旧事件、缓存心跳和核验重读不能把它重新放回。
+    dismissed_sessions: Mutex<HashMap<String, i64>>,
     /// key → 会话最近一次因终态事件被移除的时刻。
     /// 仅当移除时条目真实存在才记录（= 该 agent 会发心跳）——据此把「回合刚结束
     /// 的空闲回声」与「无心跳 agent 的真等待」区分开（见 apply_session_event）
@@ -151,6 +125,8 @@ pub struct AppState {
     pub watchers: Mutex<HashMap<String, WatcherHandle>>,
     /// 全局静音（托盘开关，仅暂停推送，事件仍入历史；重启后恢复）
     pub muted: std::sync::atomic::AtomicBool,
+    /// 托盘单击的展开请求：前端订阅完成后领取，避免建窗期间丢事件。
+    pub widget_reveal_pending: std::sync::atomic::AtomicBool,
     /// 屏幕边缘流光的当前状态（glow 模块读写，UI 只经 command 改它做预览）
     pub glow: Mutex<GlowState>,
     /// 正在进行的预览：`Some((序号, 预览前要恢复到的状态))`。
@@ -175,9 +151,8 @@ pub struct AppState {
     /// 独立通道各报一次时（如 WorkBuddy 轮询的撕裂快照把同一终态报两遍，
     /// 两次事件 id 不同、id 去重拦不住），在短窗口内压制第二条。
     /// 用 `Instant`（单调钟）度量窗口流逝（§1.7）：墙钟被 NTP 前跳/回拨会让
-    /// 6s 窗变成长期压制的通知黑洞。**残余口径**：会话判死（prune_stale 的
-    /// ms 时间戳）保持墙钟——跨进程事件时间只能用墙钟（服务端已把客户端时间戳
-    /// 夹取到 [now-1h, now]），本窗口是纯进程内流逝时间，才用得起单调钟。
+    /// 6s 窗变成长期压制的通知黑洞。跨进程事件时间仍使用墙钟，
+    /// 本窗口只衡量进程内流逝时间。
     recent_notified: Mutex<HashMap<String, Instant>>,
     /// 会话快照最近一次推送时刻（§4.4 限频）：纯 last_activity/计数变化的推送
     /// 节流到 ≥500ms 一次；相位跃迁/建档/摘档立即推（见 should_push_snapshot）
@@ -328,10 +303,12 @@ impl AppState {
             server_token,
             history: Mutex::new(VecDeque::with_capacity(HISTORY_CAP)),
             active_sessions: Mutex::new(HashMap::new()),
+            dismissed_sessions: Mutex::new(HashMap::new()),
             recent_finished: Mutex::new(HashMap::new()),
             codex_turns: Mutex::new(crate::codex_watch::Turns::default()),
             watchers: Mutex::new(HashMap::new()),
             muted: std::sync::atomic::AtomicBool::new(false),
+            widget_reveal_pending: std::sync::atomic::AtomicBool::new(false),
             glow: Mutex::new(GlowState::Idle),
             glow_preview: Mutex::new(None),
             pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -492,7 +469,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
 
         // 0.3 空 session_id 的事件不进状态机/glow/音效/通知聚合，只入历史与事件流：
         //     stdin 超时的空 payload 照样能 normalize 出事件（§2.11），session_key 会
-        //     建出 `"agent|"` 幻影会话——心跳判死时还会凭空亮失败色。幻影会话没有任何
+        //     建出 `"agent|"` 幻影会话并留下无主光效。幻影会话没有任何
         //     展示价值，但事件本身要留痕（排查「hook 超时」要用）。
         if skips_state_machine(&event) {
             tracing::debug!(agent = %event.agent, "empty session_id, publish only");
@@ -507,14 +484,15 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         }
         if event.agent == "codex" && event.id.starts_with(crate::codex_watch::EVENT_PREFIX)
             && !lock(&state.active_sessions).contains_key(&session_key("codex", &event.session_id)) {
-            // 排队期间已超时/被用户清理的会话不补发失败通知；回合封口仍保留。
+            // 已被清理的会话不补发来源核验事件；回合封口仍保留。
             continue;
         }
 
         // 0.5 会话实时状态：所有事件（含心跳）都参与推导，变化即推送前端快照。
-        //     陈旧补投（时间戳老过判死阈值）不进状态表——它声称的任何状态都已过时。
+        //     陈旧补投（时间戳老过补投有效期）不进状态表——它声称的任何状态都已过时。
+        let preserve_wait = event.agent == "codex" && lock(&state.codex_turns).preserve_wait(&event);
         let stale = is_stale_replay(&event);
-        let (running_lost, suppressed_echo, phase_changed, deferred) = {
+        let (suppressed_echo, phase_changed, deferred) = {
             let mut sessions = lock(&state.active_sessions);
             let mut finished = lock(&state.recent_finished);
             if event.cwd.is_empty() {
@@ -531,10 +509,14 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                     event.message = s.lifecycle.candidate_message.clone();
                 }
             }
-            let delta = apply_session_event_inner(&mut sessions, &mut finished, &event, stale);
+            let delta = if suppress_dismissed(&mut lock(&state.dismissed_sessions), &event) {
+                SessionDelta { suppressed_echo: true, ..Default::default() }
+            } else {
+                apply_session_event_with_wait(&mut sessions, &mut finished, &event, stale, preserve_wait)
+            };
             // 子代理事件声明了血缘（parent_session_id）→ 存活心跳向祖先递归传播：
             // 子代理干活期间父会话没有任何自己的事件（实测 DSH `Agent` 工具单次可跑
-            // 27 分钟），不传播会被判死巡检误判成「意外终止」。陈旧补投不算存活
+            // 27 分钟），传播可让父行的最后活动反映后代进展。陈旧补投不算存活
             // ——它只证明事件时刻活着，与 stale 不进状态表同口径。
             if !stale {
                 if let Some(parent) = &event.parent_session_id {
@@ -546,7 +528,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                 }
             }
             if delta.changed {
-                let snapshot = sessions_snapshot(&sessions, event.timestamp);
+                let snapshot = sessions_snapshot(&sessions);
                 drop(sessions);
                 // 快照限频（§4.4）：一回合上百条心跳都只刷 last_activity/计数，
                 // 全量快照每条一推纯属浪费 IPC；相位跃迁/建档/摘档（urgent）立即推
@@ -554,7 +536,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                     let _ = app.emit("bark://sessions", &snapshot);
                 }
             }
-            (delta.running_lost, delta.suppressed_echo, delta.phase_changed, delta.deferred)
+            (delta.suppressed_echo, delta.phase_changed, delta.deferred)
         };
         event.completion_deferred = deferred || (suppressed_echo && event.kind == EventKind::RunCompleted);
         if deferred {
@@ -568,16 +550,16 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         // 0.6 屏幕边缘流光：会话表已更新完，据此推导颜色。
         //     放在锁外——内部可能要建窗口（会派发到主线程）。
         //     终态回声（如上文 Stop 之后紧跟的 SessionEnd）不改状态表，也不该改流光，
-        //     否则正常回合的完成色会被压成失败色；但心跳判死仍需照常显失败色。
+        //     否则正常回合的完成色会被迟到事件覆盖。
         //     陈旧补投（stale）不驱动 glow/音效（§1.6）：它声称的状态早已过时，
         //     照常驱动会「开局红光 + 失败音」；历史与通知保留（离线兜底的本意）。
-        if !deferred && should_drive_glow(stale, suppressed_echo, running_lost) {
-            crate::glow::update_from_event(&app, &state, &event, running_lost);
+        if !deferred && should_drive_glow(stale, suppressed_echo) {
+            crate::glow::update_from_event(&app, &state, &event);
             // 状态音效与流光同一套四状态语义（思考/等待/完成/失败），默认全部未选
             // = 静音。子代理事件不响（与通知的子代理过滤同口径，否则一个任务拆出
             // 十几个子代理会连响十几声）。
             if !event.is_subagent {
-                if let Some(key) = sound_key_for(&event, running_lost) {
+                if let Some(key) = sound_key_for(&event) {
                     if should_play_state_sound(key, phase_changed) {
                         play_state_sound(&state, key);
                     }
@@ -773,13 +755,13 @@ fn claim_pending(
 ///
 /// 陈旧补投（stale）**不驱动**：它声称的状态早已过时，照常驱动会「开局红光 + 失败音」
 /// （启动补投一条 40 分钟前的 RunFailed 即复现）；历史与通知保留（离线兜底的本意）。
-/// 终态回声不驱动（完成色不能被压成失败色），但回声捎带的心跳判死（running_lost）要驱动。
-fn should_drive_glow(stale: bool, suppressed_echo: bool, running_lost: bool) -> bool {
-    !stale && (!suppressed_echo || running_lost)
+/// 终态回声不重复触发光效。
+fn should_drive_glow(stale: bool, suppressed_echo: bool) -> bool {
+    !stale && !suppressed_echo
 }
 
 /// 空 session_id 的事件只入历史与事件流（§2.11）：stdin 超时的空 payload 照样
-/// normalize 出事件，进状态机会建出 `"agent|"` 幻影会话（判死时凭空亮失败色）。
+/// normalize 出事件，进状态机会建出 `"agent|"` 幻影会话并点亮无主光效。
 fn skips_state_machine(ev: &NormalizedEvent) -> bool {
     ev.session_id.trim().is_empty()
 }
@@ -812,22 +794,16 @@ fn dispatch_gate(muted: bool, quiet_now: bool) -> bool {
 
 /// 事件 → 状态音效 key（与流光四色状态同语义）。`None` = 该事件不对应任何状态音。
 ///
-/// - 用户主动中止（run_aborted）不响：与流光同口径同优先级——derive 里
-///   RunAborted 分支也在判死之前（「那是你自己按的停止」，即便同一瞬间
-///   恰好有别的会话被心跳判死，也不该播「意外终止」吓人）；
-/// - 心跳判死（agent 进程没了）算「意外终止」，优先于事件本身；
+/// - 用户主动中止不响；
 /// - 完成 / 失败 / 等待（确认与输入）直接按事件角色；
 /// - 思考音挂在「不带工具名的心跳」上——那是一次新回合的开始
 ///   （UserPromptSubmit），同回合后续的工具心跳不重复响；监控型 adapter 的
 ///   保活心跳是同一种事件载体，靠 [`should_play_state_sound`] 的跃迁门挡住重播；
 /// - 工具收尾（ToolFinished）不响：它每次工具结束都来一条，
 ///   会把「新回合开始」的语义淹没（思考音只标回合起点）。
-fn sound_key_for(event: &NormalizedEvent, running_lost: bool) -> Option<&'static str> {
+fn sound_key_for(event: &NormalizedEvent) -> Option<&'static str> {
     if event.kind == EventKind::RunAborted {
         return None;
-    }
-    if running_lost {
-        return Some("failed");
     }
     match event.kind {
         EventKind::RunCompleted => Some("completed"),
@@ -903,8 +879,7 @@ fn drop_agent_sessions(state: &AppState, agent: &str) -> (bool, bool) {
 /// **两处调用点必须走这里，口径必须一致**：管道里「已关闭接入」的门，以及关闭开关时的
 /// 即时清理。历史上后者只手写了 `drop_agent_sessions` 而漏掉流光那一步，后果是一盏
 /// 熄不掉的灯：关掉最后一个在跑的 agent 接入后，它的事件从此被门丢弃（`changed` 永远
-/// 为 false，再也走不到善后），判死巡检也因表已空而无变化、在 `sweep_stale_sessions`
-/// 的 `!changed` 分支早退——思考色 / 等待色会一直挂在屏幕上，只有托盘「重置流光」能解。
+/// 为 false，再也走不到善后），后台也不再有事件能触发状态刷新——思考色 / 等待色会一直挂在屏幕上，因此关闭接入时必须同步清理显示。
 ///
 /// 流光不区分 agent，所以摘完要按**剩余**会话重新推导，而不是只在一处分叉上处理：
 /// - 表已空：当前不是终态指示（会自己过期的绿/红不受影响）时收回，免得留下僵尸色；
@@ -923,7 +898,7 @@ pub fn drop_agent_sessions_and_sync(app: &AppHandle, state: &Arc<AppState>, agen
     let _ = app.emit("bark://sessions", &snapshot);
     match glow_after_drop(empty, crate::glow::current(state).is_terminal()) {
         GlowAfterDrop::Reset => crate::glow::reset(app, state),
-        GlowAfterDrop::Refresh => crate::glow::refresh_from_sessions(app, state, false),
+        GlowAfterDrop::Refresh => crate::glow::refresh_from_sessions(app, state),
         GlowAfterDrop::Keep => {}
     }
 }
@@ -1064,38 +1039,8 @@ pub(crate) fn session_key(agent: &str, session_id: &str) -> String {
     format!("{agent}|{session_id}")
 }
 
-/// 惰性淘汰的结果
-struct PruneResult {
-    /// 状态表是否发生变化（决定要不要推前端快照）
-    changed: bool,
-    /// 被淘汰的条目里是否有「正在运行中」的会话。
-    /// 这类会话是被心跳超时判死的（agent 进程被杀不会有 Stop 事件），
-    /// 对屏幕边缘流光来说就是「意外终止」→ 失败色。
-    running_lost: bool,
-}
-
-/// 淘汰僵死条目（agent 被杀时不会有 Stop，靠心跳静止判定），返回是否有变化
-fn prune_stale(sessions: &mut HashMap<String, SessionStatus>, now_ms: i64) -> PruneResult {
-    let stale = stale_after_ms();
-    let before = sessions.len();
-    let running_lost = sessions.iter().any(|(_, s)| {
-        now_ms.saturating_sub(s.last_activity) >= stale
-            && matches!(s.phase, SessionPhase::Thinking | SessionPhase::ToolRunning)
-    });
-    sessions.retain(|_, s| now_ms.saturating_sub(s.last_activity) < stale);
-    PruneResult { changed: before != sessions.len(), running_lost }
-}
-
-/// 日志存活心跳（正向存活信号）：把该会话的 `last_activity` 刷到现在。
-///
-/// 判死口径由此从「无 hook 心跳」收紧为「无 hook **且** 无日志活动」：长工具 /
-/// 长子代理 / 长思考期间 hook 静默是常态（实测 ZCode `Agent` 工具单次可跑 27 分钟、
-/// 父会话静默 21 分钟），但 agent 自己的日志还在写——静默 ≠ 死亡。真死亡（进程
-/// 被杀）日志同步停写，判死照常；用户中断后的会话不再产生日志行，判死兜底也照常
-/// （不会被续命）。当前只有 ZCode 有这个信号（看门狗尾随其日志，见 `abort_watch`）。
-///
-/// 只刷新时间戳：不改相位、不推快照（纯保活没有可见变化，UI 的15s 对账会带上新值）；
-/// 条目不存在时**不建档**——日志里有启动前/已结束的陈年会话，建档会造出幻影会话。
+/// 日志活动刷新已有会话的 `last_activity`；不改相位、不建档。
+/// 静默不再触发终止。真实日志活动仍供界面展示，并沿子代理血缘传播。
 pub fn touch_session(state: &AppState, agent: &str, session_id: &str) {
     let mut sessions = lock(&state.active_sessions);
     touch_session_at(&mut sessions, agent, session_id, bark_core::now_millis());
@@ -1121,7 +1066,7 @@ fn touch_session_at(
 ///
 /// 血缘边来自事件的 `parent_session_id`（建档时存进 [`SessionStatus::parent_key`]）：
 /// 子代理干活时父会话自己没有任何事件（实测 DSH `Agent` 工具单次可跑 27 分钟、
-/// 父会话静默 21 分钟），父条目会被「心跳静止判死」误杀成意外终止（红光 + 失败音）。
+/// 父会话静默 21 分钟），需要沿父链更新最后活动以反映后代进展。
 /// 与 ZCode 日志存活的 parentSessionId 传播同一套口径。
 ///
 /// 只刷 `last_activity`、不动相位（[`touch_session_at`] 同语义）——子代理的活动
@@ -1146,11 +1091,10 @@ fn touch_ancestors_at(
 }
 
 /// 一次事件引起的状态表变化
+#[derive(Default)]
 struct SessionDelta {
-    /// 状态表内容有变化（含淘汰），应推前端快照
+    /// 状态表内容有变化（含摘档），应推前端快照
     changed: bool,
-    /// 有「运行中」的会话被判死（心跳超时）
-    running_lost: bool,
     /// 本事件是回合刚结束的「空闲回声」：状态表不动、不推送快照、不发通知
     /// （完成色照常停留淡出；事件仍入历史与前端事件流）
     suppressed_echo: bool,
@@ -1164,18 +1108,17 @@ struct SessionDelta {
     deferred: bool,
 }
 
-/// 状态表快照（剔除僵死条目，按回合开始时间倒序，展示稳定）
-fn sessions_snapshot(sessions: &HashMap<String, SessionStatus>, now_ms: i64) -> Vec<SessionStatus> {
+/// 状态表快照：长任务和等待用户的会话不因静默而隐藏。
+fn sessions_snapshot(sessions: &HashMap<String, SessionStatus>) -> Vec<SessionStatus> {
     let mut out: Vec<SessionStatus> = sessions
         .values()
-        .filter(|s| now_ms.saturating_sub(s.last_activity) < stale_after_ms())
         .cloned()
         .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.started_at));
     out
 }
 
-/// 「运行中会话」面板的数据源：剔除僵死条目（心跳静止超时）与**已显式关闭接入**的 agent。
+/// 「运行中会话」面板的数据源：只过滤已显式关闭接入的 agent。
 ///
 /// 关闭接入后该 agent 可能再也不会上报（hook 型：hook 已被摘掉），等不到管道门那条事件
 /// 来清表，所以这里按开关即时过滤——EventsPage 每 15s 对账一次，最迟一个周期后消失。
@@ -1188,50 +1131,88 @@ pub fn sessions_for_ui(state: &AppState) -> Vec<SessionStatus> {
     // 反向路径，锁序无环（config → active_sessions）
     let cfg = read(&state.config);
     let sessions = lock(&state.active_sessions);
-    let mut out = sessions_snapshot(&sessions, bark_core::now_millis());
+    let mut out = sessions_snapshot(&sessions);
     out.retain(|s| !cfg.agent_disabled(&s.agent));
     out
 }
 
-/// 巡检的纯逻辑：淘汰僵死条目并给出新快照。
-/// 返回 `(是否变化, 是否有运行中的会话被判死, 新快照)`（无变化时快照为空）。
-fn prune_and_snapshot(
-    sessions: &mut HashMap<String, SessionStatus>,
-    now_ms: i64,
-) -> (bool, bool, Vec<SessionStatus>) {
-    let r = prune_stale(sessions, now_ms);
-    let snapshot = if r.changed { sessions_snapshot(sessions, now_ms) } else { Vec::new() };
-    (r.changed, r.running_lost, snapshot)
+/// 定时与手动共用的主动核验入口。唤醒来源监控后，证据事件走原有管道。
+/// 不把静默、读取失败、未知 schema 或不支持核验解释为终止。
+pub fn recheck_sessions(state: &Arc<AppState>, app: &AppHandle) {
+    bark_adapters::watch::request_recheck();
+    let snapshot = sessions_for_ui(state);
+    let _ = app.emit("bark://sessions", &snapshot);
+    crate::glow::reconcile(app, state);
 }
 
-/// 心跳判死巡检：由后台定时器周期调用（见 `lib.rs`）。
-///
-/// **为什么必须由定时器驱动**：`prune_stale` 过去只在「有事件进来」时才跑，而 agent 被杀
-/// 或回合被用户中断之后可能**再也不发任何事件**（实测 ZCode 手动终止：既没有 `Stop`、
-/// 也没有任何「会话结束」类事件）——于是流光永远停在思考色（用户实测复现），状态表条目也只在
-/// 15s 轮询的快照过滤里「看不见」，并没有真正被清掉。这里让判死自己发生：
-/// 清表 + 推前端快照 + 该转失败色的转失败色、该收回的收回。
-pub fn sweep_stale_sessions(state: &Arc<AppState>, app: &AppHandle) {
-    let (changed, running_lost, snapshot) = {
+/// 移除只影响本应用，不生成终态、不停止宿主。锁序与管道一致：sessions → dismissed。
+pub async fn dismiss_session(state: &Arc<AppState>, app: &AppHandle, agent: &str, sid: &str,
+    expected_started_at: i64, expected_last_activity: i64) -> Result<(), String> {
+    {
         let mut sessions = lock(&state.active_sessions);
-        prune_and_snapshot(&mut sessions, bark_core::now_millis())
-    };
-    if !changed {
-        return;
+        let mut dismissed = lock(&state.dismissed_sessions);
+        dismiss_session_at(&mut sessions, &mut dismissed, &session_key(agent, sid),
+            expected_started_at, expected_last_activity, bark_core::now_millis())?;
     }
-    let _ = app.emit("bark://sessions", &snapshot);
-    if running_lost {
-        // 心跳判死 = 意外终止（agent 进程没了 / 回合被用户中断且没有终态事件）：
-        // 还有别的活跃会话就按它们显示，一个不剩才转失败色。
-        crate::glow::refresh_from_sessions(app, state, true);
-        // 意外终止的事件通道（burst_only）不经过事件管道，音效在这里补上
-        play_state_sound(state, "failed");
-    } else if snapshot.is_empty() && !crate::glow::current(state).is_terminal() {
-        // 判死的是等待中的会话（等待色）：没有活跃会话了就该收回，别把等待色留在屏幕上
-        crate::glow::reset(app, state);
+    // 已在聚合窗口内的旧提醒也不能在移除后弹出。
+    let mut pending = state.pending.lock().await;
+    pending.retain(|key, _| {
+        let mut parts = key.splitn(3, '|');
+        let owner = parts.next();
+        parts.next();
+        owner != Some(agent) || parts.next() != Some(sid)
+    });
+    drop(pending);
+    let _ = app.emit("bark://sessions", sessions_for_ui(state));
+    crate::glow::sync_task_state(app, state);
+    Ok(())
+}
+
+fn dismiss_session_at(sessions: &mut HashMap<String, SessionStatus>, dismissed: &mut HashMap<String, i64>,
+    key: &str, started_at: i64, last_activity: i64, now: i64) -> Result<(), String> {
+    let Some(session) = sessions.get(key) else { return Ok(()); };
+    if session.started_at != started_at || session.last_activity != last_activity {
+        return Err("会话状态已更新，请查看最新状态后重试".into());
+    }
+    if dismissed.len() >= 4096 && !dismissed.contains_key(key) {
+        return Err("本次运行的移除记录已满，请重启应用后重试".into());
+    }
+    sessions.remove(key);
+    dismissed.insert(key.into(), now);
+    crate::task_lifecycle::refresh(sessions);
+    Ok(())
+}
+
+fn suppress_dismissed(dismissed: &mut HashMap<String, i64>, event: &NormalizedEvent) -> bool {
+    let key = session_key(&event.agent, &event.session_id);
+    let Some(at) = dismissed.get(&key) else { return false; };
+    // 仅真实新活动恢复显示；库里的重复 running 状态、核验重读、保活均不恢复。
+    let live_activity = !event.keepalive && event.timestamp > *at
+        && !event.id.starts_with(crate::codex_watch::EVENT_PREFIX)
+        && (event.run.as_ref().is_some_and(|r| r.boundary == bark_core::RunBoundary::Started)
+            || event.codex.as_ref().is_some_and(|c| c.is_user_prompt)
+            || event.kind == EventKind::Activity);
+    if live_activity {
+        dismissed.remove(&key);
+        false
     } else {
-        crate::glow::refresh_from_sessions(app, state, false);
+        // 终态也只留历史：移除是显示操作，不应补放完成/失败特效。
+        true
     }
+}
+
+fn apply_session_event_with_wait(sessions: &mut HashMap<String, SessionStatus>, finished: &mut HashMap<String, i64>,
+    event: &NormalizedEvent, stale: bool, preserve_wait: bool) -> SessionDelta {
+    let key = session_key(&event.agent, &event.session_id);
+    let previous = sessions.get(&key).map(|s| s.phase.clone());
+    let mut delta = apply_session_event_inner(sessions, finished, event, stale);
+    if preserve_wait && !stale {
+        if let Some(s) = sessions.get_mut(&key) {
+            s.phase = SessionPhase::WaitingPermission;
+            delta.phase_changed = previous != Some(s.phase.clone());
+        }
+    }
+    delta
 }
 
 /// 心跳/打断/终态事件 → 状态表跃迁。返回 true 表示状态表有变化（应推送前端）。
@@ -1264,9 +1245,9 @@ fn apply_session_event(
     apply_session_event_inner(sessions, finished, ev, false)
 }
 
-/// `stale` = 这是一条陈旧补投（时间戳比现在老过判死阈值，离线兜底路径会送来
+/// `stale` = 这是一条陈旧补投（时间戳比现在老过补投状态有效期，离线兜底路径会送来
 /// 最长 1 小时前的事件）。陈旧事件**整体不进状态表**：它声称的「正在跑/等待/
-/// 结束」都早已不可信——建条目会被 sweep 判死（开局红光）、迟到的心跳会复活
+/// 结束」都早已不可信——建条目可能产生无主光效、迟到的心跳会复活
 /// 已终态会话、迟到的终态会把仍活着的会话误清场。事件本身仍入历史与通知
 /// （这是离线兜底的本意，见 run_pipeline）。
 fn apply_session_event_inner(
@@ -1277,7 +1258,6 @@ fn apply_session_event_inner(
 ) -> SessionDelta {
     let mut delta = SessionDelta {
         changed: false,
-        running_lost: false,
         suppressed_echo: false,
         phase_changed: false,
         urgent: false,
@@ -1297,14 +1277,29 @@ fn apply_session_event_inner(
             return delta;
         }
     }
-    let pruned = prune_stale(sessions, ev.timestamp);
-    delta.changed = pruned.changed;
-    delta.urgent = pruned.changed; // 判死淘汰 = 摘档，快照立即推
-    delta.running_lost = pruned.running_lost;
     let key = session_key(&ev.agent, &ev.session_id);
-    // 跃迁判定的基准：本事件处理前的相位（prune 之后、match 之前）。
+    // 跃迁判定的基准：本事件处理前的相位。
     // 摘档后取不到 → None，与建档后的 Some(...) 天然不等。
     let prev_phase = sessions.get(&key).map(|s| s.phase.clone());
+    if ev.keepalive && ev.kind == EventKind::Activity {
+        if let Some(s) = sessions.get_mut(&key) {
+            s.last_activity = s.last_activity.max(ev.timestamp);
+            delta.changed = true;
+            delta.urgent = backfill_lineage(s, ev);
+        }
+        return delta;
+    }
+
+    // 不让新会话挤掉正在执行但长期静默的旧会话。容量满时保留已有条目，
+    // 新事件仍留历史；用户可移除已结束但缺少终态的条目来释放位置。
+    if prev_phase.is_none() && sessions.len() >= ACTIVE_SESSIONS_CAP
+        && !matches!(ev.kind, EventKind::RunCompleted | EventKind::RunFailed | EventKind::RunAborted)
+    {
+        delta.suppressed_echo = true;
+        tracing::warn!(agent = %ev.agent, session = %ev.session_id, "活跃会话显示容量已满，保留已有会话");
+        return delta;
+    }
+
     // 可靠 Started 不得复活一个已处理过终态的旧回合（日志/hook 乱序）。
     if ev.run.as_ref().is_some_and(|r| r.boundary == bark_core::RunBoundary::Started)
         && finished.get(&key).is_some_and(|at| ev.timestamp <= *at)
@@ -1426,7 +1421,7 @@ fn apply_session_event_inner(
                 // 带工具名的心跳**不可能开启新回合**：会话刚终态（宽限窗内）又来的
                 // PreToolUse/PostToolUse 是乱序回声——Stop 与工具 hook 是两个独立进程，
                 // 没有全局顺序保证（工具 hook 慢几百毫秒就会「先完成、后心跳」）。
-                // 放它建档会把刚收起的完成色复活成思考色，10 分钟后被判死又亮失败色。
+                // 放它建档会把刚收起的完成色复活成持续思考色。
                 // 不带工具名的心跳（UserPromptSubmit）是真实新回合，照常建档。
                 if ev.tool_name.is_some()
                     && finished
@@ -1497,18 +1492,18 @@ fn apply_session_event_inner(
                     // 续命时，这条心跳只证明「我上次看到的那个会话还活着」，不是「这个会话
                     // 现在开始干活了」。表里没有条目 = 这条心跳的对象在当前进程里从未被
                     // 观察到（daemon 重启 / 建档心跳丢失），或早已被终态收档——建档就会造出
-                    // 一条**没有任何终态能收掉**的「思考中」，挂满 10 分钟被判死巡检清场
-                    // （红光 + 失败音）。用户实测症状：没有会话在跑，面板却一直显示
+                    // 一条**没有任何终态能收掉**的「思考中」。
+                    // 用户实测症状：没有会话在跑，面板却一直显示
                     // 一个事件流在「思考中」。
                     //
-                    // 注意不动 pruned 带来的 delta：判死淘汰必须照常上报（下面直接返回 delta）。
+                    // 保留前面状态机产生的 delta。
                     if ev.keepalive {
                         return delta;
                     }
                     // 无条目 + 宽限窗内有终态记录 = 乱序回声：Stop 与工具 hook 是两个
                     // 独立进程、没有全局顺序保证，PostToolUse 慢几百毫秒就会「先完成、
-                    // 后收尾」。放它建档会把刚收起的完成色复活成思考色，10 分钟后被
-                    // 判死又亮失败色（同 Activity 分支对带工具名心跳的防回声处理）。
+                    // 后收尾」。放它建档会把刚收起的完成色复活成持续思考色
+                    // （同 Activity 分支对带工具名心跳的防回声处理）。
                     if finished
                         .get(&key)
                         .is_some_and(|t| echo_within_grace(*t, ev.timestamp))
@@ -1542,25 +1537,12 @@ fn apply_session_event_inner(
         delta.urgent = true;
     }
     // 相位跃迁 = 建档 / 摘档 / 相位字段变化。同相位重复心跳（监控型 adapter 的
-    // 保活）只刷 last_activity，不算跃迁——要在上限清理之前比对，那一步
-    // 淘汰的是别的条目，与本事件的跃迁无关。
+    // 保活）只刷 last_activity，不算跃迁。
     delta.phase_changed = sessions.get(&key).map(|s| s.phase.clone()) != prev_phase;
     // 快照「立即推」的口径（§4.4）：本 key 的建档/摘档/相位变化（phase_changed 全覆盖）、
-    // 判死淘汰（pruned）与上限淘汰都是结构变化，必须立即可见；只有纯 last_activity /
-    // 计数刷新允许被 should_push_snapshot 节流
+    // 血缘等结构变化也必须立即可见；只有纯 last_activity / 计数刷新允许限频。
     delta.urgent = delta.urgent || delta.phase_changed;
 
-    // 上限保护：超出时淘汰最久未活动的（防泄漏）
-    if sessions.len() > ACTIVE_SESSIONS_CAP {
-        let mut by_activity: Vec<(String, i64)> =
-            sessions.iter().map(|(k, s)| (k.clone(), s.last_activity)).collect();
-        by_activity.sort_by_key(|(_, at)| *at);
-        for (k, _) in by_activity.into_iter().take(sessions.len() - ACTIVE_SESSIONS_CAP) {
-            sessions.remove(&k);
-        }
-        delta.changed = true;
-        delta.urgent = true; // 上限淘汰 = 摘档
-    }
     delta
 }
 
@@ -1635,13 +1617,14 @@ fn backfill_lineage(s: &mut SessionStatus, ev: &NormalizedEvent) -> bool {
     true
 }
 
-/// 陈旧补投判定：事件时间戳比现在还老过判死阈值。离线兜底落盘的事件
-/// （hook 写 pending.jsonl、daemon 启动补投，上限 1 小时）会带着旧时间戳
-/// 重新进管道——它声称的「正在跑 / 等人」状态早已不可信，不应建档
-/// （否则启动 30s 内就被 sweep 判死，开局红光 + 失败音）。事件本身仍入
-/// 历史与通知。阈值与 sweep 判死同源（stale_after_ms，可用环境变量覆盖）。
+/// 过期离线 hook 仅进入历史，不用旧活动创建幻影会话。
+/// 此有效期不清理活跃任务；精确匹配当前回合的本地核验不受此限制。
 fn is_stale_replay(ev: &NormalizedEvent) -> bool {
-    bark_core::now_millis().saturating_sub(ev.timestamp) > stale_after_ms()
+    // 调用前 Turns::accept 已按精确回合验证；旧终态仍须闭环当前已建档回合。
+    if ev.agent == "codex" && ev.id.starts_with(crate::codex_watch::EVENT_PREFIX) {
+        return false;
+    }
+    bark_core::now_millis().saturating_sub(ev.timestamp) > REPLAY_MAX_AGE_MS
 }
 
 /// 分发：Bark / Webhook（桌面 Toast 与系统提示音已下线，声音走状态音效）
@@ -1852,9 +1835,10 @@ mod tests {
         failure.codex.as_mut().unwrap().is_user_prompt = false;
         failure.timestamp = 2000;
         assert!(turns.accept(&failure));
-        apply_session_event(&mut sessions, &mut finished, &failure);
+        assert!(!is_stale_replay(&failure), "主动核验的旧终态仍应生效");
+        apply_session_event_inner(&mut sessions, &mut finished, &failure, is_stale_replay(&failure));
         assert!(sessions.is_empty());
-        assert_eq!(sound_key_for(&failure, false), Some("failed"));
+        assert_eq!(sound_key_for(&failure), Some("failed"));
         let mut late = adapter.normalize("PostToolUse", &serde_json::json!({
             "session_id":"s1", "turn_id":"t1"
         })).unwrap();
@@ -1897,34 +1881,13 @@ mod tests {
 
     #[test]
     fn sound_key_follows_event_roles() {
-        let mut e = ev(EventKind::RunCompleted, 1000, None, "");
-        assert_eq!(sound_key_for(&e, false), Some("completed"));
-        e.kind = EventKind::RunFailed;
-        assert_eq!(sound_key_for(&e, false), Some("failed"));
-        // 用户主动中止不响（与流光同口径：那是你自己按的停止）
-        e.kind = EventKind::RunAborted;
-        assert_eq!(sound_key_for(&e, false), None);
-        e.kind = EventKind::PermissionRequired;
-        assert_eq!(sound_key_for(&e, false), Some("waiting"));
-        e.kind = EventKind::InputRequired;
-        assert_eq!(sound_key_for(&e, false), Some("waiting"));
-        // 新回合开始（无工具名的心跳）= 思考；同回合的工具心跳不重复响
-        e.kind = EventKind::Activity;
-        e.tool_name = None;
-        assert_eq!(sound_key_for(&e, false), Some("thinking"));
-        e.tool_name = Some("Bash".into());
-        assert_eq!(sound_key_for(&e, false), None);
-        // 工具收尾不响：每次工具结束都来一条，会把「新回合开始」的语义淹没
-        e.kind = EventKind::ToolFinished;
-        assert_eq!(sound_key_for(&e, false), None);
-        // 心跳判死优先于事件本身：agent 进程没了 = 意外终止
-        assert_eq!(sound_key_for(&e, true), Some("failed"));
-        // 用户主动中止永远不响，即便同一瞬间恰好有别的会话被判死
-        // （音与流光的优先级必须一致：derive 里 RunAborted 也先于判死收光）
-        let mut a = ev(EventKind::RunAborted, 1000, None, "");
-        assert_eq!(sound_key_for(&a, true), None);
-        a.kind = EventKind::RunCompleted;
-        assert_eq!(sound_key_for(&a, true), Some("failed"), "普通终态事件在判死时仍报失败音");
+        for (kind, expected) in [
+            (EventKind::RunCompleted, Some("completed")), (EventKind::RunFailed, Some("failed")),
+            (EventKind::RunAborted, None), (EventKind::PermissionRequired, Some("waiting")),
+            (EventKind::InputRequired, Some("waiting")), (EventKind::ToolFinished, None),
+            (EventKind::ToolFailed, None), (EventKind::Activity, Some("thinking")),
+        ] { assert_eq!(sound_key_for(&ev(kind, 1000, None, "")), expected); }
+        assert_eq!(sound_key_for(&ev(EventKind::Activity, 1000, Some("Read"), "")), None);
     }
 
     #[test]
@@ -1946,7 +1909,7 @@ mod tests {
         // 首条心跳建档 = 跃迁：思考音该响这一次
         let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, None, ""));
         assert!(d.changed && d.phase_changed);
-        // 60s 后的保活：仍要刷新 last_activity（否则 10 分钟被判死），但不是跃迁
+        // 60s 后的保活：仍要刷新 last_activity（反映最近观测），但不是跃迁
         let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 61_000, None, ""));
         assert!(d.changed, "保活心跳照常刷新活跃时间");
         assert!(!d.phase_changed, "同相位重复心跳不是跃迁");
@@ -1969,7 +1932,7 @@ mod tests {
     fn late_tool_heartbeat_does_not_revive_finished_session() {
         // Stop 与工具 hook 是独立进程，无顺序保证：RunCompleted 先到、
         // 带工具名的心跳（PreToolUse/PostToolUse）后到 = 乱序回声。
-        // 不得复活会话（否则 10 分钟后被判死，亮失败色 + 播失败音）。
+        // 不得复活会话或重新点亮思考色。
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
         assert!(apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 2000, None, "done")).changed);
@@ -2004,12 +1967,12 @@ mod tests {
 
     #[test]
     fn stale_replay_does_not_touch_session_table() {
-        // 离线兜底补投的事件（时间戳老过判死阈值）：声称的任何状态都不可信，
+        // 离线兜底补投的事件（时间戳老过补投状态有效期）：声称的任何状态都不可信，
         // 整体不进状态表；新鲜事件照常
         let (mut sessions, mut finished) = table();
         let old = ev(EventKind::Activity, 1000, Some("Bash"), "");
         let d = apply_session_event_inner(&mut sessions, &mut finished, &old, true);
-        assert!(!d.changed && !d.running_lost, "陈旧心跳不得建档");
+        assert!(!d.changed, "陈旧心跳不得建档");
         assert!(sessions.is_empty());
 
         let old_wait = ev(EventKind::InputRequired, 1000, None, "");
@@ -2122,7 +2085,7 @@ mod tests {
     #[test]
     fn tool_finished_after_terminal_is_echo_within_grace() {
         // Stop 与工具 hook 是两个独立进程，PostToolUse 乱序晚到 = 回声：
-        // 宽限窗内不得复活会话（否则思考色挂 10 分钟后被判死又亮失败色）
+        // 宽限窗内不得复活会话（否则会留下持续思考色）
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::RunCompleted, 2000, None, "done"));
@@ -2148,12 +2111,18 @@ mod tests {
         ] {
             let (mut sessions, mut finished) = table();
             apply_session_event(&mut sessions, &mut finished, &ev(event, 2000, None, "wait"));
-            let mut beat = ev(EventKind::ToolFinished, 3000, None, "");
-            beat.keepalive = true;
-            let d = apply_session_event(&mut sessions, &mut finished, &beat);
-            assert!(!d.phase_changed);
-            assert_eq!(sessions["trae-code|s1"].phase, phase);
-            assert_eq!(sessions["trae-code|s1"].last_activity, 3000);
+            for kind in [EventKind::ToolFinished, EventKind::Activity] {
+                let mut beat = ev(kind, 3000, None, "cached");
+                beat.keepalive = true;
+                let d = apply_session_event(&mut sessions, &mut finished, &beat);
+                let session = &sessions["trae-code|s1"];
+                assert!(!d.phase_changed);
+                assert_eq!(session.phase, phase);
+                assert_eq!(session.last_activity, 3000);
+                assert_eq!(session.started_at, 2000);
+                assert_eq!(session.turn_count, 1);
+                assert_eq!(session.prompt.as_deref(), Some("wait"));
+            }
             let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::ToolFinished, 4000, None, ""));
             assert!(d.phase_changed && d.urgent);
             assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::Thinking);
@@ -2164,7 +2133,7 @@ mod tests {
     fn keepalive_heartbeat_never_creates_a_session() {
         // 纯保活心跳（keepalive=true）只续命、绝不建档——DSH 插件按「回合开着就定期
         // 补心跳」续命时用的就是它。表里没有条目说明这条心跳没有可续的对象：建档会留下
-        // 一条永远没有终态的「思考中」，挂满 10 分钟被判死（红光 + 失败音）。
+        // 一条永远没有终态的「思考中」。
         let (mut sessions, mut finished) = table();
         let mut beat = ev(EventKind::ToolFinished, 1000, None, "");
         beat.keepalive = true;
@@ -2311,46 +2280,38 @@ mod tests {
     }
 
     #[test]
-    fn stale_sessions_are_pruned() {
-        let (mut sessions, mut finished) = table();
-        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Read"), ""));
-        // 长时间无心跳（agent 被杀）：下一个事件触发惰性淘汰
-        let late = 1000 + STALE_AFTER_MS + 1;
-        assert!(apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, late, Some("Read"), "")).changed);
-        // 新事件自己建了新条目（旧的被淘汰），turn_count 从 1 重新开始
-        assert_eq!(sessions["trae-code|s1"].turn_count, 1);
-        // 快照也会剔除僵死条目
-        let (mut old, mut finished2) = table();
-        apply_session_event(&mut old, &mut finished2, &ev(EventKind::Activity, 1000, Some("Read"), ""));
-        assert!(sessions_snapshot(&old, 1000 + STALE_AFTER_MS).is_empty());
+    fn quiet_sessions_survive_snapshot_and_unrelated_events() {
+        for kind in [EventKind::Activity, EventKind::PermissionRequired, EventKind::InputRequired] {
+            let (mut sessions, mut finished) = table();
+            apply_session_event(&mut sessions, &mut finished, &ev(kind, 1000, Some("LongTool"), ""));
+            let late = 1000 + 24 * 60 * 60 * 1000;
+            assert_eq!(sessions_snapshot(&sessions).len(), 1);
+            let mut other = ev(EventKind::Activity, late, Some("Read"), "");
+            other.session_id = "other".into();
+            let delta = apply_session_event(&mut sessions, &mut finished, &other);
+            assert!(delta.changed);
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions["trae-code|s1"].started_at, 1000);
+            let end = ev(EventKind::RunAborted, late + 1, None, "");
+            apply_session_event(&mut sessions, &mut finished, &end);
+            assert!(!sessions.contains_key("trae-code|s1"));
+            assert!(sessions.contains_key("trae-code|other"));
+        }
     }
 
     #[test]
-    fn stale_running_session_is_reported_as_unexpected_stop() {
-        // 流光靠 running_lost 显示红色：agent 进程没了但不会有 Stop 事件
-        let late = 1000 + STALE_AFTER_MS + 1;
-        let (mut s, mut finished) = table();
-        apply_session_event(&mut s, &mut finished, &ev(EventKind::Activity, 1000, Some("Read"), ""));
-        assert!(apply_session_event(&mut s, &mut finished, &ev(EventKind::Activity, late, Some("Read"), "")).running_lost);
-
-        // 等待中的会话被判死不算「意外终止」——它本来就在等人，不是跑崩了
-        let (mut waiting, mut finished2) = table();
-        apply_session_event(&mut waiting, &mut finished2, &ev(EventKind::InputRequired, 1000, None, "问题?"));
-        let d = apply_session_event(&mut waiting, &mut finished2, &ev(EventKind::Activity, late, Some("Read"), ""));
-        assert!(!d.running_lost);
-    }
-
-    #[test]
-    fn log_liveness_touch_defers_stale_judgment() {
-        // 日志存活心跳：长静默期间 agent 日志还在写 → 刷 last_activity，判死不触发
-        let stale = stale_after_ms();
+    fn log_activity_updates_existing_session_timestamp() {
+        // 日志存活心跳：长静默期间 agent 日志还在写 → 刷新已有条目的 last_activity
+        let stale = REPLAY_MAX_AGE_MS;
         let (mut sessions, mut finished) = table();
         apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Agent"), ""));
-        // hook 时间戳已超过判死阈值，但中途有日志活动续命
+        // 较久没有 hook，日志活动仍应刷新条目的最后活动时间
         let now = 1000 + stale + 1;
         assert!(touch_session_at(&mut sessions, "trae-code", "s1", now - stale / 2));
+        assert_eq!(sessions["trae-code|s1"].last_activity, now - stale / 2);
         let d = apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, now, Some("Read"), ""));
-        assert!(!d.running_lost, "日志活动续命后不得判死");
+        assert!(d.changed);
+        assert_eq!(sessions["trae-code|s1"].last_activity, now);
         assert!(sessions.contains_key("trae-code|s1"), "条目应保留");
 
         // 刷不到的会话不建档：日志里的陈年会话不该造出幻影条目
@@ -2361,7 +2322,7 @@ mod tests {
     #[test]
     fn subagent_activity_touches_ancestors_recursively() {
         // 子代理活动沿血缘链向祖先传播存活：root ← mid ← leaf
-        let stale = stale_after_ms();
+        let stale = REPLAY_MAX_AGE_MS;
         let (mut sessions, mut finished) = table();
         for (sid, parent) in [("s1", None), ("s2", Some("s1")), ("s3", Some("s2"))] {
             let mut e = ev(EventKind::Activity, 1000, Some("Agent"), "");
@@ -2400,7 +2361,7 @@ mod tests {
         child.parent_session_id = Some(parent_id.into());
         apply_session_event(&mut sessions, &mut finished, &child);
 
-        let snap = sessions_snapshot(&sessions, 1100);
+        let snap = sessions_snapshot(&sessions);
         let child = snap.iter().find(|s| s.session_id == "sess_child_1").expect("子代理条目");
         // 完整 id 而不是尾 6 位：前端能拿它精确等于父行的 session_id（截断就只能猜，
         // 多工作区并存时两边的子代理行会长得一模一样）
@@ -2756,97 +2717,6 @@ mod tests {
         assert!(state.is_muted());
     }
 
-    #[test]
-    fn sweep_prunes_dead_running_session_and_flags_running_lost() {
-        // 用户实测场景：ZCode 手动终止后既没有 Stop 也没有任何终态事件，
-        // 流光一直停在思考色——必须靠定时巡检把这条会话判死（→ 失败色 + 清表）
-        let (mut sessions, mut finished) = table();
-        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
-        assert_eq!(sessions["trae-code|s1"].phase, SessionPhase::ToolRunning);
-
-        let (changed, running_lost, snapshot) = prune_and_snapshot(&mut sessions, 1000 + STALE_AFTER_MS);
-        assert!(changed, "僵死条目必须被淘汰");
-        assert!(running_lost, "运行中的会话判死 = 意外终止（流光转失败色）");
-        assert!(snapshot.is_empty(), "快照里不该再有僵死条目");
-        assert!(sessions.is_empty(), "状态表本身也要清掉，不能只靠快照过滤");
-    }
-
-    #[test]
-    fn sweep_prunes_dead_waiting_session_without_claiming_running_lost() {
-        // 等待中的会话判死不是「意外终止」：不该转失败色，而是收回光标（调用方负责 reset）
-        let (mut sessions, mut finished) = table();
-        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::PermissionRequired, 1000, None, ""));
-
-        let (changed, running_lost, snapshot) = prune_and_snapshot(&mut sessions, 1000 + STALE_AFTER_MS);
-        assert!(changed);
-        assert!(!running_lost, "等待中的会话超时不是「运行中判死」");
-        assert!(snapshot.is_empty());
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn sweep_keeps_live_sessions_and_pushes_nothing() {
-        let (mut sessions, mut finished) = table();
-        apply_session_event(&mut sessions, &mut finished, &ev(EventKind::Activity, 1000, Some("Bash"), ""));
-
-        // 差 1ms 未到判死线：不动状态表、不推快照（避免每 30s 一次无意义的 IPC 与重绘）
-        let (changed, running_lost, snapshot) = prune_and_snapshot(&mut sessions, 1000 + STALE_AFTER_MS - 1);
-        assert!(!changed && !running_lost);
-        assert!(snapshot.is_empty());
-        assert_eq!(sessions.len(), 1, "还活着的会话不能被误杀");
-    }
-
-    #[test]
-    fn stale_override_parsing() {
-        // 有 agent 被中断时一个事件都不发（实测 ZCode），只能靠心跳静止判死；
-        // 这个覆盖值让「等多久才判死」可调（本机验证时也能用它把等待缩短）
-        assert_eq!(parse_stale_override("60000"), Some(60_000));
-        assert_eq!(parse_stale_override(" 45000 "), Some(45_000));
-        assert_eq!(parse_stale_override("4999"), None, "低于 5s 的覆盖值误杀风险太大，忽略");
-        assert_eq!(parse_stale_override("abc"), None);
-        assert_eq!(parse_stale_override(""), None);
-        assert_eq!(parse_stale_override("-1000"), None);
-        // 未设置覆盖时用默认值（设置了就以环境为准，这里不强断）
-        if std::env::var(STALE_ENV).is_err() {
-            assert_eq!(stale_after_ms(), STALE_AFTER_MS);
-        }
-    }
-
-    #[test]
-    fn sweep_keeps_other_live_sessions_when_one_dies() {
-        // 一个会话判死、另一个还在跑：只清死的那条（流光的优先级判定在 glow 侧）。
-        // 这里直接构造状态表——走 apply_session_event 会在事件时间戳上先自行淘汰一次，
-        // 把「死的那条」提前清掉，测不出巡检本身的行为。
-        let now = 1_000_000i64;
-        let mk = |sid: &str, last: i64| SessionStatus {
-            lifecycle: Default::default(),
-            active_descendants: 0,
-            agent: "zcode".into(),
-            session_id: sid.into(),
-            project: Some("p".into()),
-            cwd: "C:/p".into(),
-            phase: SessionPhase::ToolRunning,
-            prompt: None,
-            last_tool: Some("Bash".into()),
-            turn_count: 1,
-            tool_calls: 1,
-            started_at: last,
-            last_activity: last,
-            parent: None,
-            parent_key: None,
-        };
-        let mut sessions = HashMap::new();
-        sessions.insert("zcode|dead".into(), mk("dead", now - STALE_AFTER_MS));
-        sessions.insert("zcode|live".into(), mk("live", now - 1000));
-
-        let (changed, running_lost, snapshot) = prune_and_snapshot(&mut sessions, now);
-        assert!(changed && running_lost, "死的那条算判死");
-        assert_eq!(snapshot.len(), 1, "活着的那条仍在快照里");
-        assert_eq!(snapshot[0].session_id, "live");
-        assert_eq!(sessions.len(), 1);
-        assert!(sessions.contains_key("zcode|live"));
-    }
-
     fn notification(body: &str) -> Notification {
         Notification {
             title: "t".into(),
@@ -2936,17 +2806,13 @@ mod tests {
     /// 附 §1.7 交接（S1）：被服务端夹到 now-1h 的过旧事件必须判 stale、不建档。
     #[test]
     fn stale_replay_drives_neither_glow_nor_sound() {
-        assert!(!should_drive_glow(true, false, false), "陈旧补投不驱动光效/音效");
-        assert!(!should_drive_glow(true, false, true));
-        assert!(!should_drive_glow(true, true, false));
-        // 新鲜事件照常；终态回声不驱动（完成色不被压成失败色），
-        // 但回声捎带的心跳判死（running_lost）仍要驱动
-        assert!(should_drive_glow(false, false, false));
-        assert!(!should_drive_glow(false, true, false));
-        assert!(should_drive_glow(false, true, true));
+        assert!(!should_drive_glow(true, false));
+        assert!(!should_drive_glow(true, true));
+        assert!(should_drive_glow(false, false));
+        assert!(!should_drive_glow(false, true));
 
-        // S1：now-1h（服务端夹取下限）的事件比判死阈值（默认 10min）更老 → stale
-        if std::env::var(STALE_ENV).is_err() {
+        // S1：now-1h（服务端夹取下限）的事件比补投状态有效期（10min）更老 → stale
+        {
             let mut old = ev(EventKind::RunFailed, 0, None, "boom");
             old.timestamp = bark_core::now_millis() - 60 * 60 * 1000;
             assert!(is_stale_replay(&old), "被夹到 now-1h 的过旧事件必须判 stale");
@@ -3078,7 +2944,7 @@ mod tests {
     }
 
     /// §2.11 回归：空 session_id 事件只入历史与事件流，不进状态机/glow/音效/通知聚合
-    ///（否则 `"agent|"` 幻影会话凭空建档、判死时凭空亮失败色）
+    ///（否则 `"agent|"` 幻影会话凭空建档、点亮无主光效）
     #[test]
     fn empty_session_id_events_skip_state_machine() {
         assert_eq!(session_key("claude-code", ""), "claude-code|", "幻影键形态（回归说明）");
@@ -3310,4 +3176,82 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
+    #[test]
+    fn missing_codex_transcript_does_not_drop_tools_or_failures() {
+        use bark_adapters::HookAdapter;
+        let adapter = bark_adapters::claude_style::codex();
+        let mut turns = crate::codex_watch::Turns::default();
+        let (mut sessions, mut finished) = table();
+        for (name, tool, kind, at) in [
+            ("PreToolUse", "request_user_input_async", EventKind::PermissionRequired, 1000),
+            ("PostToolUse", "request_user_input_async", EventKind::ToolFinished, 1100),
+            ("PreToolUse", "Read", EventKind::Activity, 1200),
+            ("PostToolUse", "Read", EventKind::ToolFailed, 1300),
+            ("Stop", "", EventKind::RunCompleted, 1400),
+        ] {
+            let mut event = adapter.normalize(name, &serde_json::json!({
+                "session_id":"s1", "turn_id":"t1", "tool_name":tool,
+            })).unwrap();
+            event.kind = kind;
+            event.timestamp = at;
+            assert!(event.codex.as_ref().unwrap().transcript_path.is_none());
+            assert!(turns.accept(&event), "事件不能因等待状态被吞掉");
+            apply_session_event_with_wait(&mut sessions, &mut finished, &event, false, turns.preserve_wait(&event));
+            if kind != EventKind::RunCompleted {
+                let s = &sessions["codex|s1"];
+                assert_eq!(s.phase, SessionPhase::WaitingPermission);
+                assert_eq!(s.last_activity, at);
+                if at >= 1200 { assert_eq!(s.tool_calls, 2, "提问工具与 Read 都计入调用数"); }
+            }
+        }
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn dismiss_is_local_and_ignores_cached_heartbeats_until_real_activity() {
+        let (mut sessions, mut finished) = table();
+        let mut dismissed = HashMap::new();
+        let start = ev(EventKind::Activity, 1000, Some("Read"), "work");
+        apply_session_event(&mut sessions, &mut finished, &start);
+        assert!(dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 999, 2000).is_err());
+        assert!(dismissed.is_empty());
+        dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 1000, 2000).unwrap();
+        assert!(sessions.is_empty());
+        assert!(finished.is_empty(), "移除不是终态");
+        let mut heartbeat = ev(EventKind::Activity, 3000, None, "");
+        heartbeat.keepalive = true;
+        assert!(suppress_dismissed(&mut dismissed, &heartbeat));
+        assert!(suppress_dismissed(&mut dismissed, &start));
+        assert!(suppress_dismissed(&mut dismissed, &ev(EventKind::RunCompleted, 3500, None, "")));
+        let resumed = ev(EventKind::Activity, 4000, Some("Read"), "new work");
+        assert!(!suppress_dismissed(&mut dismissed, &resumed));
+        apply_session_event(&mut sessions, &mut finished, &resumed);
+        assert_eq!(sessions.len(), 1);
+        assert!(dismissed.is_empty());
+    }
+
+    #[test]
+    fn cached_activity_cannot_recreate_a_removed_session() {
+        let (mut sessions, mut finished) = table();
+        let mut heartbeat = ev(EventKind::Activity, 1000, None, "cached");
+        heartbeat.keepalive = true;
+        assert!(!apply_session_event(&mut sessions, &mut finished, &heartbeat).changed);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn capacity_does_not_evict_an_existing_quiet_task() {
+        let (mut sessions, mut finished) = table();
+        for i in 0..ACTIVE_SESSIONS_CAP {
+            let mut event = ev(EventKind::Activity, 1000 + i as i64, Some("LongTool"), "");
+            event.session_id = format!("s{i}");
+            apply_session_event(&mut sessions, &mut finished, &event);
+        }
+        let original = sessions["trae-code|s0"].last_activity;
+        let mut extra = ev(EventKind::Activity, 100_000_000, None, "new");
+        extra.session_id = "extra".into();
+        assert!(apply_session_event(&mut sessions, &mut finished, &extra).suppressed_echo);
+        assert_eq!(sessions.len(), ACTIVE_SESSIONS_CAP);
+        assert_eq!(sessions["trae-code|s0"].last_activity, original);
+    }
 }

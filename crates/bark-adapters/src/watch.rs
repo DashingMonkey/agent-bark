@@ -9,8 +9,8 @@
 //!
 //! 与 hook 型 agent 不同，监控型拿不到每回合的 UserPromptSubmit / PreToolUse，
 //! 只能靠状态轮询模拟心跳：会话处于运行态（working/planning）时周期性重发
-//! Activity 事件——否则 daemon 侧状态表 10 分钟没有活动就会把会话判死，
-//! 流光永远亮不了思考色（这就是「接入但流光不亮」的根因）。
+//! Activity 事件：首次信号建档点亮，后续 keepalive 只刷新已有条目的活动时间。
+//! 重复 running 状态不代表进程仍在线，静默不用于推断终止。
 //!
 //! 轮询循环运行在独立 OS 线程（不依赖 tokio runtime），
 //! 通过 AtomicBool 停止标志协调退出。
@@ -18,7 +18,7 @@
 use bark_core::{now_millis, project_name_from_cwd, AgentKind, EventKind, NormalizedEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,6 +52,33 @@ pub(crate) fn emit(
     message: &str,
     tool_name: Option<&str>,
 ) {
+    emit_inner(stop, tx, kind, event, session_id, cwd, message, tool_name, false);
+}
+
+pub(crate) fn emit_keepalive(
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    kind: AgentKind,
+    event: EventKind,
+    session_id: &str,
+    cwd: &str,
+    message: &str,
+    tool_name: Option<&str>,
+) {
+    emit_inner(stop, tx, kind, event, session_id, cwd, message, tool_name, true);
+}
+
+fn emit_inner(
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    kind: AgentKind,
+    event: EventKind,
+    session_id: &str,
+    cwd: &str,
+    message: &str,
+    tool_name: Option<&str>,
+    keepalive: bool,
+) {
     // 停止标志置位后不再发事件：在飞行中的最后一轮也不能漏出
     if stop.load(Ordering::Relaxed) {
         return;
@@ -72,20 +99,35 @@ pub(crate) fn emit(
         parent_session_id: None,
         // 监控型 adapter 的轮询心跳是**真实信号**（它同时也是建档信号，见 is_watch_agent 的
         // 撕裂快照去重）：只有插件型 adapter 明确知道自己「只是在续命」时才置 keepalive
-        keepalive: false,
+        keepalive,
         codex: None,
     };
     // try_send：通道满时丢弃而不是阻塞轮询线程（否则 stop 标志永远等不到）
     let _ = tx.try_send(ev);
 }
 
-/// 可中断睡眠（秒粒度足够）
+/// 定时核验与托盘操作共用；各监控保留自己的游标，不重启、不重放历史。
+static RECHECK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn request_recheck() {
+    RECHECK_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn recheck_generation() -> u64 {
+    RECHECK_GENERATION.load(Ordering::Relaxed)
+}
+
+/// 可中断睡眠（秒粒度足够）；主动核验会唤醒所有数据库监控。
 pub(crate) fn sleep_interruptible(stop: &AtomicBool, secs: u64) -> bool {
+    let generation = recheck_generation();
     for _ in 0..secs {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
+        if generation != recheck_generation() {
+            break;
+        }
     }
     !stop.load(Ordering::Relaxed)
 }
@@ -122,8 +164,7 @@ fn remove_snapshot_dir(dir: &Path) {
 ///
 /// 归一成 **RunAborted**（中止）而不是 RunFailed（失败）：行消失意味着用户删了
 /// 会话，不是任务失败——RunFailed 会弹「任务失败」通知 + 亮失败色 + 失败音，
-/// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮失败色」，自己先亮失败色等于
-/// 换个时机复现同一问题。RunAborted 不通知、不亮失败色（TraeWork 一直如此）。
+/// 删除仅证明会话已移除。RunAborted 不通知、不亮失败色（TraeWork 一直如此）。
 pub(crate) fn emit_lost_row(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
@@ -155,7 +196,7 @@ pub(crate) fn emit_lost_row(
 ///   `planning`（规划阶段运行中）、`completed`（turn 正常结束）、`terminated`（runtime 退出）、
 ///   `error`（不可恢复错误）、`pending`（等待授权/提问/暂停）、`archived`（归档）
 /// - daemon 冷启动的 `sweepStaleActiveSessions()` 会把残留 `active`/`working` 批量置
-///   `terminated`——所以轮询侧的 `working→terminated` 恰好覆盖「WorkBuddy 进程被杀」判死
+///   `terminated`——所以轮询侧的 `working→terminated` 恰好覆盖宿主启动时确认的残留会话结束
 /// - 2026-10-14 校准：手动停止也会写 completed；回合 JSONL 的 assistant incomplete
 ///   + providerData.error.message="Interrupted by user" 才能区别中止，见 workbuddy.rs。
 ///   等待授权/提问归 pending；runtime 崩溃仍按 terminated/error 处理。
@@ -212,8 +253,7 @@ fn run_event(prev: &str, status: &str, suppress: bool, first: bool) -> Option<Ev
         // 非终态 → 终态：通知（已终态的行再变终态是重复通知，不发）
         "completed" if !is_terminal(prev) => Some(EventKind::RunCompleted),
         "terminated" | "error" if !is_terminal(prev) => Some(EventKind::RunFailed),
-        // 运行中被归档：turn 实际已结束，闭环掉状态表条目，避免它 10 分钟后
-        // 被当僵死判死误亮失败色。
+        // 运行中被归档：turn 实际已结束，闭环掉状态表条目，避免它长期残留在显示中。
         // 归一成 RunAborted 而不是 RunCompleted：归档不是「跑完了」，
         // 亮完成色属于谎报完成（用户实测就见过这个完成色）。
         "archived" if was_running => Some(EventKind::RunAborted),
@@ -223,7 +263,7 @@ fn run_event(prev: &str, status: &str, suppress: bool, first: bool) -> Option<Ev
 
 /// 是否应为本行发一次心跳（纯函数，便于测试）。
 /// 进入运行态立即发一次；持续运行时每 `every` 轮重发一次保活
-/// （daemon 状态表 STALE_AFTER_MS=10min 判死线，5s×12=60s 足够安全）。
+/// （默认 5s×12=60s，只刷新已有条目）。
 fn needs_heartbeat(status: &str, prev: Option<&SeenSession>, round: u64, every: u64) -> bool {
     if !is_running(status) {
         return false;
@@ -238,7 +278,7 @@ fn needs_heartbeat(status: &str, prev: Option<&SeenSession>, round: u64, every: 
 /// 返回本轮被遗忘的「运行中」条目 id——运行中会话的行从库里消失意味着
 /// 会话被删除（不会有终态跃迁），需由调用方发 RunAborted 闭环 daemon 侧状态表
 /// （§1.12a：用户删的会话按「中止」收场，不弹「任务失败」、不亮失败色），
-/// 否则它会在 10 分钟后被当僵死判死、在不相干的事件里误亮失败色。
+/// 避免已经移除的会话长期残留在显示中。
 ///
 /// 其余规则：
 /// 1. 连续 MISSING_KEEP_ROUNDS 轮未再出现的条目一律遗忘；
@@ -328,7 +368,7 @@ impl WorkBuddyWatch {
     const QUERY: &'static str =
         "SELECT id, COALESCE(title, ''), status, COALESCE(cwd, ''), updated_at FROM sessions WHERE deleted_at IS NULL";
     const POLL_SECS: u64 = 5;
-    /// 运行态心跳重发间隔（轮）：12 × 5s = 60s，远小于 daemon 侧 10 分钟判死线
+    /// 运行态心跳重发间隔（轮）：12 × 5s = 60s，只刷新已有条目
     const HEARTBEAT_EVERY_ROUNDS: u64 = 12;
 }
 
@@ -409,7 +449,11 @@ impl WatchAdapter for WorkBuddyWatch {
                             if hb {
                                 // 心跳（Activity，不通知不入历史）：让流光亮思考色 +
                                 // 会话进入「运行中会话」列表；message 用标题作 prompt 展示
-                                emit(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title, None);
+                                if prev == status {
+                                    emit_keepalive(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title, None);
+                                } else {
+                                    emit(&stop, &tx, kind, EventKind::Activity, &session, &cwd, &title, None);
+                                }
                             }
                             if let Some(ev) = run_event(prev, &status, suppress, first) {
                                 // 会话级 completed 不代表回合成功；先补齐结束原因，再进入统一状态机。
@@ -430,7 +474,7 @@ impl WatchAdapter for WorkBuddyWatch {
                         for id in prune_last(&mut last, &mut tombstone, round) {
                             // 运行中的行从库里消失 = 会话被删除，没有终态跃迁；
                             // 主动闭环（RunAborted：不通知、不亮失败色，§1.12a），
-                            // 别等 daemon 侧 10 分钟僵死判死在随机时刻亮失败色
+                            // 避免已删除会话长期残留
                             emit_lost_row(&stop, &tx, kind, &id, "WorkBuddy");
                         }
                         first = false;
@@ -738,7 +782,7 @@ impl TraeWorkWatch {
          ) GROUP BY session_id";
 
     const POLL_SECS: u64 = 5;
-    /// 运行中回合的保活心跳间隔（轮）：12 × 5s = 60s，远小于 daemon 侧 10 分钟判死线
+    /// 运行中回合的保活心跳间隔（轮）：12 × 5s = 60s，只刷新已有条目
     const HEARTBEAT_EVERY_ROUNDS: u64 = 12;
 }
 
@@ -838,7 +882,8 @@ impl WatchAdapter for TraeWorkWatch {
                                 Self::HEARTBEAT_EVERY_ROUNDS,
                             );
                             if hb {
-                                emit(
+                                let send = if prev.is_some_and(|p| p.churn == *churn) { emit_keepalive } else { emit };
+                                send(
                                     &stop,
                                     &tx,
                                     kind,
@@ -884,7 +929,7 @@ impl WatchAdapter for TraeWorkWatch {
                         }
 
                         // 3) 回合行持续消失（会话被删）时主动闭环运行中条目：
-                        //    RunAborted（用户删的：不通知不亮色，也别等 10 分钟僵死判死）
+                        //    RunAborted（用户删的：不通知不亮色，清除残留显示）
                         for id in prune_turns(&mut turns, &mut tombstone, round) {
                             emit_lost_row(&stop, &tx, kind, &id, "TraeWork");
                         }
@@ -1165,7 +1210,7 @@ mod tests {
 
     /// §1.12a：「会话行消失」的闭环必须是 RunAborted（中止）而不是 RunFailed（失败）。
     /// WorkBuddy 曾发 RunFailed——弹「任务失败 · WorkBuddy」+ 亮失败色 + 失败音，
-    /// 而这条闭环的目标恰是「别等僵死判死在随机时刻亮失败色」；与 TraeWork 口径统一。
+    /// 删除不代表任务失败；与 TraeWork 口径统一。
     #[test]
     fn lost_row_reports_run_aborted_not_failed() {
         let (tx, mut rx) = mpsc::channel(4);

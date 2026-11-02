@@ -27,7 +27,7 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 实际使用的仓库坐标：`BARK_UPDATE_REPO=owner/name` 可覆盖默认值。
 ///
-/// 只为联调/自测留的口子（与 `BARK_DEBUG`、`BARK_STALE_AFTER_MS` 同一套做法）：
+/// 只为联调/自测留的口子（与 `BARK_DEBUG` 同一套做法）：
 /// 指到一个**已经发过版本**的仓库，就能验证「发现新版本 → 下载新版本」这条路径，
 /// 不必等本仓库先发版。正常用户不会设置它。
 fn repo() -> String {

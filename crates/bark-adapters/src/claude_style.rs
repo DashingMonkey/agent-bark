@@ -618,12 +618,38 @@ impl HookAdapter for ClaudeStyleAdapter {
         // 而它注册的 PermissionRequest 一次都没触发过。
         // 不归一的话通知标题会是「等待输入」、会话相位记成 WaitingInput，
         // 与真实情况（等人点授权）不符。
-        let kind = if kind == EventKind::InputRequired && is_permission_prompt(raw) {
+        // 选择框由工具调用发起，不一定触发 PermissionRequest。
+        let input_tool = self.spec.kind == AgentKind::Codex
+            && raw.get("tool_name").and_then(Value::as_str).is_some_and(is_codex_input_tool);
+        let kind = if input_tool && event_name == "PreToolUse" {
+            EventKind::PermissionRequired
+        } else if kind == EventKind::InputRequired && is_permission_prompt(raw) {
             EventKind::PermissionRequired
         } else {
             kind
         };
         let mut event = NormalizedEvent::from_raw(self.spec.kind.id(), kind, raw);
+        if input_tool && event_name == "PostToolUse"
+            && raw.get("tool_name").and_then(Value::as_str)
+                .is_some_and(|name| name.rsplit('.').next() == Some("request_user_input_async"))
+        {
+            let response = raw.get("tool_response");
+            let parsed = response.and_then(Value::as_str).and_then(|v| serde_json::from_str::<Value>(v).ok());
+            let response = parsed.as_ref().or(response);
+            // accepted/未知返回都不能证明用户回答；显式 answers 或 error 才解除等待。
+            let resolved = response.is_some_and(|v|
+                v.get("answers").is_some_and(|a| !a.is_null()) || v.get("error").is_some_and(|e| !e.is_null()));
+            event.keepalive = !resolved;
+            if resolved { event.tool_name = Some("__user_input_answered".into()); }
+        }
+        if input_tool && event_name == "PreToolUse" && event.message.is_empty() {
+            let message = raw.pointer("/tool_input/questions").and_then(Value::as_array)
+                .map(|questions| questions.iter()
+                    .filter_map(|q| q.get("question").or_else(|| q.get("title")).and_then(Value::as_str))
+                    .collect::<Vec<_>>().join("\n"))
+                .unwrap_or_else(|| "请选择或回答问题".into());
+            event.message = bark_core::event::truncate_chars(&message, bark_core::event::MAX_MESSAGE_CHARS);
+        }
         if self.spec.kind == AgentKind::Codex {
             // 2026-10-15 本机实测：桌面端的 composer_predictions 也触发
             // UserPromptSubmit，额度耗尽时没有 Stop。保留内部请求标记，
@@ -645,6 +671,11 @@ impl HookAdapter for ClaudeStyleAdapter {
     fn trust_hint(&self) -> Option<&'static str> {
         self.spec.trust_hint
     }
+}
+
+/// Codex 原生提问工具；精确匹配末段，兼容 functions 命名空间。
+pub fn is_codex_input_tool(name: &str) -> bool {
+    matches!(name.rsplit('.').next(), Some("request_user_input" | "request_user_input_async"))
 }
 
 /// 一组 hook 里是否有**有效**的我们的条目：指向已下线 agent 的旧条目不算。
@@ -2011,6 +2042,42 @@ mod tests {
         assert_eq!(tool.tool_name.as_deref(), Some("Bash"));
         assert_eq!(adapter.hook_events().len(), 8);
         assert!(adapter.normalize("agent-turn-complete", &json!({})).is_none());
+    }
+
+    #[test]
+    fn codex_selection_tools_wait_for_confirmation() {
+        let adapter = codex();
+        for name in ["request_user_input", "functions.request_user_input", "request_user_input_async", "functions.request_user_input_async"] {
+            let raw = json!({"session_id":"s1", "turn_id":"t1", "tool_name":name});
+            let event = adapter.normalize("PreToolUse", &raw).unwrap();
+            assert_eq!(event.kind, EventKind::PermissionRequired);
+            assert_eq!(event.codex.unwrap().turn_id.as_deref(), Some("t1"));
+            let post = adapter.normalize("PostToolUse", &raw);
+            assert_eq!(post.as_ref().unwrap().kind, EventKind::ToolFinished);
+            assert_eq!(post.unwrap().keepalive, name.ends_with("async"));
+        }
+        for name in ["request_user_input_extra", "exec", "AskUserQuestion"] {
+            assert_eq!(adapter.normalize("PreToolUse", &json!({"tool_name":name})).unwrap().kind, EventKind::Activity);
+        }
+    }
+
+    #[test]
+    fn codex_async_post_requires_answer_or_error_to_release_wait() {
+        for (response, resolved) in [
+            (json!({"accepted":true}), false), (json!({}), false),
+            (json!({"accepted":true,"error":null,"answers":null}), false),
+            (json!({"answers":{"q":"yes"}}), true), (json!({"error":"unavailable"}), true),
+        ] {
+            for response in [response.clone(), json!(response.to_string())] {
+                let raw = json!({"tool_name":"functions.request_user_input_async", "tool_response":response});
+                let event = codex().normalize("PostToolUse", &raw).unwrap();
+                assert_eq!(event.keepalive, !resolved);
+                assert_eq!(event.tool_name.as_deref() == Some("__user_input_answered"), resolved);
+                let other = claude_code().normalize("PostToolUse", &raw).unwrap();
+                assert!(!other.keepalive);
+                assert_eq!(other.tool_name.as_deref(), Some("functions.request_user_input_async"));
+            }
+        }
     }
 
     #[test]
