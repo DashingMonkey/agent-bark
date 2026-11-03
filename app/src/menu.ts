@@ -2,8 +2,8 @@
 //
 // 独立入口，与主窗口的 Vue 应用无关。窗口由 tray_menu.rs 管理：点击托盘图标
 // 时落位 + 显示 + 聚焦，平时常驻隐藏。职责只有两件事：
-// 1. 静音勾选态渲染：建窗首帧用注入参数兜底，之后每次打开收 Rust 推送的最新值；
-// 2. 菜单项动作（经 commands.rs）：显示主窗口 / 检测运行状态 / 静音（勾选项，
+// 1. 静音状态渲染：建窗首帧用注入参数兜底，之后每次打开收 Rust 推送的最新值；
+// 2. 菜单项动作（经 commands.rs）：显示主窗口 / 检测运行状态 / 静音（切换项，
 //    切换后菜单保持打开，同原生 CheckMenuItem）/ 退出。
 //
 // 关闭：点窗口外 → Rust 侧失焦即收（主口径）；点菜单项 / Esc → 自收；
@@ -34,7 +34,7 @@ const init =
 let muted = init.muted;
 
 function renderMute() {
-  document.getElementById("menu-mute")!.classList.toggle("checked", muted);
+  document.getElementById("menu-mute")!.textContent = muted ? "取消静音（恢复通知）" : "静音（暂停通知）";
 }
 
 async function hideSelf() {
@@ -63,7 +63,7 @@ document.getElementById("menu-recheck")!.addEventListener("click", async () => {
   await hideSelf();
 });
 
-// 静音是勾选项：切换后菜单保持打开（原生 CheckMenuItem 的行为），勾选态就地更新
+// 切换静音后菜单保持打开，文字就地更新。
 document.getElementById("menu-mute")!.addEventListener("click", async () => {
   try {
     muted = await invoke<boolean>("toggle_mute");

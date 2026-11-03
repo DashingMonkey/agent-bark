@@ -80,6 +80,7 @@ body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, san
 #row-tip { position: absolute; z-index: 20; padding: 10px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--fg); font-size: 11px; line-height: 1.65; max-height: 112px; overflow: auto; scrollbar-width: thin; overflow-wrap: anywhere; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 100ms ease; }
 #row-tip.show { opacity: 1; visibility: visible; pointer-events: auto; }
 .tip-heading { color: var(--muted); font-size: 10px; margin-bottom: 4px; }
+.tip-duration { color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 #ctx-menu { position: absolute; z-index: 30; display: none; min-width: 154px; padding: 4px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .ctx-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 8px; border: 0; border-radius: 5px; background: transparent; color: var(--fg); font: 11px "Segoe UI", "Microsoft YaHei", sans-serif; text-align: left; cursor: default; }
 .ctx-item:hover, .ctx-item:focus-visible { background: var(--hover); }
@@ -100,8 +101,6 @@ body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, san
 .card[data-dock-preview="top"] { border-top-color: var(--blue); }
 .card[data-dock-preview="left"] { border-left-color: var(--blue); }
 .card[data-dock-preview="right"] { border-right-color: var(--blue); }
-.ctx-check { width: 12px; flex-shrink: 0; text-align: center; color: var(--green); }
-.ctx-item.checked .ctx-check::before { content: "✓"; }
 .ctx-separator { height: 1px; margin: 4px; background: var(--line); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
 

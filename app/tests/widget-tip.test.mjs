@@ -8,11 +8,15 @@ const source = readFileSync(new URL("../src/widget-tip.ts", import.meta.url), "u
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText;
+const timeModule = {};
+runInNewContext(ts.transpileModule(readFileSync(new URL("../src/session-time.ts", import.meta.url), "utf8"), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, { exports: timeModule });
 
 function setup(place = async () => true) {
   const timers = new Map();
   let timerId = 0;
-  let now = 0;
+  let now = 100000;
   let closes = 0;
   function element() {
     const children = [];
@@ -31,21 +35,34 @@ function setup(place = async () => true) {
     };
   }
   const body = element();
-  const document = { body, createElement: element };
+  const document = { body, createElement: element, hidden: false, events: {},
+    addEventListener(name, fn) { this.events[name] = fn; },
+  };
   const window = {
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
+    setInterval(fn, ms) { const id = ++timerId; timers.set(id, { fn, at: now + ms, interval: ms }); return id; },
+    clearInterval(id) { timers.delete(id); },
   };
   const api = {};
-  runInNewContext(compiled, { exports: api, document, window, console: { warn() {} } });
+  runInNewContext(compiled, { exports: api, document, window, Date: { now: () => now },
+    require: (id) => { assert.equal(id, "./session-time"); return timeModule; }, console: { warn() {} },
+  });
   api.initRowTip({ place, close: async () => { closes++; } });
   const row = element();
-  row.dataset = { tipHeading: "Codex", tip: "passport-firmware-alpha" };
+  row.dataset = { tipHeading: "Codex", tip: "passport-firmware-alpha", startedAt: String(now - 5000) };
   return {
     api, row, box: body.children[0], closes: () => closes,
+    now: () => now,
+    intervalCount: () => [...timers.values()].filter((timer) => timer.interval).length,
+    visibility(hidden) { document.hidden = hidden; document.events.visibilitychange(); },
     async advance(ms) {
       now += ms;
-      for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.fn(); }
+      for (const [id, timer] of [...timers]) if (timer.at <= now) {
+        if (timer.interval) timer.at = now + timer.interval;
+        else timers.delete(id);
+        timer.fn();
+      }
       await new Promise(setImmediate);
     },
   };
@@ -115,4 +132,59 @@ test("blocked or failed native positioning never displays a clipped tooltip", as
     assert.equal(ui.box.classList.contains("show"), false);
     assert.ok(ui.closes() >= 1);
   }
+});
+
+test("hover duration ticks without snapshots or native resize and catches up on reopening", async () => {
+  let placements = 0;
+  const ui = setup(async () => { placements++; return true; });
+  const duration = ui.box.querySelector(".tip-duration");
+  ui.api.scheduleRowTip(ui.row);
+  await ui.advance(220);
+  assert.equal(duration.textContent, "已运行 5秒");
+  assert.equal(ui.intervalCount(), 1);
+  await ui.advance(1000);
+  assert.equal(duration.textContent, "已运行 6秒");
+  await ui.advance(64000);
+  assert.equal(duration.textContent, "已运行 1分10秒");
+  assert.equal(placements, 1);
+  ui.api.hideRowTip();
+  assert.equal(ui.intervalCount(), 0);
+  await ui.advance(90000);
+  ui.api.scheduleRowTip(ui.row);
+  await ui.advance(220);
+  assert.equal(duration.textContent, "已运行 2分40秒");
+  assert.equal(ui.intervalCount(), 1);
+});
+
+test("new turns reset hover duration and terminal rows stop it", async () => {
+  const ui = setup();
+  ui.api.scheduleRowTip(ui.row);
+  await ui.advance(220);
+  ui.row.dataset.startedAt = String(ui.now());
+  ui.api.refreshRowTip();
+  await ui.advance(0);
+  const duration = ui.box.querySelector(".tip-duration");
+  assert.equal(duration.textContent, "已运行 0秒");
+  await ui.advance(1000);
+  assert.equal(duration.textContent, "已运行 1秒");
+  for (const value of ["", "invalid"]) {
+    ui.row.dataset.startedAt = value;
+    ui.api.refreshRowTip();
+    await ui.advance(0);
+    assert.equal(duration.hidden, true);
+    assert.equal(duration.textContent, "");
+    assert.equal(ui.intervalCount(), 0);
+  }
+});
+
+test("a hidden hover panel suspends its timer and recalculates when visible", async () => {
+  const ui = setup();
+  ui.api.scheduleRowTip(ui.row);
+  await ui.advance(220);
+  ui.visibility(true);
+  assert.equal(ui.intervalCount(), 0);
+  await ui.advance(60000);
+  ui.visibility(false);
+  assert.equal(ui.box.querySelector(".tip-duration").textContent, "已运行 1分05秒");
+  assert.equal(ui.intervalCount(), 1);
 });

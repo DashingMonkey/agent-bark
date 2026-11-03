@@ -8,7 +8,6 @@ import {
   eventBadgeClass,
   EVENT_LABELS,
   formatTime,
-  formatDuration,
   isSubagentSession,
   parentTail,
   PHASE_LABELS,
@@ -18,6 +17,7 @@ import {
   subagentRowClass,
   type SessionStatus,
 } from "../api";
+import { formatDuration } from "../session-time";
 
 const historyLoaded = ref(false);
 const historyError = ref("");
@@ -118,19 +118,26 @@ const now = ref(Date.now());
 let tickTimer: number | undefined;
 let reconcileTimer: number | undefined;
 
+function refreshNow() {
+  now.value = Date.now();
+}
+
 function stopTimers() {
   if (tickTimer) clearInterval(tickTimer);
   if (reconcileTimer) clearInterval(reconcileTimer);
   tickTimer = undefined;
   reconcileTimer = undefined;
+  window.removeEventListener("focus", refreshNow);
+  document.removeEventListener("visibilitychange", refreshNow);
 }
 
 function startTimers() {
+  refreshNow();
   if (tickTimer) return;
   // 已运行时长需要本地时钟驱动（后端只在状态变化时推送，时长刻度在前端算）
-  tickTimer = window.setInterval(() => {
-    now.value = Date.now();
-  }, 5000);
+  tickTimer = window.setInterval(refreshNow, 1000);
+  window.addEventListener("focus", refreshNow);
+  document.addEventListener("visibilitychange", refreshNow);
   // 周期对账：补推可能丢失的快照；来源核验由后台独立执行
   reconcileTimer = window.setInterval(loadSessions, 15000);
 }
@@ -151,9 +158,8 @@ onDeactivated(stopTimers);
 onUnmounted(stopTimers);
 
 function durationLabel(s: SessionStatus): string {
-  const verb =
-    s.phase === "waiting_permission" || s.phase === "waiting_input" ? "已等待" : "已运行";
-  return `${verb} ${formatDuration(s.started_at, now.value)}`;
+  // started_at 是回合发起时间，等待授权/输入也仍展示整个回合的耗时。
+  return `已运行 ${formatDuration(s.started_at, now.value)}`;
 }
 
 function statsLabel(s: SessionStatus): string {

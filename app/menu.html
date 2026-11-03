@@ -22,7 +22,7 @@
         （MENU_W × MENU_H），这里的几何常量改了必须同步改 Rust 侧。
 
         面板与菜单项样式与悬浮窗右键菜单（widget.html #ctx-menu）同一套：
-        同样的圆角 / 描边 / 半透明底 / 勾选列，深浅主题跟随系统。
+        同样的圆角 / 描边 / 半透明底，深浅主题跟随系统。
       */
       :root {
         /* 具体值由 <head> 里的内联脚本与 src/theme.ts 写到 data-theme 上 */
@@ -73,9 +73,6 @@
       /* body.no-hover：菜单常驻隐藏复用，重新弹出时 Chromium 不重算 ：hover，
          上次点过的项会顶着悬停态出现——menu.ts 的 guardStaleHover 挂/摘（src/hover.ts） */
       body:not(.no-hover) .ctx-item:hover { background: rgba(255, 255, 255, 0.08); }
-      /* 勾选列：四行菜单的对齐垫片，「静音」激活时显示 ✓ */
-      .ctx-check { width: 13px; flex-shrink: 0; text-align: center; color: #4493f8; }
-      .ctx-item.checked .ctx-check::before { content: "✓"; }
       :root[data-theme="light"] #menu {
         background: rgba(255, 255, 255, 0.97);
         border-color: rgba(213, 213, 220, 0.95);
@@ -86,10 +83,10 @@
   </head>
   <body>
     <div id="menu">
-      <button type="button" class="ctx-item" id="menu-show"><span class="ctx-check"></span>显示主窗口</button>
-      <button type="button" class="ctx-item" id="menu-recheck"><span class="ctx-check"></span>检测运行状态</button>
-      <button type="button" class="ctx-item" id="menu-mute"><span class="ctx-check"></span>静音（暂停通知）</button>
-      <button type="button" class="ctx-item" id="menu-quit"><span class="ctx-check"></span>退出</button>
+      <button type="button" class="ctx-item" id="menu-show">显示主窗口</button>
+      <button type="button" class="ctx-item" id="menu-recheck">检测运行状态</button>
+      <button type="button" class="ctx-item" id="menu-mute">静音（暂停通知）</button>
+      <button type="button" class="ctx-item" id="menu-quit">退出</button>
     </div>
     <script type="module" src="/src/menu.ts"></script>
   </body>

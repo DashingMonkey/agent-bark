@@ -1,4 +1,6 @@
 /** One detail panel, with delegated row events and serialized native window geometry. */
+import { formatDuration } from "./session-time";
+
 interface TipHost {
   place: (box: HTMLElement, row: HTMLElement, current: () => boolean) => Promise<boolean>;
   close: () => Promise<void>;
@@ -6,10 +8,12 @@ interface TipHost {
 
 let host: TipHost;
 let tip: HTMLDivElement;
+let duration: HTMLDivElement;
 let target: HTMLElement | null = null;
 let showTimer = 0;
 let hideTimer = 0;
 let generation = 0;
+let durationTimer = 0;
 
 export function initRowTip(next: TipHost) {
   host = next;
@@ -20,10 +24,35 @@ export function initRowTip(next: TipHost) {
   heading.className = "tip-heading";
   const body = document.createElement("div");
   body.className = "tip-body";
-  tip.append(heading, body);
+  duration = document.createElement("div");
+  duration.className = "tip-duration";
+  duration.hidden = true;
+  tip.append(heading, body, duration);
   document.body.appendChild(tip);
   tip.addEventListener("mouseenter", cancelTipHide);
   tip.addEventListener("mouseleave", scheduleTipHide);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopDurationTimer();
+    else if (tip.classList.contains("show")) startDurationTimer();
+  });
+}
+
+function stopDurationTimer() {
+  window.clearInterval(durationTimer);
+  durationTimer = 0;
+}
+
+function renderDuration() {
+  const startedAt = Number(target?.dataset.startedAt);
+  duration.hidden = !Number.isFinite(startedAt) || startedAt <= 0;
+  duration.textContent = duration.hidden ? "" : `已运行 ${formatDuration(startedAt, Date.now())}`;
+}
+
+function startDurationTimer() {
+  stopDurationTimer();
+  renderDuration();
+  // 只更新可见详情里的文字，不触发整张卡片重绘或原生窗口缩放。
+  if (!duration.hidden && !document.hidden) durationTimer = window.setInterval(renderDuration, 1000);
 }
 
 function cancelTipHide() {
@@ -35,6 +64,7 @@ export function hideRowTip() {
   window.clearTimeout(showTimer);
   showTimer = 0;
   cancelTipHide();
+  stopDurationTimer();
   generation++;
   target?.removeAttribute("aria-describedby");
   target = null;
@@ -55,11 +85,13 @@ async function show(row: HTMLElement) {
   const current = () => gen === generation && row.isConnected && target === row;
   tip.querySelector(".tip-heading")!.textContent = row.dataset.tipHeading ?? "";
   tip.querySelector(".tip-body")!.textContent = row.dataset.tip ?? "";
+  renderDuration();
   try {
     const placed = await host.place(tip, row, current);
     if (placed && current()) {
       tip.classList.add("show");
       row.setAttribute("aria-describedby", "row-tip");
+      startDurationTimer();
     }
   } catch (e) {
     if (current()) hideRowTip();

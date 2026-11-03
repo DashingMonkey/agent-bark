@@ -111,6 +111,8 @@ interface Row {
    * 行节点按身份复用，更新快照时保持已展开的详情与滚动位置。
    */
   tip: string;
+  /** 仅活跃会话携带发起时间，终态和占位行不继续计时。 */
+  startedAt?: number;
   label: string;
   state: StateColor;
   /**
@@ -425,6 +427,7 @@ function currentRows(): Row[] {
       name,
       // 子代理详情同样保留完整工作区，方便确认归属。
       tip,
+      startedAt: placeholder || aborted ? undefined : s.started_at,
       // 未知 phase 兜底显示原值：undefined 漏进 escapeHtml 会抛 TypeError、悬浮窗冻结在旧帧
       label: placeholder ? "已结束" : aborted ? ABORT_LABEL : (PHASE_LABELS[s.phase] ?? String(s.phase)) + (s.phase === "waiting_children" && s.active_descendants ? ` · ${s.active_descendants}` : ""),
       state: aborted ? "aborted" : state,
@@ -537,6 +540,7 @@ function render() {
     el.dataset.state = r.state;
     el.dataset.tip = r.tip || r.name;
     el.dataset.tipHeading = agentName(r.agent) + (r.subagent ? " · " + r.name : "");
+    el.dataset.startedAt = r.startedAt === undefined ? "" : String(r.startedAt);
     const pad = r.subagent ? SUB_ALIGN_PX + Math.max(0, Math.min(r.depth, SESSION_INDENT_MAX) - 1) * 11 : 7;
     el.style.paddingLeft = pad + "px";
     el.style.setProperty("--indent", pad + "px");
@@ -1012,7 +1016,7 @@ function closeMenu(): Promise<void> {
 }
 
 function renderMenuState() {
-  document.getElementById("ctx-pin")!.classList.toggle("checked", pinned);
+  document.getElementById("ctx-pin")!.textContent = pinned ? "取消固定位置" : "固定位置";
   document.getElementById("ctx-undock")!.hidden = !dockSide;
 }
 
@@ -1096,7 +1100,7 @@ async function closeMenuImpl() {
 }
 
 document.addEventListener("contextmenu", (e) => {
-  // 拦掉 WebView2 自带的右键菜单，换我们自己的两项目录
+  // 拦掉 WebView2 自带的右键菜单，换成悬浮窗菜单
   e.preventDefault();
   void openMenu(e.clientX, e.clientY).catch((err) => console.warn("打开悬浮窗菜单失败：", err));
 });
