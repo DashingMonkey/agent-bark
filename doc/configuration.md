@@ -1,5 +1,7 @@
 # 配置与运行参考
 
+[返回首页](../README.md) · [使用指南](usage.md) · [开发构建](development.md)
+
 开发/排障需要的参考内容：配置字段、流光状态推导、项目结构、开发说明。
 **「每种 agent 怎么接入」看 [agent-integration.md](agent-integration.md)。**
 
@@ -288,4 +290,4 @@ pnpm tauri dev                # 开发模式（需要 vite 起在 5173）
 - 「关于」页检查更新的联调：设 `BARK_UPDATE_REPO=owner/name` 可把两个平台的查询指到别的仓库（默认 `dashingmonkey/agent-bark`）——指到一个**已发过版本**的仓库就能验证「发现新版本 → 下载新版本」这条路径，不必等本仓库先发版。
 - 运行状态核验：每 5 分钟触发一次；托盘「检测运行状态」可立即触发。各 Agent 的数据库/日志监控继续使用原有秒级周期。静默不再自动终止会话，`BARK_STALE_AFTER_MS` 已移除。来源不可用时保留最后已知状态。事件流中的「移除」只清除本地会话显示并重新对齐光效，不停止 Agent、不产生终态或通知；缓存心跳不会重新建档，新的真实活动可恢复显示。Kimi Work 与豆包工作降级分支在日志连续 5 分钟无增长后停止合成心跳，仍保留会话。显示上限为 64 条，满时保留已有会话并提示移除停滞条目。具体支持范围见 [agent-integration.md](agent-integration.md)。
 - Hook 进程的三条硬约束（见 `crates/bark-cli/src/lib.rs` 模块注释）：永远退出码 0；读 stdin 必须带超时；只读配置、绝不写盘。
-- 验证某个 agent 到底读哪份配置 / 哪些事件真的会触发：见 [agent-integration.md 的「探针验证法」](agent-integration.md#13-探针验证法文档与实测冲突时用)。
+- 验证某个 agent 到底读哪份配置 / 哪些事件真的会触发：见 [agent-integration.md 的「探针验证法」](agent-integration.md#23-探针验证法文档与实测冲突时用)。
