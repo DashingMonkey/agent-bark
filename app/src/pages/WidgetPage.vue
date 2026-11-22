@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { listen } from "@tauri-apps/api/event";
 import { api, type BarkConfig } from "../api";
 import { toast } from "../toast";
+
+const { t } = useI18n();
 
 // 悬浮窗设置页：启用开关，**即点即存**——
 // 后端 save_config 里的 widget::sync 会随即创建 / 销毁悬浮窗，
@@ -16,7 +19,7 @@ async function load() {
   try {
     config.value = await api.getConfig();
   } catch (e) {
-    loadError.value = `加载配置失败：${e}`;
+    loadError.value = t("common.loadConfigFailed", { error: String(e) });
   }
 }
 
@@ -30,7 +33,7 @@ async function persist(key: "enabled"): Promise<boolean> {
     await api.saveConfig({ widget: { [key]: config.value.widget[key] } });
     return true;
   } catch (e) {
-    toast(`保存失败：${e}`, "error");
+    toast(t("common.saveFailed", { error: String(e) }), "error");
     return false;
   }
 }
@@ -76,33 +79,33 @@ onUnmounted(() => {
 
 <template>
   <div v-if="config">
-    <div class="between mb-14">
-      <h1 class="page-title">悬浮窗</h1>
-      <span class="hint">开关即时生效，无需保存</span>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("widgetPage.title") }}</h1></div>
     </div>
 
-    <!-- 与设置页同一套「开关类设置行」（.setting-row，样式在 style.css） -->
-    <div class="card">
-      <div class="setting-row">
-        <div class="setting-text">
-          <span class="setting-label">启用</span>
+    <div class="stack">
+      <!-- 与设置页同一套「开关类设置行」（.setting-row，样式在 style.css） -->
+      <div class="card">
+        <div class="setting-row">
+          <div class="setting-text">
+            <span class="setting-label">{{ $t("widgetPage.enable") }}</span>
+          </div>
+          <label class="switch">
+            <input
+              type="checkbox"
+              :checked="config.widget.enabled"
+              @change="toggle('enabled', ($event.target as HTMLInputElement).checked)"
+            />
+            <span class="track"></span>
+          </label>
         </div>
-        <label class="switch">
-          <input
-            type="checkbox"
-            :checked="config.widget.enabled"
-            @change="toggle('enabled', ($event.target as HTMLInputElement).checked)"
-          />
-          <span class="track"></span>
-        </label>
       </div>
     </div>
-    <p class="hint mt-12">拖到屏幕顶部或左右边缘后松手，即可靠边隐藏；移入窄边展开，移出收起。单击托盘图标可找回悬浮窗并展开 2 秒；贴边时会话状态类别变化会展开 5 秒，思考与使用工具之间切换不触发，鼠标停留期间持续展开。拖离边缘或在右键菜单中取消，固定位置也会退出靠边隐藏。</p>
   </div>
 
   <div v-else-if="loadError" class="empty">
     {{ loadError }}
-    <div class="mt-12"><button class="ghost" @click="load">重试</button></div>
+    <div class="mt-12"><button class="ghost" @click="load">{{ $t("common.retry") }}</button></div>
   </div>
-  <div v-else class="empty">加载配置中…</div>
+  <div v-else class="empty">{{ $t("common.loadingConfig") }}</div>
 </template>

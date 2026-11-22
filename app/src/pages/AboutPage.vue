@@ -2,8 +2,11 @@
 import { onMounted, ref } from "vue";
 import { isTauri } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { useI18n } from "vue-i18n";
 import { api } from "../api";
 import logo from "../assets/logo.png";
+
+const { t } = useI18n();
 
 // 「关于」页：图标 + 软件名 + 版本号，下面一个「检查更新」按钮。
 // 版本号取自 Tauri 的 package_info（= tauri.conf.json 的 version，与安装包、NSIS 同一个
@@ -44,7 +47,7 @@ async function check() {
       await api.openReleasePage();
     } catch (e) {
       failed.value = true;
-      message.value = `打开发布页失败：${e}`;
+      message.value = t("about.openReleaseFailed", { error: String(e) });
     }
     return;
   }
@@ -59,13 +62,13 @@ async function check() {
     latest.value = info.latest;
     source.value = SOURCE_NAMES[info.source] ?? info.source;
     message.value = info.newer
-      ? `发现新版本 v${info.latest}（当前 v${info.current}），点击上方按钮前往下载`
-      : `已是最新版本 ✓（v${info.current}）`;
+      ? t("about.newVersion", { latest: info.latest, current: info.current })
+      : t("about.upToDate", { current: info.current });
   } catch (e) {
     newer.value = false;
     source.value = "";
     failed.value = true;
-    message.value = `检查失败：${e}`;
+    message.value = t("about.checkFailed", { error: String(e) });
   } finally {
     checking.value = false;
   }
@@ -73,29 +76,34 @@ async function check() {
 </script>
 
 <template>
-  <div class="about">
-    <img class="about-logo" :src="logo" alt="" />
-    <div class="about-name">Agent Bark</div>
-    <div class="about-version">{{ version ? `v${version}` : "—" }}</div>
-    <p class="about-desc hint">AI 编程助手状态监测工具</p>
+  <div>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("nav.about") }}</h1></div>
+    </div>
+    <div class="about-hero">
+      <img class="about-logo" :src="logo" alt="" />
+      <div class="about-name">Agent Bark</div>
+      <div class="about-version">{{ version ? `v${version}` : "—" }}</div>
+      <p class="about-desc hint">{{ $t("about.desc") }}</p>
 
-    <button class="about-check" :class="{ ghost: !newer }" :disabled="checking" @click="check">
-      {{ checking ? "检查中…" : newer ? `下载新版本 v${latest}` : "检查更新" }}
-    </button>
+      <button class="about-check" :class="{ ghost: !newer }" :disabled="checking" @click="check">
+        {{ checking ? $t("about.checking") : newer ? $t("about.downloadNew", { version: latest }) : $t("about.checkUpdate") }}
+      </button>
 
-    <div v-if="message" class="about-msg" :class="{ failed }">{{ message }}</div>
-    <div v-if="source" class="about-src">检查源：{{ source }}</div>
+      <div v-if="message" class="about-msg" :class="{ failed }">{{ message }}</div>
+      <div v-if="source" class="about-src">{{ $t("about.source", { source }) }}</div>
+    </div>
   </div>
 </template>
 
 <style scoped>
-/* 整页居中：图标 / 名称 / 版本号 / 按钮自上而下一条竖轴（对齐 quota-widget 的关于页） */
-.about {
+/* 页头与其它页同几何；hero 居中但起点同一留白（对齐 quota-widget 的关于页） */
+.about-hero {
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
-  padding: 36px 0 0;
+  padding: 24px 0 0;
 }
 
 /* 图标 PNG 自带透明圆角（半径 56/256），按同比例裁切，与标题栏 logo 一致 */
@@ -117,7 +125,7 @@ async function check() {
 
 .about-desc { max-width: 420px; margin: 14px 0 0; }
 
-.about-check { margin-top: 22px; padding: 7px 22px; }
+.about-check { margin-top: 22px; padding: 0 22px; }
 
 .about-msg { margin-top: 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
 .about-msg.failed { color: var(--err); }

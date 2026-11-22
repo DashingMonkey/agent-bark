@@ -11,16 +11,17 @@ const compiled = ts.transpileModule(source, {
 const layout = {};
 runInNewContext(compiled, { exports: layout });
 const screen = { x: 0, y: 0, width: 1920, height: 1040 };
+const overlaps = (a, b) => a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 
 test("details prefer the right and keep the hovered row visible", () => {
   const card = { x: 100, y: 120, width: 280, height: 140 };
   const result = layout.placeTip(card, screen, 37, 70);
   assert.equal(result.side, "right");
-  assert.equal(result.left, 288);
-  assert.equal(result.top, 37);
-  assert.equal(result.x, card.x);
-  assert.equal(result.y, card.y);
-  assert.equal(result.windowWidth, 508);
+  assert.equal(result.x, card.x + card.width + 8);
+  assert.equal(result.y, card.y + 37);
+  assert.equal(result.width, 220);
+  assert.equal(result.height, 70);
+  assert.equal(overlaps(result, card), false);
 });
 
 test("bottom fallback matches both card edges with no extra inset", () => {
@@ -28,21 +29,37 @@ test("bottom fallback matches both card edges with no extra inset", () => {
     const card = { x, y: 100, width: 280, height: 140 };
     const result = layout.placeTip(card, screen, 37, 70);
     assert.equal(result.side, "bottom");
-    assert.equal(result.left, 0);
-    assert.equal(result.width, card.width);
     assert.equal(result.x, x);
-    assert.equal(result.top, card.height + 8);
-    assert.equal(result.windowWidth, 280);
+    assert.equal(result.width, card.width);
+    assert.equal(result.y, card.y + card.height + 8);
+    assert.equal(overlaps(result, card), false);
   }
 });
 
-test("details near the taskbar fit on screen without overlapping the card", () => {
+test("bottom-right corner flips to the left instead of covering the card", () => {
   const card = { x: 1640, y: 996, width: 280, height: 44 };
   const result = layout.placeTip(card, screen, 6, 112);
+  assert.equal(result.side, "left");
+  assert.ok(result.x + result.width <= card.x, "详情右缘不越过卡片左缘");
+  assert.ok(result.y + result.height <= screen.height, "详情不超出屏幕底");
+  assert.equal(overlaps(result, card), false);
+});
+
+test("small gap above the Dock flips left at full height instead of truncating", () => {
+  // 右吸附、离工作区底 88px（< 详情自然高 112）：不该把详情压成 88px 塞进缝里
+  const card = { x: 1640, y: 900, width: 280, height: 44 };
+  const result = layout.placeTip(card, screen, 6, 112);
+  assert.equal(result.side, "left");
+  assert.equal(result.height, 112, "详情保持自然高度，不被截断");
+  assert.equal(overlaps(result, card), false);
+});
+
+test("roomy gap below shows the full detail beneath the card", () => {
+  const card = { x: 1640, y: 800, width: 280, height: 44 };
+  const result = layout.placeTip(card, screen, 6, 112);
   assert.equal(result.side, "bottom");
-  assert.equal(result.y + result.windowHeight, 1040);
-  assert.equal(result.top, 52);
   assert.equal(result.height, 112);
+  assert.equal(overlaps(result, card), false);
 });
 
 test("negative monitor coordinates and scaled logical work areas stay in bounds", () => {
@@ -53,10 +70,11 @@ test("negative monitor coordinates and scaled logical work areas stay in bounds"
   for (const area of monitors) {
     const card = { x: area.x + area.width - 280, y: area.y + area.height - 235, width: 280, height: 235 };
     const result = layout.placeTip(card, area, 180, 112);
-    assert.equal(result.side, "bottom");
-    assert.equal(result.x, card.x);
+    assert.ok(result.x >= area.x);
     assert.ok(result.y >= area.y);
-    assert.ok(result.y + result.windowHeight <= area.y + area.height);
+    assert.ok(result.x + result.width <= area.x + area.width);
+    assert.ok(result.y + result.height <= area.y + area.height);
+    assert.equal(overlaps(result, card), false);
   }
 });
 
@@ -66,8 +84,9 @@ test("right-side minimum width is respected and tall details are clamped", () =>
   assert.equal(layout.tipWidth(card, { ...screen, width: 467 }).side, "bottom");
   const tiny = { x: 0, y: 0, width: 280, height: 160 };
   const result = layout.placeTip(card, tiny, 0, 500);
+  assert.equal(result.side, "bottom");
   assert.equal(result.height, 108);
-  assert.equal(result.windowHeight, 160);
+  assert.equal(overlaps(result, card), false);
 });
 
 test("project suffixes remain distinct and never consume the whole label", () => {

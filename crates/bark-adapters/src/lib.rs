@@ -52,6 +52,9 @@ pub struct RegisterCtx {
     pub exe_path: String,
     pub port: u16,
     pub token: String,
+    /// 界面语言：register_for_startup / trust_hint 等**直接整句展示给用户**的
+    /// notice 文案按它取词（错误链等诊断信息不受影响，见各 adapter 注释）
+    pub lang: bark_core::Lang,
 }
 
 /// 卸载/写入时的上下文
@@ -137,18 +140,21 @@ pub trait HookAdapter: Send + Sync {
         Some(NormalizedEvent::from_raw(self.kind().id(), kind, raw))
     }
 
-    /// 信任引导（如 Codex 需在会话内运行 /hooks）
-    fn trust_hint(&self) -> Option<&'static str> {
+    /// 信任引导（如 Codex 需在会话内运行 /hooks）。按界面语言取词，
+    /// 与 register_for_startup 的 notice 同属「直接整句展示」的用户可见文案。
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let _ = lang;
         None
     }
 
-    /// 关闭接入后给用户的提示。
+    /// 关闭接入后给用户的提示（按界面语言取词）。
     ///
     /// 默认 `None`：hook 型 agent 的下一条 hook 命令就会按新配置执行，无需额外动作。
     /// 插件型（DSH / OpenCode）必须给出提示——我们删掉的是磁盘上的插件文件与登记，
     /// 而**宿主进程里已经加载的那份仍在内存里继续 POST**，只有重启宿主才真正停止。
     /// 在宿主重启前，daemon 侧会按「已关闭」忽略该 agent 的事件（见 state.rs 管道门）。
-    fn unregister_hint(&self) -> Option<&'static str> {
+    fn unregister_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let _ = lang;
         None
     }
 }

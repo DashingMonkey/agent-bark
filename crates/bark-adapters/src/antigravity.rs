@@ -241,8 +241,15 @@ impl HookAdapter for AntigravityAdapter {
         }
     }
 
-    fn trust_hint(&self) -> Option<&'static str> {
-        Some("需在 Antigravity 设置中开启 Hooks 后生效")
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let (zh, en) = (
+            "需在 Antigravity 设置中开启 Hooks 后生效",
+            "Enable Hooks in the Antigravity settings for this to take effect",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh,
+            bark_core::Lang::En => en,
+        })
     }
 }
 
@@ -265,6 +272,7 @@ mod tests {
             exe_path: r"C:\Program Files\AgentBark\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         }
     }
 
@@ -355,7 +363,7 @@ mod tests {
         adapter.register(&ctx()).unwrap();
         assert!(matches!(adapter.verify(&ctx()), VerifyReport::Ok));
 
-        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into() };
+        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into(), lang: bark_core::Lang::Zh };
         assert!(matches!(adapter.verify(&moved), VerifyReport::StalePath { .. }));
         adapter.register(&moved).unwrap();
         assert!(matches!(adapter.verify(&moved), VerifyReport::Ok));

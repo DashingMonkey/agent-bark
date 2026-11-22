@@ -6,7 +6,7 @@ use bark_adapters::registry;
 use bark_adapters::{AgentStatus, InstallCtx, RegisterCtx};
 use bark_channels::{BarkChannel, Channel, Notification, WebhookChannel};
 use bark_core::config::BarkChannelConfig;
-use bark_core::{BarkConfig, ChannelsConfig, EventKind, NormalizedEvent, WebhookChannelConfig};
+use bark_core::{AgentKind, BarkConfig, ChannelsConfig, EventKind, NormalizedEvent, WebhookChannelConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
@@ -23,12 +23,14 @@ use tokio::sync::mpsc;
 //
 // 白名单与各窗口入口的**实际 invoke 调用面**一一对应（前端 grep 核对）：
 // - "main"（index.html → main.ts → App.vue + pages）：save_config / set_agent_enabled /
-//   test_channel / test_sound / glow_preview / glow_preview_burst / glow_off / dismiss_session；
+//   test_channel / test_sound / glow_preview / glow_preview_burst / glow_off / dismiss_session /
+//   set_window_border_color（main.ts 主题同步）；
 // - "main" + "tray-menu"（menu.html → menu.ts 直接 invoke）：recheck_sessions / toggle_mute / quit_app；
 // - "widget"（widget.html → widget.ts）：start_widget_drag / save_widget_position / set_widget_pinned / take_widget_reveal / close_widget；
 // - 任意窗口：show_main_panel（App.vue / widget.ts 都调）与只读命令
 //   （agent_statuses / needs_agent_setup / get_config / diagnostics / list_events /
-//   clear_events / list_active_sessions / list_monitors / check_update / open_release_page）；
+//   clear_events / list_active_sessions / usage_daily / usage_by_agent / usage_hourly /
+//   usage_coverage / list_monitors / check_update / open_release_page）；
 // - "glow-*"（glow.html → glow.ts）：只 listen 事件，零命令。
 const MAIN: &[&str] = &["main"];
 /// 托盘菜单窗口里直接调用的动作（menu.ts）：主窗口与托盘菜单共用
@@ -36,14 +38,24 @@ const MAIN_OR_TRAY: &[&str] = &["main", crate::tray_menu::LABEL];
 /// 悬浮窗右键菜单的动作（widget.ts）：只许悬浮窗自己调
 const WIDGET_ONLY: &[&str] = &[crate::widget::WIDGET_LABEL];
 
+/// 按界面语言取词（zh/en 双语元组模式，取词依据见 bark-core/src/i18n.rs）：
+/// 返回给前端的 Err 与提示文案统一走这里，一处分支、处处双语。
+/// commands 与 update 等返回 UI 文案的模块共用（app 内无第二处实现）。
+pub(crate) fn tr(lang: bark_core::Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
+    match lang {
+        bark_core::Lang::Zh => zh.into(),
+        bark_core::Lang::En => en.into(),
+    }
+}
+
 /// 校验命令调用方窗口是否在白名单内（判定逻辑见纯函数 [`label_allowed`]）
-fn require_window(webview: &Webview, allowed: &[&str]) -> Result<(), String> {
+fn require_window(webview: &Webview, allowed: &[&str], lang: bark_core::Lang) -> Result<(), String> {
     let window = webview.window();
     let label = window.label();
     if label_allowed(label, allowed) {
         Ok(())
     } else {
-        Err(format!("命令拒绝来自窗口「{label}」的调用"))
+        Err(tr(lang, format!("命令拒绝来自窗口「{label}」的调用"), format!("Command rejected: call from window \"{label}\" is not allowed")))
     }
 }
 
@@ -65,6 +77,9 @@ pub struct Diagnostics {
     pub startup_warnings: Vec<String>,
     /// 更新成功后的操作提醒，与接入故障分开展示。
     pub startup_notices: Vec<String>,
+    /// 最近一次「该有声音却没响」的原因（未响过则为 null）。
+    /// 判定层把每个跳过原因都带出来了，这里直接给用户看，不用翻代码猜。
+    pub last_sound_skip: Option<crate::state::SoundSkipNote>,
 }
 
 /// 所有 agent 的检测状态
@@ -90,7 +105,7 @@ fn scan_statuses(state: &Arc<AppState>) -> Vec<AgentStatus> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let runtime = crate::state::watch_runtime(state);
-    registry::statuses(&cfg, &exe, &runtime)
+    registry::statuses(&cfg, &exe, &runtime, state.lang())
 }
 
 /// 「这个 agent 接上了吗」：与 Agents 页开关同口径（AgentsPage 的 isOn）。
@@ -128,6 +143,7 @@ pub async fn diagnostics(state: State<'_, Arc<AppState>>) -> Result<Diagnostics,
         restart_required: state.restart_required(),
         startup_warnings: state.startup_warnings(),
         startup_notices: state.startup_notices(),
+        last_sound_skip: state.last_sound_skip(),
     })
 }
 
@@ -145,7 +161,7 @@ pub async fn set_agent_enabled(
     enabled: bool,
     tx: State<'_, mpsc::Sender<NormalizedEvent>>,
 ) -> Result<Option<String>, String> {
-    require_window(&webview, MAIN)?;
+    require_window(&webview, MAIN, state.lang())?;
     // B12：含 agent 配置文件写入与 fsync，整体挪进 spawn_blocking。
     // Arc<AppState> 与 mpsc::Sender 都是 'static，可直接 move。
     let state = state.inner().clone();
@@ -161,9 +177,16 @@ pub async fn set_agent_enabled(
 /// 配置损坏后用户拖一下悬浮窗就会触发覆盖。所有写盘命令统一走这里。
 fn ensure_config_writable(state: &Arc<AppState>) -> Result<(), String> {
     match state.config_error() {
-        Some(e) => Err(format!(
-            "配置文件损坏，已阻止写入以免覆盖你的配置：{e}\n\
-             请修复或删除配置文件后重启应用。"
+        Some(e) => Err(tr(
+            state.lang(),
+            format!(
+                "配置文件损坏，已阻止写入以免覆盖你的配置：{e}\n\
+                 请修复或删除配置文件后重启应用。"
+            ),
+            format!(
+                "Config file is corrupted; writes are blocked to protect your configuration: {e}\n\
+                 Fix or delete the config file and restart the app."
+            ),
         )),
         None => Ok(()),
     }
@@ -177,7 +200,9 @@ fn set_agent_enabled_blocking(
     enabled: bool,
     tx: mpsc::Sender<NormalizedEvent>,
 ) -> Result<Option<String>, String> {
-    let agent = bark_core::AgentKind::from_id(&kind).ok_or_else(|| format!("未知 agent: {kind}"))?;
+    let lang = state.lang();
+    let agent = bark_core::AgentKind::from_id(&kind)
+        .ok_or_else(|| tr(lang, format!("未知 agent: {kind}"), format!("Unknown agent: {kind}")))?;
     // 配置损坏 → 整个开关操作短路（见 ensure_config_writable：此刻落任何盘都会覆盖用户配置）
     ensure_config_writable(&state)?;
 
@@ -191,10 +216,11 @@ fn set_agent_enabled_blocking(
                 let cfg = crate::state::read(&state.config);
                 (cfg.server.port, cfg.server.token.clone())
             };
-            let ctx = RegisterCtx { exe_path: exe.to_string_lossy().into_owned(), port, token };
+            let ctx =
+                RegisterCtx { exe_path: exe.to_string_lossy().into_owned(), port, token, lang };
             adapter.register(&ctx).map_err(|e| format!("{e:#}"))?;
             wrote_hook = true;
-            hint = adapter.trust_hint().map(String::from);
+            hint = adapter.trust_hint(lang).map(String::from);
         } else {
             let mut ctx = InstallCtx {
                 exe_path: std::env::current_exe()
@@ -207,7 +233,7 @@ fn set_agent_enabled_blocking(
             // 插件型（DSH / OpenCode）：删除的只是磁盘上的插件与登记，宿主进程里
             // 已加载的那份仍在内存中继续上报，必须提示用户重启宿主才彻底停止
             // （在此之前 daemon 会按开关忽略该 agent 的事件）。
-            hint = adapter.unregister_hint().map(String::from);
+            hint = adapter.unregister_hint(lang).map(String::from);
         }
     } else if agent.mode() == bark_core::AdapterMode::Watch {
         // 监控型（WorkBuddy / TraeWork）：没有 hook 配置文件可写，开关落盘后
@@ -217,10 +243,18 @@ fn set_agent_enabled_blocking(
         if enabled {
             match registry::find_watch_adapter(agent) {
                 Some(a) if !a.is_installed() => {
-                    return Err(format!("{} 未检测到安装，无法开启监控", agent.display_name()));
+                    return Err(tr(
+                        lang,
+                        format!("{} 未检测到安装，无法开启监控", agent.display_name_lang(lang)),
+                        format!("{} is not installed; cannot enable monitoring", agent.display_name_lang(lang)),
+                    ));
                 }
                 Some(a) if !a.is_available() => {
-                    let reason = a.unavailable_reason().unwrap_or_else(|| "监控暂不可用".into());
+                    // unavailable_reason 按界面语言取词（见 watch.rs 各实现）；
+                    // 这里只兜「取不到原因」的极小概率分支
+                    let reason = a.unavailable_reason(lang).unwrap_or_else(|| {
+                        tr(lang, "监控暂不可用", "Monitoring is currently unavailable")
+                    });
                     return Err(reason);
                 }
                 _ => {}
@@ -228,7 +262,11 @@ fn set_agent_enabled_blocking(
         }
     } else {
         // 无 hook 适配器且非监控型：枚举未注册或接入方式尚未支持
-        return Err(format!("{} 暂不支持接入（无适配器）", agent.display_name()));
+        return Err(tr(
+            lang,
+            format!("{} 暂不支持接入（无适配器）", agent.display_name_lang(lang)),
+            format!("{} is not supported yet (no adapter)", agent.display_name_lang(lang)),
+        ));
     }
 
     // 监控型：只写开关，sync_watchers 负责启停。
@@ -260,7 +298,11 @@ fn set_agent_enabled_blocking(
                     let _ = adapter.unregister(&mut ctx);
                 }
             }
-            return Err(format!("配置保存失败，已回滚接入改动: {e:#}"));
+            return Err(tr(
+                lang,
+                format!("配置保存失败，已回滚接入改动: {e:#}"),
+                format!("Failed to save config; integration changes were rolled back: {e:#}"),
+            ));
         }
     }
     // 开关已按用户意图落定：启动自检关于这个 agent 的告警（如「配置无法解析，已置为未启用」）
@@ -284,6 +326,16 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<BarkConfig, S
     Ok(crate::state::read(&state.config).clone())
 }
 
+/// 当前界面语言（已按配置偏好 + 操作系统语言解析）。
+///
+/// **任何窗口都可调用**（主面板 / 悬浮窗 / 托盘菜单三个入口启动时都要先拿它
+/// 再渲染文案，见 src/i18n.ts）。语言解析点全应用只有 Rust 这一处
+/// （bark-core/src/i18n.rs 的注释说明了为什么不做 webview 本地检测）。
+#[tauri::command]
+pub async fn get_locale(state: State<'_, Arc<AppState>>) -> Result<&'static str, String> {
+    Ok(state.lang().id())
+}
+
 /// 页面只提交自己负责的分区；接入开关由 set_agent_enabled 管理。
 /// server 有意不开放：当前 UI 只展示端口/token，修改需手工编辑配置并重启。
 #[derive(Default, Deserialize)]
@@ -294,11 +346,21 @@ pub struct ConfigPatch {
     notify: Option<bark_core::NotifyConfig>,
     glow: Option<bark_core::GlowConfig>,
     widget: Option<WidgetPatch>,
+    /// Token 用量统计开关（设置页；关闭即停采集并隐藏菜单）
+    token_monitor: Option<TokenMonitorPatch>,
+    /// 界面语言（设置页「界面语言」下拉；语言变更的广播见 save_config）
+    language: Option<bark_core::LanguagePref>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WidgetPatch {
+    enabled: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenMonitorPatch {
     enabled: Option<bool>,
 }
 
@@ -321,6 +383,14 @@ impl ConfigPatch {
                 current.widget.enabled = enabled;
             }
         }
+        if let Some(value) = self.token_monitor {
+            if let Some(enabled) = value.enabled {
+                current.token_monitor.enabled = enabled;
+            }
+        }
+        if let Some(value) = self.language {
+            current.language = value;
+        }
     }
 }
 
@@ -333,7 +403,7 @@ pub async fn save_config(
     config: ConfigPatch,
     tx: State<'_, mpsc::Sender<NormalizedEvent>>,
 ) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
+    require_window(&webview, MAIN, state.lang())?;
     // B12：fsync 落盘挪进 spawn_blocking
     let state = state.inner().clone();
     let tx = tx.inner().clone();
@@ -344,17 +414,44 @@ pub async fn save_config(
         ensure_config_writable(&state)?;
 
         // 与接入开关、悬浮窗位置等写盘串行，锁在副作用之前释放。
+        let language_changed;
+        let token_monitor_changed;
         {
             let _write_guard = crate::state::lock(&state.config_write);
             let mut incoming = crate::state::read(&state.config).clone();
+            let old_lang = incoming.language;
+            let old_tm = incoming.token_monitor.enabled;
             config.apply(&mut incoming);
+            language_changed = incoming.language != old_lang;
+            token_monitor_changed = incoming.token_monitor.enabled != old_tm;
             // 先落盘（不持配置读写锁本体），再原子替换内存值：
             // save() 内部有 fsync，持 RwLock 写锁会阻塞 run_pipeline 的读锁
-            incoming.save(&state.config_path).map_err(|e| format!("配置保存失败: {e:#}"))?;
+            incoming.save(&state.config_path).map_err(|e| {
+                tr(state.lang(), format!("配置保存失败: {e:#}"), format!("Failed to save config: {e:#}"))
+            })?;
             *crate::state::write(&state.config) = incoming;
         }
 
+        // 界面语言变了：刷新 AppState 缓存并广播三个窗口（前端监听后实时换文案，
+        // 无需重启）。emit 放锁外：广播失败只丢这次实时切换，配置已正确落盘。
+        if language_changed {
+            let lang = crate::state::read(&state.config).language.resolve();
+            *crate::state::write(&state.lang) = lang;
+            let _ = app.emit("bark://locale-changed", lang.id());
+        }
+
+        // 用量统计开关变了：广播给主窗口实时隐藏 / 恢复菜单（无需重启）
+        if token_monitor_changed {
+            let _ = app.emit(
+                "bark://token-monitor-changed",
+                crate::state::read(&state.config).token_monitor.enabled,
+            );
+        }
+
         let _ = crate::state::sync_watchers(tx, &state);
+        // Token 用量统计开关可能变了：开 / 关本地库（采集器每轮看 is_enabled 停摆）
+        state.usage.set_enabled(crate::state::read(&state.config).token_monitor.enabled);
+        crate::usage_collect::sync(&state);
         // 流光开关 / 显示器范围 / 宽度等可能变了：重建或回收覆盖窗口
         glow::sync(&app, &state);
         // 悬浮窗开关可能变了：创建 / 销毁窗口
@@ -367,11 +464,20 @@ pub async fn save_config(
 
 /// 原生拖动完成信号：Windows 上必须等左键实际释放，不能把 Tauri 的启动回执当成松手。
 #[tauri::command]
-pub async fn start_widget_drag(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    require_window(&webview, WIDGET_ONLY)?;
-    if crate::state::read(&state.config).widget.pinned { return Ok(false); }
-    let window = app.get_webview_window(crate::widget::WIDGET_LABEL).ok_or("悬浮窗不存在")?;
-    crate::widget::drag(window).await
+pub async fn start_widget_drag(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<crate::widget::DragReport, String> {
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
+    #[cfg(target_os = "macos")]
+    if crate::state::read(&state.config).widget.pinned {
+        return Ok(crate::widget::DragReport { moved: false, before: (0, 0), mouse: (0.0, 0.0) });
+    }
+    #[cfg(not(target_os = "macos"))]
+    if crate::state::read(&state.config).widget.pinned {
+        return Ok(crate::widget::DragReport { moved: false, before: (0, 0) });
+    }
+    let window = app
+        .get_webview_window(crate::widget::WIDGET_LABEL)
+        .ok_or_else(|| tr(state.lang(), "悬浮窗不存在", "Widget window does not exist"))?;
+    crate::widget::drag(window, app.clone()).await
 }
 
 /// 悬浮窗位置记忆（拖动松手后上报，低频）。
@@ -387,9 +493,9 @@ pub async fn save_widget_position(
     dock_side: Option<bark_core::WidgetDockSide>,
     dock_monitor: Option<String>,
 ) -> Result<(), String> {
-    require_window(&webview, WIDGET_ONLY)?;
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
     if !x.is_finite() || !y.is_finite() {
-        return Err("悬浮窗位置必须是有限数值".into());
+        return Err(tr(state.lang(), "悬浮窗位置必须是有限数值", "Widget position must be finite numbers"));
     }
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -401,8 +507,9 @@ pub async fn save_widget_position(
         next.widget.y = y;
         next.widget.dock_side = if next.widget.pinned { None } else { dock_side };
         next.widget.dock_monitor = if next.widget.dock_side.is_some() { dock_monitor } else { None };
-        next.save(&state.config_path)
-            .map_err(|e| format!("保存悬浮窗位置失败: {e:#}"))?;
+        next.save(&state.config_path).map_err(|e| {
+            tr(state.lang(), format!("保存悬浮窗位置失败: {e:#}"), format!("Failed to save widget position: {e:#}"))
+        })?;
         *crate::state::write(&state.config) = next;
         Ok(())
     })
@@ -413,7 +520,7 @@ pub async fn save_widget_position(
 /// 悬浮窗右键菜单「固定位置」：固定时同时取消停靠（并发考量同 save_widget_position）
 #[tauri::command]
 pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>, pinned: bool) -> Result<(), String> {
-    require_window(&webview, WIDGET_ONLY)?;
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         ensure_config_writable(&state)?;
@@ -425,8 +532,31 @@ pub async fn set_widget_pinned(webview: Webview, state: State<'_, Arc<AppState>>
             next.widget.dock_side = None;
             next.widget.dock_monitor = None;
         }
-        next.save(&state.config_path)
-            .map_err(|e| format!("保存固定状态失败: {e:#}"))?;
+        next.save(&state.config_path).map_err(|e| {
+            tr(state.lang(), format!("保存固定状态失败: {e:#}"), format!("Failed to save pin state: {e:#}"))
+        })?;
+        *crate::state::write(&state.config) = next;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 悬浮窗右键菜单「启用/关闭详情面板」：落盘开关，关闭后行悬停不弹详情。
+/// 详情已独立成窗，开关只影响前端是否发起悬停请求，无需重建窗口。
+#[tauri::command]
+pub async fn set_widget_detail_tip(webview: Webview, state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        ensure_config_writable(&state)?;
+        // 单写者（§2.1）：与 save_config 的分区合并串行，「读-改-写盘」全程持锁
+        let _write_guard = crate::state::lock(&state.config_write);
+        let mut next = crate::state::read(&state.config).clone();
+        next.widget.detail_tip = enabled;
+        next.save(&state.config_path).map_err(|e| {
+            tr(state.lang(), format!("保存详情面板开关失败: {e:#}"), format!("Failed to save detail tip state: {e:#}"))
+        })?;
         *crate::state::write(&state.config) = next;
         Ok(())
     })
@@ -440,7 +570,7 @@ pub fn take_widget_reveal(
     webview: Webview,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    require_window(&webview, WIDGET_ONLY)?;
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
     Ok(crate::widget::take_reveal(state.inner()))
 }
 
@@ -448,7 +578,7 @@ pub fn take_widget_reveal(
 /// 广播 bark://widget-closed 让主窗口的悬浮窗设置页同步勾选态。
 #[tauri::command]
 pub async fn close_widget(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    require_window(&webview, WIDGET_ONLY)?;
+    require_window(&webview, WIDGET_ONLY, state.lang())?;
     let state = state.inner().clone();
     let cfg_state = state.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -457,7 +587,9 @@ pub async fn close_widget(webview: Webview, app: AppHandle, state: State<'_, Arc
         let _write_guard = crate::state::lock(&cfg_state.config_write);
         let mut cfg = crate::state::write(&cfg_state.config);
         cfg.widget.enabled = false;
-        cfg.save(&cfg_state.config_path).map_err(|e| format!("保存配置失败: {e:#}"))?;
+        cfg.save(&cfg_state.config_path).map_err(|e| {
+            tr(cfg_state.lang(), format!("保存配置失败: {e:#}"), format!("Failed to save config: {e:#}"))
+        })?;
         Ok(())
     })
     .await
@@ -481,8 +613,9 @@ pub async fn glow_preview(
     state: State<'_, Arc<AppState>>,
     state_name: String,
 ) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
-    let target = parse_glow_state(&state_name)?;
+    require_window(&webview, MAIN, state.lang())?;
+    let lang = state.lang();
+    let target = parse_glow_state(&state_name, lang)?;
     let state = state.inner().clone();
     // "idle" = 熄灭：立刻收起，不需要恢复定时器
     if target == glow::GlowState::Idle {
@@ -503,7 +636,7 @@ pub async fn glow_preview(
 /// 覆盖窗口不销毁，点一下就能灭，不用等预览的恢复定时器。
 #[tauri::command]
 pub async fn glow_off(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
+    require_window(&webview, MAIN, state.lang())?;
     let state = state.inner().clone();
     glow::off(&app, &state);
     Ok(())
@@ -522,11 +655,16 @@ pub async fn glow_preview_burst(
     edge_name: String,
     burst_name: String,
 ) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
-    let edge = parse_glow_state(&edge_name)?;
-    let burst = parse_glow_state(&burst_name)?;
+    require_window(&webview, MAIN, state.lang())?;
+    let lang = state.lang();
+    let edge = parse_glow_state(&edge_name, lang)?;
+    let burst = parse_glow_state(&burst_name, lang)?;
     if edge == glow::GlowState::Idle || burst == glow::GlowState::Idle {
-        return Err("组合预览的边缘与全屏状态都不能是 idle".into());
+        return Err(tr(
+            lang,
+            "组合预览的边缘与全屏状态都不能是 idle",
+            "Edge and burst states in combined preview cannot be idle",
+        ));
     }
     let state = state.inner().clone();
     let seq = glow::preview_burst(&app, &state, edge, burst);
@@ -538,14 +676,14 @@ pub async fn glow_preview_burst(
     Ok(())
 }
 
-fn parse_glow_state(s: &str) -> Result<glow::GlowState, String> {
+fn parse_glow_state(s: &str, lang: bark_core::Lang) -> Result<glow::GlowState, String> {
     match s {
         "running" => Ok(glow::GlowState::Running),
         "waiting" => Ok(glow::GlowState::Waiting),
         "completed" => Ok(glow::GlowState::Completed),
         "failed" => Ok(glow::GlowState::Failed),
         "idle" => Ok(glow::GlowState::Idle),
-        other => Err(format!("未知流光状态: {other}")),
+        other => Err(tr(lang, format!("未知流光状态: {other}"), format!("Unknown glow state: {other}"))),
     }
 }
 
@@ -589,11 +727,104 @@ pub fn list_active_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionStatu
     crate::state::sessions_for_ui(state.inner())
 }
 
+/// Token 用量：按日 × agent 聚合（day 闭区间，YYYY-MM-DD）。
+/// 统计关闭 / 库不可用时返回空数组，前端据此显示空态而非报错。
+#[tauri::command]
+pub fn usage_daily(state: State<'_, Arc<AppState>>, from: String, to: String) -> Vec<crate::usage_store::DailyUsage> {
+    state.usage.daily(&from, &to)
+}
+
+/// Token 用量：窗口内按 agent 聚合（分 agent 表格）。
+#[tauri::command]
+pub fn usage_by_agent(state: State<'_, Arc<AppState>>, from: String, to: String) -> Vec<crate::usage_store::AgentUsage> {
+    let lang = state.lang();
+    let mut rows = state.usage.by_agent(&from, &to);
+    for r in &mut rows {
+        r.display_name = bark_core::AgentKind::ALL
+            .iter()
+            .find(|k| k.id() == r.agent)
+            .map(|k| k.display_name_lang(lang).to_string())
+            .unwrap_or_else(|| r.agent.clone());
+    }
+    rows
+}
+
+/// Token 用量：按小时 × agent 聚合（"今天"视图）。day 闭区间 → 本地零点的毫秒边界。
+#[tauri::command]
+pub fn usage_hourly(state: State<'_, Arc<AppState>>, from: String, to: String) -> Vec<crate::usage_store::HourlyUsage> {
+    let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+    let (Some(f), Some(t)) = (parse(&from), parse(&to)) else { return Vec::new() };
+    let local = chrono::Local::now().timezone();
+    let Some(start) = f.and_hms_opt(0, 0, 0).and_then(|d| d.and_local_timezone(local).single()) else {
+        return Vec::new();
+    };
+    let Some(end) = (t + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .and_then(|d| d.and_local_timezone(local).single())
+    else {
+        return Vec::new();
+    };
+    state.usage.hourly(start.timestamp_millis(), end.timestamp_millis())
+}
+
+/// 用量页脚注：已安装但没有本地用量源的 agent，以及只有条件源的 Qoder。
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageCoverage {
+    pub kind: &'static str,
+    pub display_name: &'static str,
+    pub reason: UsageCoverageReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCoverageReason {
+    NoLocalSource,
+    CustomOnly,
+}
+
+fn usage_coverage_reason(kind: &str) -> Option<UsageCoverageReason> {
+    if crate::usage_collect::NO_USAGE_SOURCE_AGENTS.contains(&kind) {
+        Some(UsageCoverageReason::NoLocalSource)
+    } else if crate::usage_collect::CONDITIONAL_USAGE_AGENTS.contains(&kind) {
+        Some(UsageCoverageReason::CustomOnly)
+    } else {
+        None
+    }
+}
+
+fn usage_coverage_from(statuses: &[AgentStatus], lang: bark_core::Lang) -> Vec<UsageCoverage> {
+    statuses
+        .iter()
+        .filter(|s| s.installed)
+        .filter_map(|s| {
+            Some(UsageCoverage {
+                kind: s.kind,
+                // watch 型 adapter 的 display_name 是固定的中文名（豆包工作），
+                // 与同页表格一样按界面语言取展示名。
+                display_name: AgentKind::from_id(s.kind)
+                    .map(|k| k.display_name_lang(lang))
+                    .unwrap_or(s.display_name),
+                reason: usage_coverage_reason(s.kind)?,
+            })
+        })
+        .collect()
+}
+
+/// Token 用量页脚注：只返回已安装且没有完整本地用量源的 agent。
+#[tauri::command]
+pub async fn usage_coverage(state: State<'_, Arc<AppState>>) -> Result<Vec<UsageCoverage>, String> {
+    let state = state.inner().clone();
+    let lang = state.lang();
+    tokio::task::spawn_blocking(move || usage_coverage_from(&scan_statuses(&state), lang))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 只移除本应用中的显示条目，不向 Agent 发送停止指令。
 #[tauri::command]
 pub async fn dismiss_session(webview: Webview, app: AppHandle, state: State<'_, Arc<AppState>>,
     agent: String, session_id: String, expected_started_at: i64, expected_last_activity: i64) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
+    require_window(&webview, MAIN, state.lang())?;
     crate::state::dismiss_session(&state, &app, &agent, &session_id,
         expected_started_at, expected_last_activity).await
 }
@@ -617,6 +848,7 @@ fn resolve_test_target(
     saved: &ChannelsConfig,
     url: Option<String>,
     template: Option<String>,
+    lang: bark_core::Lang,
 ) -> Result<TestTarget, String> {
     let url = url.filter(|u| !u.trim().is_empty());
     match channel {
@@ -624,7 +856,7 @@ fn resolve_test_target(
             let saved = saved.bark.clone().unwrap_or_default();
             let url = url.unwrap_or(saved.url);
             if url.trim().is_empty() {
-                return Err("Bark 未配置".into());
+                return Err(tr(lang, "Bark 未配置", "Bark is not configured"));
             }
             Ok(TestTarget::Bark(BarkChannelConfig { enabled: true, url }))
         }
@@ -632,7 +864,7 @@ fn resolve_test_target(
             let saved = saved.webhook.clone().unwrap_or_default();
             let url = url.unwrap_or(saved.url);
             if url.trim().is_empty() {
-                return Err("Webhook 未配置".into());
+                return Err(tr(lang, "Webhook 未配置", "Webhook is not configured"));
             }
             let template = template.unwrap_or_else(|| {
                 if saved.template.trim().is_empty() {
@@ -648,7 +880,7 @@ fn resolve_test_target(
                 template,
             }))
         }
-        other => Err(format!("未知渠道: {other}")),
+        other => Err(tr(lang, format!("未知渠道: {other}"), format!("Unknown channel: {other}"))),
     }
 }
 
@@ -662,12 +894,17 @@ pub async fn test_channel(
     url: Option<String>,
     template: Option<String>,
 ) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
+    require_window(&webview, MAIN, state.lang())?;
+    let lang = state.lang();
     let saved = crate::state::read(&state.config).channels.clone();
-    let target = resolve_test_target(&channel, &saved, url, template)?;
+    let target = resolve_test_target(&channel, &saved, url, template, lang)?;
+    let (title, body) = match lang {
+        bark_core::Lang::Zh => ("agent-bark 测试通知".to_string(), format!("渠道 {channel} 工作正常")),
+        bark_core::Lang::En => ("agent-bark Test Notification".to_string(), format!("Channel {channel} is working")),
+    };
     let n = Notification {
-        title: "agent-bark 测试通知".into(),
-        body: format!("渠道 {channel} 工作正常"),
+        title,
+        body,
         event: EventKind::RunCompleted,
         agent: "agent-bark".into(),
         project: None,
@@ -683,15 +920,66 @@ pub async fn test_channel(
     .map_err(|e| format!("{e:#}"))
 }
 
-/// 「通知」页「声音」的测试按钮：立即把选定的音效播放 `plays` 次。
+/// 「通知」页「声音」的测试按钮：立即把选定的音效播放一次。
 /// 走与真实事件同一条播放路径（bark_channels::play_sound），测的就是将来会响的那个声音。
+/// effect = "custom" 时 custom_path 为用户自选的音频文件路径。
+///
+/// 测试不建立会话，按正常门控保活永远是冷的（每点一次都重开流 + 重新垫预缓冲）。
+/// 所以这里先开一个 30s 的保活窗并立即起流：第一次仍按冷路径垫预缓冲（设备要醒），
+/// 之后再点就是热路径、零延迟——连点几下去听四个状态的差别时才不会每次都等一秒。
+///
+/// play_sound 只把音频交给后台线程/进程就返回，所以本命令不会随着播放时长挂住——
+/// 自定义音效可能长达几分钟，等它播完会让按钮一直转圈且无法取消。
+/// 因此这里的 Err 只覆盖「参数不合法 / 文件不存在 / 开不出输出设备」这三类前置失败。
 #[tauri::command]
-pub async fn test_sound(webview: Webview, effect: String, plays: u32) -> Result<(), String> {
-    require_window(&webview, MAIN)?;
-    tokio::task::spawn_blocking(move || bark_channels::play_sound(&effect, plays))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))
+pub async fn test_sound(
+    webview: Webview,
+    state: State<'_, Arc<AppState>>,
+    effect: String,
+    custom_path: Option<String>,
+) -> Result<(), String> {
+    require_window(&webview, MAIN, state.lang())?;
+    state.hold_sound_preview();
+    // 先把保活意图发过去：音频线程会开流，第一次仍按冷路径垫预缓冲
+    bark_channels::keepalive_set(true);
+    // 音量也跟着「声音」页的滑杆走：试听听到的就是真实事件会用的音量
+    let volume = state.sound_volume();
+    tokio::task::spawn_blocking(move || {
+        // preview 会等音频线程确认（最多 1.5s），放阻塞线程里等，不占 async 运行时
+        bark_channels::preview_sound(&effect, custom_path.as_deref().map(std::path::Path::new), volume)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 「声音」区自定义音效的文件选择：原生文件对话框（音频格式过滤），
+/// 返回所选文件绝对路径；用户取消返回 null。对话框是阻塞调用，走 spawn_blocking。
+#[tauri::command]
+pub async fn pick_sound_file(
+    webview: Webview,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    let lang = state.lang();
+    require_window(&webview, MAIN, lang)?;
+    tokio::task::spawn_blocking(move || {
+        let title = match lang {
+            bark_core::Lang::Zh => "选择自定义音效文件",
+            bark_core::Lang::En => "Choose a custom sound file",
+        };
+        rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter(
+                match lang {
+                    bark_core::Lang::Zh => "音频",
+                    bark_core::Lang::En => "Audio",
+                },
+                &["mp3", "wav", "flac", "ogg", "m4a", "aac", "wma", "opus", "aiff", "aif"],
+            )
+            .pick_file()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---- 托盘菜单 / 悬浮窗的窗口动作 ----
@@ -707,10 +995,33 @@ pub fn show_main_panel(app: AppHandle) {
     crate::show_main(&app);
 }
 
+/// 主窗口边缘描边色跟随主题（main.ts 在主题落地 / 变化时调）。
+/// 仅 Windows 生效：Win11 无边框窗口的 DWM 默认描边是黑线，换成「浅色深一档 / 深色浅一档」。
+/// macOS 带原生红绿灯的 titled 窗口由系统画边框（公开 API 改不了色），这里空操作。
+#[tauri::command]
+pub fn set_window_border_color(webview: Webview, app: AppHandle, theme: String) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    require_window(&webview, MAIN, state.lang())?;
+    #[cfg(windows)]
+    {
+        let dark = match theme.as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => return Err(tr(state.lang(), format!("未知主题「{theme}」"), format!("Unknown theme \"{theme}\""))),
+        };
+        if let Some(win) = app.get_webview_window("main") {
+            crate::set_main_border_color(&win, dark);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = theme;
+    Ok(())
+}
+
 /// 托盘菜单「检测运行状态」：触发来源核验，并按当前会话恢复光效。
 #[tauri::command]
 pub fn recheck_sessions(webview: Webview, app: AppHandle) -> Result<(), String> {
-    require_window(&webview, MAIN_OR_TRAY)?;
+    require_window(&webview, MAIN_OR_TRAY, app.state::<Arc<AppState>>().lang())?;
     crate::state::recheck_sessions(&app.state::<Arc<AppState>>(), &app);
     Ok(())
 }
@@ -718,14 +1029,14 @@ pub fn recheck_sessions(webview: Webview, app: AppHandle) -> Result<(), String> 
 /// 托盘菜单「静音」：切换静音（事件仍入历史，仅暂停推送），返回切换后的状态供菜单勾选。
 #[tauri::command]
 pub fn toggle_mute(webview: Webview, app: AppHandle) -> Result<bool, String> {
-    require_window(&webview, MAIN_OR_TRAY)?;
+    require_window(&webview, MAIN_OR_TRAY, app.state::<Arc<AppState>>().lang())?;
     Ok(app.state::<Arc<AppState>>().toggle_mute())
 }
 
 /// 托盘菜单「退出」：整个应用退出（主窗口关闭只是隐藏到托盘，不在这里）。
 #[tauri::command]
 pub fn quit_app(webview: Webview, app: AppHandle) -> Result<(), String> {
-    require_window(&webview, MAIN_OR_TRAY)?;
+    require_window(&webview, MAIN_OR_TRAY, app.state::<Arc<AppState>>().lang())?;
     app.exit(0);
     Ok(())
 }
@@ -735,7 +1046,7 @@ mod tests {
     use super::*;
     use super::agent_integrated;
     use bark_adapters::{AgentStatus, VerifyReport};
-    use bark_core::AdapterMode;
+    use bark_core::{AdapterMode, Lang};
 
     fn status(enabled: bool, registered: bool) -> AgentStatus {
         AgentStatus {
@@ -802,33 +1113,34 @@ mod tests {
         };
 
         // url Some（非空）= 测表单里未保存的新地址
-        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, Some("https://new/bark".into()), None).unwrap() else {
+        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, Some("https://new/bark".into()), None, Lang::Zh).unwrap() else {
             panic!("bark 渠道");
         };
         assert_eq!(b.url, "https://new/bark");
         // url 空串视同 None → 回退落盘配置
-        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, Some("  ".into()), None).unwrap() else {
+        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, Some("  ".into()), None, Lang::Zh).unwrap() else {
             panic!("bark 渠道");
         };
         assert_eq!(b.url, "https://old/bark");
         // 全 None = 用已落盘配置（旧行为）
-        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, None, None).unwrap() else {
+        let TestTarget::Bark(b) = resolve_test_target("bark", &saved, None, None, Lang::Zh).unwrap() else {
             panic!("bark 渠道");
         };
         assert_eq!(b.url, "https://old/bark");
-        // 都没配过 → 明确报「未配置」
-        assert!(resolve_test_target("bark", &empty, None, None).is_err());
+        // 都没配过 → 明确报「未配置」（zh 原文 + en 用例都钉住）
+        assert!(matches!(resolve_test_target("bark", &empty, None, None, Lang::Zh), Err(e) if e == "Bark 未配置"));
+        assert!(matches!(resolve_test_target("bark", &empty, None, None, Lang::En), Err(e) if e == "Bark is not configured"));
 
         // template Some 用传入值；None 回退落盘 template；落盘为空再回退默认模板
         let TestTarget::Webhook(w) =
-            resolve_test_target("webhook", &saved, Some("https://new/hook".into()), Some(r#"{"x": 1}"#.into())).unwrap()
+            resolve_test_target("webhook", &saved, Some("https://new/hook".into()), Some(r#"{"x": 1}"#.into()), Lang::Zh).unwrap()
         else {
             panic!("webhook 渠道");
         };
         assert_eq!(w.url, "https://new/hook");
         assert_eq!(w.template, r#"{"x": 1}"#);
         assert_eq!(w.method, "PUT", "契约不覆盖 method：沿用落盘值");
-        let TestTarget::Webhook(w) = resolve_test_target("webhook", &saved, None, None).unwrap() else {
+        let TestTarget::Webhook(w) = resolve_test_target("webhook", &saved, None, None, Lang::Zh).unwrap() else {
             panic!("webhook 渠道");
         };
         assert_eq!(w.template, r#"{"t": "{title}"}"#);
@@ -840,11 +1152,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let TestTarget::Webhook(w) = resolve_test_target("webhook", &cleared, None, None).unwrap() else {
+        let TestTarget::Webhook(w) = resolve_test_target("webhook", &cleared, None, None, Lang::Zh).unwrap() else {
             panic!("webhook 渠道");
         };
         assert_eq!(w.template, WebhookChannelConfig::default().template, "落盘 template 为空 → 默认模板");
-        assert!(resolve_test_target("nope", &saved, None, None).is_err(), "未知渠道报错");
+        assert!(resolve_test_target("nope", &saved, None, None, Lang::Zh).is_err(), "未知渠道报错");
     }
 
     #[test]
@@ -879,5 +1191,55 @@ mod tests {
         assert!(!current.notify.enabled);
         assert!(!current.glow.enabled);
         assert!(serde_json::from_value::<ConfigPatch>(serde_json::json!({"agents": []})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod usage_coverage_tests {
+    use super::*;
+
+    fn status(kind: &'static str, installed: bool) -> AgentStatus {
+        AgentStatus {
+            kind,
+            display_name: kind,
+            mode: bark_core::AdapterMode::Hook,
+            installed,
+            registered: false,
+            enabled: true,
+            trust_hint: None,
+            config_paths: Vec::new(),
+            verify: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn maps_only_unreadable_installed_agents() {
+        let rows = usage_coverage_from(
+            &[
+                status("cursor", true),
+                status("trae-code", false),
+                status("qoder", true),
+                status("claude-code", true),
+            ],
+            bark_core::Lang::Zh,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "cursor");
+        assert_eq!(rows[0].reason, UsageCoverageReason::NoLocalSource);
+        assert_eq!(rows[1].kind, "qoder");
+        assert_eq!(rows[1].reason, UsageCoverageReason::CustomOnly);
+
+        let en = usage_coverage_from(&[status("doubao-work", true)], bark_core::Lang::En);
+        assert_eq!(en[0].display_name, "Doubao Work");
+    }
+
+    #[test]
+    fn coverage_reason_covers_every_no_source_agent() {
+        for kind in crate::usage_collect::NO_USAGE_SOURCE_AGENTS {
+            assert_eq!(usage_coverage_reason(kind), Some(UsageCoverageReason::NoLocalSource));
+        }
+        assert_eq!(usage_coverage_reason("qoder"), Some(UsageCoverageReason::CustomOnly));
+        assert_eq!(usage_coverage_reason("claude-code"), None);
     }
 }

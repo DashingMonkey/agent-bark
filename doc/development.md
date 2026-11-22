@@ -5,20 +5,31 @@
 ## 环境准备
 
 - Node.js 与 pnpm。
-- Rust stable 工具链。
+- Rust stable 工具链，且 **不低于 1.92**：自定义音效的文件选择用 `rfd` 0.18，它的 MSRV 是 1.92，工具链更旧会在编译期直接报错（仓库没有锁定 `rust-toolchain`，用发行版自带的老 rustc 打包时尤其注意）。
 - Windows 上的 Visual Studio C++ 构建工具。
 
 项目使用 Rust workspace、Tauri 2、Vue 3 和 TypeScript。目录职责见 [项目结构](configuration.md#项目结构)。
 
 ## 构建安装包
 
-在仓库根目录运行：
+先在仓库根目录跑 Rust 一侧的全量测试：
 
 ```powershell
-.\build.bat
+cargo test --manifest-path .\Cargo.toml --workspace --all-targets
 ```
 
-脚本会安装前端依赖、关闭正在运行的 Agent Bark，依次执行类型检查、前端回归测试、探针测试和 Rust 全量测试，再通过 Tauri CLI 构建安装包。任何检查失败都会停止打包，成功后会启动生成的应用。
+再到 `app` 目录完成前端依赖、检查与打包：
+
+```powershell
+cd app
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+pnpm test:tools
+pnpm tauri build
+```
+
+上述命令覆盖 Rust 全量测试、前端依赖安装、类型检查、前端回归测试与探针测试，最后经 Tauri CLI 打包。任何一步失败都应停止打包。打包前建议先退出正在运行的 Agent Bark，否则 exe 被占用会导致链接失败；构建完成后可直接运行 `target\release\AgentBark.exe`。
 
 默认产物：
 

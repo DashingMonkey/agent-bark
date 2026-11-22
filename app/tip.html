@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 行悬停详情的独立窗口；文案由 src/tip.ts 经 i18n 按 UI 语言填充，窗口先加载后显示 -->
+    <title></title>
+    <script>
+      /* 首帧定色：与 index.html / widget.html / menu.html 内联脚本、src/theme.ts 同一套规则（改键名多处一起改） */
+      (function () {
+        try {
+          var p = localStorage.getItem("agent-bark.theme");
+          var t = p === "dark" || p === "light" ? p : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="stylesheet" href="/src/widget.css" />
+  </head>
+  <body>
+    <script type="module" src="/src/tip.ts"></script>
+  </body>
+</html>

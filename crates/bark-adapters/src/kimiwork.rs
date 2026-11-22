@@ -247,15 +247,20 @@ impl WatchAdapter for KimiWorkWatch {
         Self::sessions_dir().is_some_and(|p| p.is_dir())
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
         if self.is_available() {
             return None;
         }
-        Some(
+        let (zh, en) = (
             "未找到 Kimi Work 的 agent 内核数据目录（daimon-share/daimon/runtime/kimi-code/home）。\
-             可能未安装 Kimi 电脑客户端、从未运行过 Work 任务，或 Work 数据迁移过存储盘"
-                .into(),
-        )
+             可能未安装 Kimi 电脑客户端、从未运行过 Work 任务，或 Work 数据迁移过存储盘",
+            "Kimi Work's agent kernel data directory not found (daimon-share/daimon/runtime/kimi-code/home). \
+             The Kimi desktop app may not be installed, no Work task has ever run, or the Work data was migrated to another drive",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh.into(),
+            bark_core::Lang::En => en.into(),
+        })
     }
 
     fn spawn(

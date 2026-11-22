@@ -77,6 +77,15 @@ pub fn run(args: HookArgs) -> i32 {
     let Some(event) = adapter.normalize(&args.event, &raw) else {
         return 0;
     };
+    // BARK_DEBUG：本地终态核验（Codex/Qoder/CodeBuddy）依赖 hook 声明的
+    // transcript_path。用户报「完成没通知」时，这一行能区分「hook 没带路径」与
+    // 「路径带了但格式不认识」，不必让对方抓完整 payload（正文可能含代码）。
+    if std::env::var_os("BARK_DEBUG").is_some() {
+        eprintln!(
+            "agent-bark[debug]: event={} session={} transcript={:?}",
+            args.event, event.session_id, event.transcript_path
+        );
+    }
 
     // 只读加载配置：失败（文件损坏）时绝不写盘
     let config = match BarkConfig::load() {
@@ -397,6 +406,7 @@ mod tests {
             agent: "claude-code".into(),
             kind: EventKind::RunCompleted,
             session_id: "s".into(),
+            transcript_path: None,
             cwd: "C:/p".into(),
             project: Some("p".into()),
             message: "done".into(),

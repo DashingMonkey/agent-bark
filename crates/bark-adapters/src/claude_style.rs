@@ -243,7 +243,7 @@ impl HookAdapter for ClaudeStyleAdapter {
         let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).ok()).collect();
         self.register(ctx)?;
         let changed = paths.iter().zip(before).any(|(p, old)| std::fs::read(p).ok() != old);
-        Ok(if changed { self.spec.trust_hint } else { None })
+        Ok(if changed { self.trust_hint(ctx.lang) } else { None })
     }
 
     fn register(&self, ctx: &RegisterCtx) -> anyhow::Result<()> {
@@ -587,6 +587,16 @@ impl HookAdapter for ClaudeStyleAdapter {
             && raw.get("notification_type").and_then(Value::as_str) == Some("idle_prompt") {
             return None;
         }
+        // Qoder 的内置「记忆」后台代理会在主回合 `Stop` 之后起跑 fork 回合，用工具读写
+        // `~/.qoder[-cn]` 自己的记忆库，却按**父会话 id**触发我们的工具 hook、且没有终态——
+        // 放它进管道就会给一个刚完成的会话凭空建出一条永远收不掉的「思考中」行
+        // （实测记录见 [`touches_qoder_home`]）。
+        if self.spec.kind == AgentKind::Qoder
+            && is_tool_event(event_name)
+            && touches_qoder_home(raw, &InstallEnv::detect().home)
+        {
+            return None;
+        }
         let kind = match (self.spec.kind, event_name) {
             // Cursor 的 stop 是回合结束，不能仅凭事件名断言成功。
             // https://cursor.com/docs/agent/hooks（2026-10-14 核对）
@@ -668,14 +678,134 @@ impl HookAdapter for ClaudeStyleAdapter {
         Some(event)
     }
 
-    fn trust_hint(&self) -> Option<&'static str> {
-        self.spec.trust_hint
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        match lang {
+            bark_core::Lang::Zh => self.spec.trust_hint,
+            bark_core::Lang::En => spec_trust_hint_en(self.spec.kind),
+        }
+    }
+}
+
+/// 英文界面的信任引导（与各 spec 的 `trust_hint` 中文原文一一对应；仅这几个
+/// 宿主有提示）。中文留在 spec 数据里，英文按 kind 在这里取词——提示是
+/// 直接整句展示的用户可见文案，须跟随界面语言。
+fn spec_trust_hint_en(kind: AgentKind) -> Option<&'static str> {
+    match kind {
+        AgentKind::TraeCode => Some(
+            "TRA (formerly TraeCode): after integrating, enable the global config under Settings > Hooks and switch \"Run Mode\" from the default \"Sandbox Run\" to \"Local Auto Run\", otherwise it will not take effect; Agent Hooks logs are shown on the same page",
+        ),
+        AgentKind::CodeBuddy => Some(
+            "CodeBuddy requires running the /hooks panel in a session and approving the externally modified hooks before they take effect",
+        ),
+        AgentKind::Qoder => Some(
+            "Qoder: if it doesn't take effect, fully quit and restart the app",
+        ),
+        AgentKind::Codex => Some(
+            "Codex: after the first integration or hook updates, review and trust the new or changed hooks in the CLI's /hooks; untrusted hooks will not run",
+        ),
+        _ => None,
     }
 }
 
 /// Codex 原生提问工具；精确匹配末段，兼容 functions 命名空间。
 pub fn is_codex_input_tool(name: &str) -> bool {
     matches!(name.rsplit('.').next(), Some("request_user_input" | "request_user_input_async"))
+}
+
+/// 工具类 hook 事件名（`PreToolUse` / `PostToolUse`，含 `PreToolUse:Read` 这种带工具名
+/// 后缀的写法——Qoder 自己的日志里 hook_name 就是这么记的）。`PostToolUseFailure` 也算：
+/// 它归一成「工具失败」，在状态机里同样会**建档 / 改相位**（见 state.rs 的 ToolFailed 分支）。
+fn is_tool_event(event_name: &str) -> bool {
+    event_name.starts_with("PreToolUse") || event_name.starts_with("PostToolUse")
+}
+
+/// hook 载荷里指向文件的字段名：`Read` / `Write` / `Edit` / `MultiEdit` 用 `file_path`，
+/// `Glob` / `Grep` 用 `path`，工具结果里是 `filePath`（2026-11-18 逐条核对 Qoder 日志）。
+const TOOL_PATH_KEYS: [&str; 5] = ["file_path", "filePath", "path", "notebook_path", "notebookPath"];
+
+/// 工具事件是否碰的是 **Qoder 自己的家目录**（`~/.qoder` / `~/.qoder-cn`）。
+///
+/// 为什么需要这条判据（2026-11-18 本机实测，Qoder CN 0.5.14）：Qoder 内置的
+/// `qoder-memory` 插件注册的是 **async `Stop` hook**，主回合 `Stop` 之后约 1 分钟起跑一个
+/// **memory-fork 回合**，用 `Read / Write / Edit / Glob` 读写自己的记忆库
+/// （`~/.qoder-cn/memory/*.md`、`~/.qoder-cn/projects/<项目>/memory/`）。这些工具调用
+/// **会触发我们注册的 `PreToolUse` / `PostToolUse`，载荷里的 `session_id` 是父会话**，
+/// 而那个 fork 回合**没有 `Stop`、没有 `SessionEnd`**：
+///
+/// - 主回合 `Stop` → 会话行照常摘掉（完成色）；
+/// - 64 秒后 memory-fork 的 `PreToolUse:Read` 到达，已过状态机的 10 秒终态回声窗
+///   （`state::IDLE_ECHO_GRACE_MS`），于是按「真心跳」**新建一行**，随后的 `PostToolUse`
+///   把相位改成「思考中」；
+/// - 之后再没有任何事件能收掉它——用户看到的就是
+///   「Qoder 完成后过几分钟又自动变成思考中」。
+///
+/// 判据取「路径前缀」而不是「工具名 + memory 子目录」：记忆库只是眼下最常撞上的一处，
+/// 同一个家目录下还有 `file-history` / `tasks` / `shell-snapshots` 等内部目录，
+/// 以后 Qoder 再加别的后台代理、只要同样走带路径字段的文件工具，同一条规则继续生效。
+/// 用户的工程不可能落在 agent 自己的配置目录里；万一真有人让 Qoder 去改 `~/.qoder`
+/// 里的文件，代价也只是这一轮少显示「执行工具」相位（会话行由 `UserPromptSubmit` 建好，
+/// 完成仍由 `Stop` 收尾）。
+///
+/// 边界——认的是**路径**，不是 fork 回合本身，两类事件拦不住：
+/// - `Bash` 这类载荷只有 `command`、没有路径字段的工具；
+/// - fork 回合若发 `UserPromptSubmit` / `Notification` 等非工具事件（过滤只作用于工具事件）。
+///
+/// 实测至今 memory-fork 只用 `Read / Write / Edit / Glob`，眼下够用；
+/// 僵尸行若复现，先查 fork 是否换了工具或发了非工具事件，再考虑按回合识别。
+fn touches_qoder_home(raw: &Value, home: &std::path::Path) -> bool {
+    let mut paths = Vec::new();
+    collect_tool_paths(raw, 0, &mut paths);
+    if paths.is_empty() {
+        return false;
+    }
+    let roots = qoder_home_roots(home);
+    paths
+        .iter()
+        .map(|path| fold_path(path))
+        .any(|path| roots.iter().any(|root| path.starts_with(root.as_str())))
+}
+
+/// Qoder 两个版本的家目录（带结尾分隔符：`~/.qoder-x` 这种同前缀目录不得误命中）。
+fn qoder_home_roots(home: &std::path::Path) -> Vec<String> {
+    [".qoder", ".qoder-cn"]
+        .iter()
+        .map(|name| fold_path(&home.join(name).to_string_lossy()) + "/")
+        .collect()
+}
+
+/// 统一分隔符并折叠大小写：hook 载荷里的路径形态不可控（`C:\…` 与 `C:/…` 混用），
+/// Windows 上盘符 / 目录名的大小写也可能与配置里不一致。判据只关心「属于谁的目录」。
+fn fold_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// 递归收集 hook 载荷里「文件路径」字段的值（深度有限：`tool_input` 正常只有两层）。
+fn collect_tool_paths(value: &Value, depth: usize, out: &mut Vec<String>) {
+    if depth > 4 {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if TOOL_PATH_KEYS.contains(&key.as_str()) {
+                    match child {
+                        Value::String(path) => out.push(path.clone()),
+                        Value::Array(items) => {
+                            out.extend(items.iter().filter_map(Value::as_str).map(str::to_owned));
+                        }
+                        _ => {}
+                    }
+                }
+                collect_tool_paths(child, depth + 1, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_paths(item, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 一组 hook 里是否有**有效**的我们的条目：指向已下线 agent 的旧条目不算。
@@ -925,8 +1055,8 @@ pub fn trae_code() -> ClaudeStyleAdapter {
 /// v1.16.0+，Beta）取子集——该文档是 Claude Code hooks 的近逐字镜像，27+ 事件，
 /// 含 `SessionEnd`（reason: clear / logout / prompt_input_exit / other）与
 /// `StopFailure`（回合因 API 错误结束）。此前这里只写 3 个事件是囿于「官方
-/// 事件表未公开」；现在有文档了，按 Claude Code 同款口径补齐（**未实测**，
-/// 但本机装有 CodeBuddy，可直接验证）：
+/// 事件表未公开」；现在有文档了，按 Claude Code 同款口径补齐（**未实测**；
+/// 本机未安装 CodeBuddy，有装机的机器可直接用 `/hooks` 面板核对）：
 /// - `Stop` 官方同样明确「用户中断时不触发」→ 中止回合靠 `SessionEnd` 释放。
 /// - `UserPromptSubmit` / `PreToolUse` → Activity 心跳（此前会话只在等待/失败时可见）。
 /// - `PostToolUseFailure` → ToolFailed（工具级失败）。
@@ -1011,6 +1141,10 @@ pub fn codebuddy() -> ClaudeStyleAdapter {
 /// 没注册的两个（都是交集之外、且实测无功能损失）：
 /// - `SessionStart`：在本仓库是空操作（不通知、不建档，见 state.rs 的 apply_session_event）
 /// - `PermissionRequest`：国际版实测**从不触发**（授权等待走 Notification），CN 文档也没列它
+///
+/// 额外的入口过滤：工具事件里的文件落在 `~/.qoder` / `~/.qoder-cn` 内判为 **agent 内部维护**
+/// 并整条丢弃——`qoder-memory` 的 memory-fork 回合会在 `Stop` 之后几十秒用工具读写自己的
+/// 记忆库，却按父会话 id 触发 hook 且没有终态，见 [`touches_qoder_home`] 的实测记录。
 pub fn qoder() -> ClaudeStyleAdapter {
     const MAP: &[(&str, EventKind)] = &[
         ("UserPromptSubmit", EventKind::Activity),
@@ -1034,8 +1168,8 @@ pub fn qoder() -> ClaudeStyleAdapter {
             ]
         }),
         event_map: MAP,
-        // 三个入口（IDE / 桌面应用 / CLI）都只在启动时加载 hooks，所以是"退出并重启"
-        trust_hint: Some("Qoder 修改配置后需完全退出并重启对应应用（IDE / 桌面应用 / CLI）生效"),
+        // 桌面版实测改完即生效；CLI 仍只在启动时加载 hooks，所以提示「未生效再重启」
+        trust_hint: Some("Qoder 若未生效，请完全退出并重启对应应用"),
         shape: HookShape::Nested,
         entry: command_entry,
         create_parent_dir: false,
@@ -1326,6 +1460,7 @@ mod tests {
             exe_path: r"C:\Program Files\AgentBark\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         }
     }
 
@@ -1543,6 +1678,7 @@ mod tests {
             exe_path: r"D:\new\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         };
         assert!(matches!(adapter.verify(&moved), VerifyReport::StalePath { .. }));
         adapter.register(&moved).unwrap();
@@ -1587,7 +1723,7 @@ mod tests {
             )
             .expect("claude_code 注册了 PostToolUseFailure");
         assert_eq!(ev.kind, EventKind::ToolFailed);
-        assert_eq!(ev.kind.default_title(), "工具失败");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "工具失败");
         assert!(!ev.kind.should_notify(), "工具失败不该弹「任务失败」通知");
     }
 
@@ -1614,19 +1750,24 @@ mod tests {
         let adapter = test_adapter(vec![dir.join("settings.json")]);
 
         // Qoder 实测载荷：Notification 里带 notification_type=permission_prompt
+        // project 名取 cwd 的最后一段，路径分隔符必须按平台给——反斜杠写法在 unix 上不是分隔符
+        #[cfg(windows)]
+        let cwd = r"D:\Workspace\proj";
+        #[cfg(not(windows))]
+        let cwd = "/tmp/Workspace/proj";
         let ev = adapter
             .normalize(
                 "Notification",
                 &json!({
                     "session_id": "s",
-                    "cwd": r"D:\Workspace\proj",
+                    "cwd": cwd,
                     "notification_type": "permission_prompt",
                     "message": "Tool Bash requires confirmation"
                 }),
             )
             .expect("test_adapter 注册了 Notification");
         assert_eq!(ev.kind, EventKind::PermissionRequired);
-        assert_eq!(ev.kind.default_title(), "需要确认");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "需要确认");
         assert_eq!(ev.message, "Tool Bash requires confirmation");
         assert_eq!(ev.project.as_deref(), Some("proj"));
 
@@ -1675,7 +1816,7 @@ mod tests {
             )
             .expect("两版实测都支持 Notification");
         assert_eq!(ev.kind, EventKind::PermissionRequired);
-        assert_eq!(ev.kind.default_title(), "需要确认");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "需要确认");
 
         // 实测：用户主动中断回合只有 SessionEnd（没有 Stop）→ 必须能清掉「运行中」。
         // 归一成 RunAborted（中止）而不是 RunFailed：用户自己按的停止不该亮失败色，
@@ -1684,12 +1825,124 @@ mod tests {
             .normalize("SessionEnd", &json!({ "session_id": "s", "reason": "other" }))
             .expect("两版实测都支持 SessionEnd");
         assert_eq!(ev.kind, EventKind::RunAborted);
-        assert_eq!(ev.kind.default_title(), "已终止");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "已终止");
         assert!(!ev.kind.should_notify(), "自己按的停止不通知");
 
         // 合并后的表只留两版交集：SessionStart（空操作）与 PermissionRequest（实测不触发）不注册
         assert!(adapter.normalize("SessionStart", &json!({})).is_none());
         assert!(adapter.normalize("PermissionRequest", &json!({})).is_none());
+    }
+
+    /// 2026-11-18 实测回归：Qoder 的 `qoder-memory` 插件在 `Stop` 之后约 1 分钟起跑
+    /// memory-fork 回合，用 Read / Write / Edit / Glob 读写 `~/.qoder[-cn]` 下的记忆库。
+    /// 这些工具 hook 带的是**父会话 id**、却没有任何终态事件；放行就会给刚完成的会话
+    /// 建出一条永远收不掉的「思考中」行（用户实测症状：完成后过几分钟又变成思考中）。
+    #[test]
+    fn qoder_memory_maintenance_tool_events_are_dropped() {
+        let adapter = qoder();
+        let home = InstallEnv::detect().home;
+        let global = home.join(".qoder-cn").join("memory").join("MEMORY.md");
+        let project = home
+            .join(".qoder-cn")
+            .join("projects")
+            .join("D--work-demo")
+            .join("memory")
+            .join("MEMORY.md");
+        // 实测的三种事件名（PreToolUse / PostToolUse / PostToolUseFailure）+ 两种路径字段
+        // （Read / Write / Edit 走 `file_path`，Glob 走 `path`）
+        let project_memory_dir = home.join(".qoder-cn").join("projects").join("p").join("memory");
+        for (event, tool, path) in [
+            ("PreToolUse", "Read", global.to_string_lossy().into_owned()),
+            ("PreToolUse", "Glob", project_memory_dir.to_string_lossy().into_owned()),
+            ("PostToolUse", "Write", global.to_string_lossy().into_owned()),
+            ("PostToolUse", "Edit", project.to_string_lossy().into_owned()),
+            ("PostToolUseFailure", "Read", project.to_string_lossy().into_owned()),
+        ] {
+            let raw = json!({
+                "session_id": "s1",
+                "cwd": "D:/work/demo",
+                "tool_name": tool,
+                // Read/Write/Edit 用 file_path，Glob 用 path——两种都得被覆盖
+                "tool_input": if tool == "Glob" {
+                    json!({ "path": path, "pattern": "*.md" })
+                } else {
+                    json!({ "file_path": path })
+                },
+            });
+            assert!(
+                adapter.normalize(event, &raw).is_none(),
+                "{event}/{tool} 指向 Qoder 自己的记忆库时不得进管道（否则建出收不掉的思考中行）"
+            );
+        }
+        // 国际版家目录同样成立（一条 adapter 覆盖两个版本）
+        let intl = home.join(".qoder").join("memory").join("MEMORY.md");
+        let raw = json!({
+            "session_id": "s1",
+            "tool_name": "Write",
+            "tool_input": { "file_path": intl.to_string_lossy() },
+        });
+        assert!(adapter.normalize("PreToolUse", &raw).is_none());
+    }
+
+    #[test]
+    fn qoder_user_files_and_other_agents_are_unaffected() {
+        let home = InstallEnv::detect().home;
+        // 用户工程里恰好也有 memory 目录：名字一样、但不在 agent 家目录下 → 照常进管道
+        let raw = json!({
+            "session_id": "s1",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "D:/work/demo/memory/MEMORY.md" },
+        });
+        let ev = qoder().normalize("PreToolUse", &raw).expect("用户工程的文件不能被过滤");
+        assert_eq!(ev.kind, EventKind::Activity);
+        assert_eq!(ev.tool_name.as_deref(), Some("Write"));
+
+        // 家目录下但不是 Qoder 的目录（如 ~/.codex）→ 同样放行
+        let raw = json!({
+            "session_id": "s1",
+            "tool_name": "Read",
+            "tool_input": { "file_path": home.join(".codex").join("config.toml").to_string_lossy() },
+        });
+        assert!(qoder().normalize("PreToolUse", &raw).is_some());
+
+        // 这条判据是 Qoder 专属：别的 agent 读写自己的目录不能被顺手过滤掉
+        let raw = json!({
+            "session_id": "s1",
+            "tool_name": "Read",
+            "tool_input": { "file_path": home.join(".qoder-cn").join("memory").join("MEMORY.md").to_string_lossy() },
+        });
+        assert!(claude_code().normalize("PreToolUse", &raw).is_some());
+    }
+
+    #[test]
+    fn qoder_home_match_handles_both_separators_and_case() {
+        // 载荷里的路径形态不可控（`C:\…` 与 `C:/…` 混用、盘符大小写不一），
+        // 判据必须折叠分隔符与大小写，同时不能把同前缀目录 / 别的盘符算进去。
+        let home = std::path::Path::new("C:/Users/Tester");
+        let raw = |p: &str| json!({ "tool_name": "Read", "tool_input": { "file_path": p } });
+        assert!(touches_qoder_home(&raw(r"C:\Users\Tester\.qoder-cn\memory\MEMORY.md"), home));
+        assert!(touches_qoder_home(&raw("c:/users/tester/.qoder/memory/x.md"), home));
+        assert!(!touches_qoder_home(&raw(r"D:\Users\Tester\.qoder-cn\memory\MEMORY.md"), home), "别的盘符");
+        assert!(!touches_qoder_home(&raw(r"C:\Users\Tester2\.qoder-cn\memory\MEMORY.md"), home), "同前缀用户目录");
+        assert!(!touches_qoder_home(&raw(r"C:\Users\Tester\project\memory\MEMORY.md"), home), "用户工程里的 memory");
+        assert!(!touches_qoder_home(&json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }), home), "没有路径字段");
+    }
+
+    #[test]
+    fn tool_event_match_covers_tool_name_suffix() {
+        // Qoder 日志里 hook_name 记成 `PreToolUse:Read` 这种带工具名后缀的形态。
+        // event_map 是精确匹配，normalize 层分不清「被过滤丢弃」和「未知事件」，
+        // 前缀判定只能在 is_tool_event 这一层锁定。
+        for name in [
+            "PreToolUse", "PostToolUse", "PostToolUseFailure",
+            "PreToolUse:Read", "PostToolUse:Write", "PostToolUseFailure:Edit",
+        ] {
+            assert!(is_tool_event(name), "{name} 应被认成工具事件");
+        }
+        // 非工具事件不得被认成工具事件，否则路径判据会误丢生命周期事件
+        for name in ["UserPromptSubmit", "Notification", "Stop", "SessionEnd", "SessionStart"] {
+            assert!(!is_tool_event(name), "{name} 不是工具事件");
+        }
     }
 
     #[test]
@@ -2379,7 +2632,7 @@ mod tests {
             create_parent_dir: false,
         });
         adapter.register(&ctx()).unwrap();
-        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into() };
+        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into(), lang: bark_core::Lang::Zh };
         assert!(matches!(adapter.verify(&moved), VerifyReport::StalePath { .. }));
         adapter.register(&moved).unwrap();
         assert!(matches!(adapter.verify(&moved), VerifyReport::Ok));

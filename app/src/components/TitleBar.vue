@@ -3,16 +3,24 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { useI18n } from "vue-i18n";
 import { onThemeChange, resolvedTheme, themePref, toggleTheme, type Theme, type ThemePref } from "../theme";
 import logo from "../assets/logo.png";
 
-// 自绘标题栏：主窗口在 tauri.conf.json 里关掉了原生装饰（decorations:false），
+// 自绘标题栏：Windows 主窗口在 tauri.conf.json 里关掉了原生装饰（decorations:false），
 // 拖动 / 双击最大化靠根元素上的 data-tauri-drag-region="deep"（Tauri 注入的 drag.js），
 // 三个按钮则走 @tauri-apps/api 的窗口命令，权限见 capabilities/default.json。
+// macOS 例外：tauri.macos.conf.json 用原生 Overlay 标题栏（左侧红绿灯 + 原生圆角/描边），
+// 这里只隐藏品牌与三个窗口按钮、给红绿灯让位，保留右侧主题切换；拖拽区照旧。
 // isTauri() 兜底：直接用浏览器打开 vite dev 页面看样式时按钮退化为无操作，而不是整页白屏。
 // 按钮一律 @mousedown.prevent：Chromium 点击会把焦点留在按钮上，窗口隐藏再 show 时
 // 焦点被原样还原，面板一打开就「选中」上次的关闭/最小化按钮（回车还会再触发一次）。
 const appWindow = isTauri() ? getCurrentWindow() : null;
+
+// 平台判定与 widget-edge.ts 同口径（userAgent）；不 import 它，避免把悬浮窗模块拉进主面板
+const isMac = typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+
+const { t } = useI18n();
 
 // 第三个按钮的图标要在「最大化 / 向下还原」之间切：双击标题栏、Win+↑、拖到屏幕顶部贴靠
 // 都会改窗口状态，统一在 resize 事件里回读，不自己猜状态。
@@ -47,9 +55,10 @@ function close() {
 const theme = ref<{ theme: Theme; pref: ThemePref }>({ theme: resolvedTheme(), pref: themePref() });
 
 const themeTip = computed(() => {
-  const cur = theme.value.theme === "dark" ? "深色" : "浅色";
-  const following = theme.value.pref === "system" ? "（跟随系统）" : "";
-  return `当前${cur}${following} · 点击切换到${theme.value.theme === "dark" ? "浅色" : "深色"}`;
+  const current = t(theme.value.theme === "dark" ? "titlebar.themeDark" : "titlebar.themeLight");
+  const following = theme.value.pref === "system" ? t("titlebar.themeFollowing") : "";
+  const target = t(theme.value.theme === "dark" ? "titlebar.themeLight" : "titlebar.themeDark");
+  return t("titlebar.themeTip", { current, following, target });
 });
 
 function onToggleTheme() {
@@ -74,8 +83,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <header class="titlebar" data-tauri-drag-region="deep">
-    <div class="titlebar-brand">
+  <header class="titlebar" :class="{ 'titlebar--mac': isMac }" data-tauri-drag-region="deep">
+    <div v-if="!isMac" class="titlebar-brand">
       <img class="titlebar-logo" :src="logo" alt="" />
       <span class="titlebar-name">Agent Bark</span>
     </div>
@@ -90,7 +99,8 @@ onUnmounted(() => {
         </svg>
       </button>
 
-      <button type="button" class="titlebar-btn" v-tooltip="'最小化'" aria-label="最小化" @mousedown.prevent @click="minimize">
+      <template v-if="!isMac">
+      <button type="button" class="titlebar-btn" v-tooltip="$t('titlebar.minimize')" :aria-label="$t('titlebar.minimize')" @mousedown.prevent @click="minimize">
         <svg class="titlebar-icon" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M3 8.5h10" />
         </svg>
@@ -99,8 +109,8 @@ onUnmounted(() => {
       <button
         type="button"
         class="titlebar-btn"
-        v-tooltip="maximized ? '向下还原' : '最大化'"
-        :aria-label="maximized ? '向下还原' : '最大化'"
+        v-tooltip="maximized ? $t('titlebar.restore') : $t('titlebar.maximize')"
+        :aria-label="maximized ? $t('titlebar.restore') : $t('titlebar.maximize')"
         @mousedown.prevent
         @click="toggleMaximize"
       >
@@ -113,11 +123,12 @@ onUnmounted(() => {
         </svg>
       </button>
 
-      <button type="button" class="titlebar-btn close" v-tooltip="'关闭'" aria-label="关闭" @mousedown.prevent @click="close">
+      <button type="button" class="titlebar-btn close" v-tooltip="$t('titlebar.close')" :aria-label="$t('titlebar.close')" @mousedown.prevent @click="close">
         <svg class="titlebar-icon" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" />
         </svg>
       </button>
+      </template>
     </div>
   </header>
 </template>

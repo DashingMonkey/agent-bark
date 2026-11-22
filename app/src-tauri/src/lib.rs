@@ -1,18 +1,25 @@
 mod abort_watch;
+mod codebuddy_watch;
 mod codex_watch;
+mod evidence;
+mod qoder_watch;
 mod trae_abort_watch;
 mod commands;
 mod glow;
+mod sound_policy;
 mod state;
 mod task_lifecycle;
 mod tray_menu;
 mod update;
+mod usage_collect;
+mod usage_sources;
+mod usage_store;
 mod widget;
 
 use bark_core::NormalizedEvent;
 use state::AppState;
 use tauri::tray::TrayIconBuilder;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,12 +41,18 @@ pub fn run() {
             commands::set_agent_enabled,
             commands::get_config,
             commands::save_config,
+            commands::get_locale,
             commands::list_events,
             commands::clear_events,
             commands::list_active_sessions,
+            commands::usage_daily,
+            commands::usage_by_agent,
+            commands::usage_hourly,
+            commands::usage_coverage,
             commands::dismiss_session,
             commands::test_channel,
             commands::test_sound,
+            commands::pick_sound_file,
             commands::diagnostics,
             commands::glow_preview,
             commands::glow_preview_burst,
@@ -48,9 +61,11 @@ pub fn run() {
             commands::save_widget_position,
             commands::start_widget_drag,
             commands::set_widget_pinned,
+            commands::set_widget_detail_tip,
             commands::take_widget_reveal,
             commands::close_widget,
             commands::show_main_panel,
+            commands::set_window_border_color,
             commands::recheck_sessions,
             commands::toggle_mute,
             commands::quit_app,
@@ -79,6 +94,22 @@ pub fn run() {
             _ => {}
         })
         .setup(|app| {
+            // macOS：悬浮窗/流光转 NSPanel 的插件（Sonoma+ 的「点壁纸显示桌面」和
+            // 调度中心「显示桌面」只推走普通应用窗口，utility/auxiliary 面板存活）。
+            // 必须在建窗（widget sync / glow create）之前注册。
+            #[cfg(target_os = "macos")]
+            app.handle().plugin(tauri_nspanel::init())?;
+            // macOS：无感悬浮窗的关键——accessory 政策让应用不出现在 Dock、
+            // 点击悬浮窗不会激活应用（菜单栏保持用户当前的应用）；托盘
+            // NSStatusItem 不受影响，主面板仍可正常打开使用。Raycast 等悬浮
+            // 工具条类应用的标准做法。
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+                let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
+                NSApplication::sharedApplication(mtm)
+                    .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            }
             // 配置：损坏时**不再 panic**，用默认值把界面拉起来并把错误展示给用户，
             // 让用户有机会去修文件（而不是应用直接起不来）。
             let (config, config_path, config_error) = match bark_core::BarkConfig::load_or_init() {
@@ -107,6 +138,7 @@ pub fn run() {
 
             let state = AppState::new(config, config_path);
             state.set_config_error(config_error);
+            state::spawn_keepalive_watch(state.clone());
 
             // 事件管道（server 需在 Tauri 的 async runtime 中启动）
             // B4：serve 返回 Result，bind 失败记入 AppState，diagnostics 命令暴露给 UI
@@ -116,8 +148,12 @@ pub fn run() {
                 let server_tx = tx.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = bark_server::serve(port, token, server_tx).await {
-                        let msg = format!("事件服务器启动失败（127.0.0.1:{port}）: {e}");
-                        tracing::error!("{msg}");
+                        // 日志保持中文（非 UI）；UI 消息经 diagnostics 展示，按界面语言取词
+                        tracing::error!("事件服务器启动失败（127.0.0.1:{port}）: {e}");
+                        let msg = match server_state.lang() {
+                            bark_core::Lang::Zh => format!("事件服务器启动失败（127.0.0.1:{port}）: {e}"),
+                            bark_core::Lang::En => format!("Failed to start the event server (127.0.0.1:{port}): {e}"),
+                        };
                         server_state.set_server_error(Some(msg));
                     }
                 });
@@ -174,15 +210,21 @@ pub fn run() {
             }
             state.set_startup_warnings(warnings);
 
-            // ZCode 回合终态看门狗（非官方）：中断与致命失败都不发 hook，只能读它
-            // 自己的日志拿秒级信号（中断合成 run_aborted、回合失败合成 run_failed）。
-            // 必须在 sync_watchers 之前——那一步会拿走 tx 的所有权。
+            // 回合终态看门狗（非官方）：这些来源的明确终态不一定走 hook——ZCode 的
+            // 中断/致命失败、Codex/Qoder 的额度类失败、CodeBuddy 漏收的 Stop，都只能
+            // 从本地日志/transcript 补。必须在 sync_watchers 之前：那一步会拿走 tx 的
+            // 所有权。
             abort_watch::spawn(state.clone(), tx.clone());
+            codebuddy_watch::spawn(state.clone(), tx.clone());
             codex_watch::spawn(state.clone(), tx.clone());
+            qoder_watch::spawn(state.clone(), tx.clone());
             trae_abort_watch::spawn(state.clone(), tx.clone());
 
             // 监控型 adapter
             state::sync_watchers(tx, &state);
+
+            // Token 用量采集（独立通道；开关关闭时 sync 内部不起线程）
+            usage_collect::sync(&state);
 
             // 悬浮窗：开关开着就按记住的位置建窗（sync 内部会派发到主线程）
             widget::sync(&app.handle(), &state);
@@ -282,5 +324,40 @@ pub(crate) fn show_main(app: &tauri::AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        // 托盘 / 悬浮窗双击 / 二次启动唤出：前端监听后落到第一个可见菜单
+        let _ = app.emit("bark://panel-shown", ());
+    }
+}
+
+// Windows 11 给无边框窗口画的 DWM 默认描边是一条黑线（DWMWA_BORDER_COLOR 的默认值）。
+// 手写 extern 同 glow.rs 的 DWM 圆角声明：只用一个函数，不引整套 windows crate。
+// 仅 Win11（22000+）起效，更早系统调用失败——预期内，忽略。
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut core::ffi::c_void,
+        attribute: u32,
+        value: *const core::ffi::c_void,
+        size: u32,
+    ) -> i32;
+}
+
+/// 主窗口边缘描边色跟随主题（COLORREF = 0x00BBGGRR）：浅色深一档 / 深色浅一档，
+/// 对齐系统原生窗口的 1px 边缘观感。macOS 原生标题栏自带系统描边，不走这里。
+#[cfg(windows)]
+pub(crate) fn set_main_border_color(win: &tauri::WebviewWindow, dark: bool) {
+    // DWMWINDOWATTRIBUTE::DWMWA_BORDER_COLOR
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    // 深色 #46464e / 浅色 #c6c6ce（与 style.css 的 --bg 配套）
+    let color: u32 = if dark { 0x004e4646 } else { 0x00cec6c6 };
+    let Ok(hwnd) = win.hwnd() else { return };
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0,
+            DWMWA_BORDER_COLOR,
+            std::ptr::addr_of!(color).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
     }
 }

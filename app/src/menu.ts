@@ -15,9 +15,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { initI18n, onLocaleChanged, t } from "./i18n";
 import { initTheme } from "./theme";
 import { guardStaleHover } from "./hover";
 
+// 界面语言立即开始初始化（Rust 是唯一解析点），首帧文案在它就位后再填；
+// 托盘菜单先加载后显示，这一趟 IPC 用户看不见（见 i18n.ts 的说明）。
+// 不用顶层 await：构建目标不含 es2022，顶层 await 会吃 TOLERATED_TRANSFORM
+// 警告（widget.ts / main.ts 同款理由）。
+void initI18n();
 const win = getCurrentWindow();
 
 // 首帧已由 menu.html 的内联脚本定色；这里补上跨窗口同步（主面板里切主题时，
@@ -34,7 +40,7 @@ const init =
 let muted = init.muted;
 
 function renderMute() {
-  document.getElementById("menu-mute")!.textContent = muted ? "取消静音（恢复通知）" : "静音（暂停通知）";
+  document.getElementById("menu-mute")!.textContent = muted ? t("tray.unmute") : t("tray.mute");
 }
 
 async function hideSelf() {
@@ -110,4 +116,23 @@ void listen<boolean>("tray-menu://state", (e) => {
   renderMute();
 }).catch((e) => console.warn("托盘菜单状态订阅失败：", e));
 
-renderMute();
+/**
+ * 静态文案填充（首次启动 + 语言切换时重跑）：窗口标题与四个菜单项的标签
+ * 就地重写，不重建任何结构；静音项按当前态取词（切换静音后也走 renderMute）。
+ */
+function applyStaticTexts() {
+  document.title = t("tray.windowTitle");
+  document.getElementById("menu-show")!.textContent = t("tray.showMainWindow");
+  document.getElementById("menu-recheck")!.textContent = t("tray.recheck");
+  document.getElementById("menu-quit")!.textContent = t("tray.quit");
+  renderMute();
+}
+
+// 语言切换（设置页切换后 Rust 对全部窗口广播）：菜单项就地换词
+onLocaleChanged(applyStaticTexts);
+
+// 首帧文案等语言就位再填；语言切换期间（极短）菜单尚未显示，无闪烁
+void (async () => {
+  await initI18n();
+  applyStaticTexts();
+})();

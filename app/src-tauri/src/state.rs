@@ -14,8 +14,23 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
 use crate::glow::GlowState;
+use crate::sound_policy;
 
 pub const HISTORY_CAP: usize = 500;
+
+/// 最近一次「该有声音却没响」的记录（诊断页直接展示）。
+///
+/// 用户排障时问的就是「刚才那一声为什么没响」，这里直接给原因，不用再去翻
+/// 事件管道 / 判定层 / 播放层三处代码。
+#[derive(Debug, Clone, Serialize)]
+pub struct SoundSkipNote {
+    /// [`crate::sound_policy::SkipReason`] 的稳定标识，如 `no_effect` / `quiet_hours`
+    pub reason: String,
+    /// 触发事件类型（如 `run_completed`）
+    pub kind: String,
+    /// unix 毫秒
+    pub at: i64,
+}
 
 /// 会话实时状态（由 Activity 心跳与打断/终态事件推导，前端经 bark://sessions 订阅）
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -46,6 +61,13 @@ pub struct SessionStatus {
     pub session_id: String,
     pub project: Option<String>,
     pub cwd: String,
+    /// agent 声明的本地会话日志路径（hook 的 `transcript_path`）。
+    /// 不出快照：前端不需要，且它不是会话状态的一部分。带本地证据 watcher 的 agent
+    /// （Qoder 的额度/鉴权失败核验、CodeBuddy 漏收 Stop 时的回合完成核验）用它精确
+    /// 尾读当前回合的日志：缺失时 Qoder 按精确 session id 自己找，CodeBuddy 不做
+    /// 查找、只保留最后已知状态。
+    #[serde(skip)]
+    pub transcript_path: Option<String>,
     pub phase: SessionPhase,
     /// 当前/最近回合的 prompt（截断展示用）
     pub prompt: Option<String>,
@@ -92,6 +114,15 @@ pub type WatcherHandle = (Arc<std::sync::atomic::AtomicBool>, std::thread::JoinH
 pub struct AppState {
     pub config: RwLock<BarkConfig>,
     pub config_path: std::path::PathBuf,
+    /// Token 用量本地库（独立于事件管道，见 usage_store.rs）；
+    /// 开关关闭时为关连接态，采集器每轮看 is_enabled() 停摆
+    pub usage: crate::usage_store::UsageStore,
+    /// 用量采集线程（usage_collect.rs）；开关同步时停旧起新
+    pub usage_thread: Mutex<Option<WatcherHandle>>,
+    /// 解析后的界面语言（见 bark-core::i18n）。缓存而非每次现解析：
+    /// 推送标题等调用点在事件管道热路径上，且「语言只在启动 / 保存配置时变化」
+    /// 的语义要钉死——save_config 检测到 language 变化时在这里同步刷新并广播。
+    pub lang: RwLock<bark_core::Lang>,
     /// 配置写入的**单写者**语义（§2.1）：所有「读-改-写盘-换内存」的配置保存路径
     /// （save_config 的分区合并、save_widget_position / set_widget_pinned /
     /// close_widget 的单字段写）全程持它，保证两个并发保存不会交错成
@@ -125,6 +156,22 @@ pub struct AppState {
     pub watchers: Mutex<HashMap<String, WatcherHandle>>,
     /// 全局静音（托盘开关，仅暂停推送，事件仍入历史；重启后恢复）
     pub muted: std::sync::atomic::AtomicBool,
+    /// 音频保持窗的截止时刻：这段时间内即使没有活跃会话也让设备醒着
+    /// （见 [`AppState::hold_audio`]）。
+    ///
+    /// 两个来源共用一个字段，取较晚的那个：
+    /// - 真实事件要响（[`SOUND_PLAY_WINDOW`]）：先把设备叫醒，播完到点再放睡；
+    /// - 「声音」页点测试（[`SOUND_PREVIEW_WINDOW`]）：测试不建立会话，按正常门控
+    ///   永远是冷的，得开个长一点的窗让连续试听走热路径。
+    ///
+    /// 用单调钟：墙钟跳变不会把窗口变成「永久保活」或「立刻失效」。
+    audio_hold_until: Mutex<Option<Instant>>,
+    /// 各状态上一次真正响的时刻，节流窗口（`notify.throttle_ms`）据此判定。
+    /// 只有四个 key，天然有界，不需要清理。
+    sound_last_played: Mutex<HashMap<sound_policy::SoundKey, Instant>>,
+    /// 最近一次「该有声音却没响」的原因，诊断页直接展示。
+    /// 只存一条：用户排障时看的就是「刚才那一声为什么没响」。
+    last_sound_skip: Mutex<Option<SoundSkipNote>>,
     /// 托盘单击的展开请求：前端订阅完成后领取，避免建窗期间丢事件。
     pub widget_reveal_pending: std::sync::atomic::AtomicBool,
     /// 屏幕边缘流光的当前状态（glow 模块读写，UI 只经 command 改它做预览）
@@ -287,14 +334,23 @@ impl AppState {
     pub fn new(config: BarkConfig, config_path: std::path::PathBuf) -> Arc<Self> {
         let server_port = config.server.port;
         let server_token = config.server.token.clone();
+        let lang = config.language.resolve();
         // id 去重窗口从 seen-ids.jsonl 恢复（§2.10）：跨 daemon 重启的重复通知靠它拦。
         // 加载失败/目录不可用只降级为纯内存窗口，不挡启动。
         let recent_ids = bark_core::BarkConfig::dir()
             .map(|d| RecentIds::load(d.join("seen-ids.jsonl")))
             .unwrap_or_default();
+        let usage_path = bark_core::BarkConfig::dir()
+            .map(|d| d.join("usage.sqlite3"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("agent-bark-usage.sqlite3"));
+        let usage = crate::usage_store::UsageStore::new(usage_path);
+        usage.set_enabled(config.token_monitor.enabled);
         Arc::new(Self {
             config: RwLock::new(config),
             config_path,
+            usage,
+            usage_thread: Mutex::new(None),
+            lang: RwLock::new(lang),
             config_write: Mutex::new(()),
             config_error: Mutex::new(None),
             startup_warnings: Mutex::new(Vec::new()),
@@ -308,6 +364,9 @@ impl AppState {
             codex_turns: Mutex::new(crate::codex_watch::Turns::default()),
             watchers: Mutex::new(HashMap::new()),
             muted: std::sync::atomic::AtomicBool::new(false),
+            audio_hold_until: Mutex::new(None),
+            sound_last_played: Mutex::new(HashMap::new()),
+            last_sound_skip: Mutex::new(None),
             widget_reveal_pending: std::sync::atomic::AtomicBool::new(false),
             glow: Mutex::new(GlowState::Idle),
             glow_preview: Mutex::new(None),
@@ -336,6 +395,11 @@ impl AppState {
         cfg.server.port != self.server_port || cfg.server.token != self.server_token
     }
 
+    /// 当前界面语言（推送标题、错误提示等 Rust 侧文案的取词依据）
+    pub fn lang(&self) -> bark_core::Lang {
+        *read(&self.lang)
+    }
+
     /// 切换静音，返回切换后的状态
     pub fn toggle_mute(&self) -> bool {
         use std::sync::atomic::Ordering;
@@ -347,6 +411,47 @@ impl AppState {
 
     pub fn is_muted(&self) -> bool {
         self.muted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 当前提示音音量（0.0~1.0）。测试按钮与判定层共用，避免两处各算一遍百分比。
+    pub fn sound_volume(&self) -> f32 {
+        f32::from(read(&self.config).notify.volume.min(100)) / 100.0
+    }
+
+    /// 「声音」页点测试：开一个 [`SOUND_PREVIEW_WINDOW`] 的保活窗口。
+    ///
+    /// 测试不建立会话，按正常门控保活永远是冷的——每点一次都要重开流、重新垫预缓冲。
+    /// 开窗后第一次仍按冷路径（设备要醒），之后几次直接插队，听到的就和真实会话中一样。
+    /// 反复点会顺延；过期后由编排循环在下一轮（≤5s）把设备放睡。
+    pub fn hold_sound_preview(&self) {
+        self.hold_audio(SOUND_PREVIEW_WINDOW);
+    }
+
+    /// 把「设备保持醒着」的截止时刻推到 `now + window`（只延后，不提前）。
+    ///
+    /// 两个调用点：真实事件要响之前先叫醒设备（[`SOUND_PLAY_WINDOW`]），
+    /// 以及设置页点测试（[`SOUND_PREVIEW_WINDOW`]）。合用一个字段取较晚者，
+    /// 避免「事件把窗推短、测试把窗推长」互相覆盖。
+    ///
+    /// 为什么需要这个窗：事件里通常紧跟着发 `keepalive_set(true)`，而编排循环
+    /// 每 5s 会按「有没有会话」重算一次——冷启动收到终态事件时可能算出 false，
+    /// 把刚开的流 drop 掉，正在播的预缓冲+音效就被切断了。
+    pub fn hold_audio(&self, window: std::time::Duration) {
+        let until = Instant::now() + window;
+        let mut cur = lock(&self.audio_hold_until);
+        if cur.map_or(true, |t| t < until) {
+            *cur = Some(until);
+        }
+    }
+
+    /// 音频保持窗是否仍然有效
+    pub fn audio_hold_active(&self) -> bool {
+        preview_active(*lock(&self.audio_hold_until), Instant::now())
+    }
+
+    /// 最近一次「该响却没响」的原因（诊断页展示）
+    pub fn last_sound_skip(&self) -> Option<SoundSkipNote> {
+        lock(&self.last_sound_skip).clone()
     }
 
     pub fn set_config_error(&self, err: Option<String>) {
@@ -477,20 +582,16 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
             continue;
         }
 
-        // Codex 内部建议请求与已结束回合的迟到 hook 不得建档或触发通知。
-        // 必须在整个事件管道前过滤，而不只是抑制状态跃迁。
-        if event.agent == "codex" && !lock(&state.codex_turns).accept(&event) {
-            continue;
-        }
-        if event.agent == "codex" && event.id.starts_with(crate::codex_watch::EVENT_PREFIX)
-            && !lock(&state.active_sessions).contains_key(&session_key("codex", &event.session_id)) {
-            // 已被清理的会话不补发来源核验事件；回合封口仍保留。
+        // 本地证据源（Codex rollout / Qoder transcript 补出来的终态）的入口门：
+        // 回合身份与「是否仍属于当前会话」由 evidence 注册表里各 watcher 自己声明的
+        // 判据决定。状态机不认识具体 agent；普通 hook / 监控型事件直接放行。
+        if !crate::evidence::admit(&state, &event) {
             continue;
         }
 
         // 0.5 会话实时状态：所有事件（含心跳）都参与推导，变化即推送前端快照。
         //     陈旧补投（时间戳老过补投有效期）不进状态表——它声称的任何状态都已过时。
-        let preserve_wait = event.agent == "codex" && lock(&state.codex_turns).preserve_wait(&event);
+        let preserve_wait = crate::evidence::preserve_wait(&state, &event);
         let stale = is_stale_replay(&event);
         let (suppressed_echo, phase_changed, deferred) = {
             let mut sessions = lock(&state.active_sessions);
@@ -555,16 +656,9 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
         //     照常驱动会「开局红光 + 失败音」；历史与通知保留（离线兜底的本意）。
         if !deferred && should_drive_glow(stale, suppressed_echo) {
             crate::glow::update_from_event(&app, &state, &event);
-            // 状态音效与流光同一套四状态语义（思考/等待/完成/失败），默认全部未选
-            // = 静音。子代理事件不响（与通知的子代理过滤同口径，否则一个任务拆出
-            // 十几个子代理会连响十几声）。
-            if !event.is_subagent {
-                if let Some(key) = sound_key_for(&event) {
-                    if should_play_state_sound(key, phase_changed) {
-                        play_state_sound(&state, key);
-                    }
-                }
-            }
+            // 状态音效：判定全部交给 sound_policy::decide（子代理、相位、静音、
+            // 免打扰、未配置、节流都在那里），这里只取状态、落节流时刻、丢后台播放。
+            play_event_sound(&state, &event, phase_changed);
         }
 
         // 心跳与工具收尾不入历史不入事件流：一个回合可达多次，会把 500 条容量的
@@ -621,7 +715,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
             recent_notified(&mut recent, &key)
         };
         let notification = Notification {
-            title: event.notify_title(),
+            title: event.notify_title(state.lang()),
             body: event.notify_body(),
             event: event.kind,
             agent: event.agent.clone(),
@@ -668,7 +762,7 @@ pub async fn run_pipeline(mut rx: mpsc::Receiver<NormalizedEvent>, app: AppHandl
                     return; // 聚合窗口内恢复运行，旧完成不再可派发。
                 }
                 if p.merged > 0 {
-                    p.notification.body = append_merged_note(p.notification.body, p.merged);
+                    p.notification.body = append_merged_note(p.notification.body, p.merged, state2.lang());
                 }
                 dispatch(&state2, &p.notification).await;
             }
@@ -730,8 +824,8 @@ fn recent_notified(recent: &mut HashMap<String, Instant>, key: &str) -> bool {
 }
 
 /// 「合并了 N 条同类事件」的附注（纯函数，便于测试钉死文案）
-fn append_merged_note(body: String, merged: u32) -> String {
-    format!("{body}\n（合并了 {merged} 条同类事件）")
+fn append_merged_note(body: String, merged: u32, lang: bark_core::Lang) -> String {
+    format!("{body}{}", lang.merged_note(merged))
 }
 
 /// 认领聚合条目：**seq 对得上**（还是自己派发的那一代）才移除返回；否则把条目
@@ -792,28 +886,6 @@ fn dispatch_gate(muted: bool, quiet_now: bool) -> bool {
     !muted && !quiet_now
 }
 
-/// 事件 → 状态音效 key（与流光四色状态同语义）。`None` = 该事件不对应任何状态音。
-///
-/// - 用户主动中止不响；
-/// - 完成 / 失败 / 等待（确认与输入）直接按事件角色；
-/// - 思考音挂在「不带工具名的心跳」上——那是一次新回合的开始
-///   （UserPromptSubmit），同回合后续的工具心跳不重复响；监控型 adapter 的
-///   保活心跳是同一种事件载体，靠 [`should_play_state_sound`] 的跃迁门挡住重播；
-/// - 工具收尾（ToolFinished）不响：它每次工具结束都来一条，
-///   会把「新回合开始」的语义淹没（思考音只标回合起点）。
-fn sound_key_for(event: &NormalizedEvent) -> Option<&'static str> {
-    if event.kind == EventKind::RunAborted {
-        return None;
-    }
-    match event.kind {
-        EventKind::RunCompleted => Some("completed"),
-        EventKind::RunFailed => Some("failed"),
-        EventKind::PermissionRequired | EventKind::InputRequired => Some("waiting"),
-        EventKind::Activity if event.tool_name.is_none() => Some("thinking"),
-        _ => None,
-    }
-}
-
 /// 这条状态音此刻是否该响（纯函数，便于测试）。
 ///
 /// 只有思考音需要跃迁门：它与保活心跳共用同一种事件载体（无工具名的
@@ -823,34 +895,115 @@ fn sound_key_for(event: &NormalizedEvent) -> Option<&'static str> {
 /// 状态表「相位没变」识别。其余状态音的事件（终态 / 打断）天然一次性，
 /// 不该被这道门拦——终态会把条目摘掉，相位无从比对，门只会误杀
 /// 「daemon 晚启动、终态是唯一信号」的会话。
-fn should_play_state_sound(key: &str, phase_changed: bool) -> bool {
-    key != "thinking" || phase_changed
+/// 「声音」页测试按钮触发的保活窗口：30s 够连点几下把四个状态都试一遍，
+/// 又不至于用户离开设置页之后还长时间占着设备。
+const SOUND_PREVIEW_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 真实事件播放前的保活窗口：要盖住「冷启动预缓冲 + 音效本身」，否则编排循环
+/// 下一轮（≤5s）可能把刚开的流关掉、把正在播的声音切断。内置音效最长 1.9s，
+/// 加 1s 预缓冲，10s 富余；更长的自定义文件若恰在「无会话」时播放，仍可能被切。
+const SOUND_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 测试保活窗口判定。抽成纯函数便于单测（`Instant` 不能凭空构造，now 由调用方传入）。
+fn preview_active(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|t| t > now)
 }
 
-/// 播放某个状态配置的音效。总开关关闭、未配置（effect 为空）、全局静音、免打扰时段都静默。
+/// 判定并播放这一条事件的状态音。
 ///
-/// 真正的播放（Windows 上要起 PowerShell 进程）走 spawn_blocking，
-/// 不阻塞事件管道；播放失败只记日志。
-fn play_state_sound(state: &Arc<AppState>, key: &str) {
-    if state.is_muted() {
-        return;
+/// 判定全部交给 [`crate::sound_policy::decide`]（纯函数、可单测）：这里只做三件
+/// 有状态的事——取配置/静音/免打扰、记「上一次响的时刻」（节流）、把跳过的原因
+/// 留给诊断页——然后丢到后台线程播放，不阻塞事件管道。
+fn play_event_sound(state: &Arc<AppState>, event: &NormalizedEvent, phase_changed: bool) {
+    let (notify, quiet) = {
+        let cfg = read(&state.config);
+        (cfg.notify.clone(), in_quiet_hours(&cfg.rules.quiet_hours))
+    };
+    let now = Instant::now();
+    let last = crate::sound_policy::key_for(event)
+        .and_then(|k| lock(&state.sound_last_played).get(&k).copied());
+
+    match crate::sound_policy::decide(crate::sound_policy::SoundInput {
+        event,
+        phase_changed,
+        cfg: &notify,
+        muted: state.is_muted(),
+        quiet_now: quiet,
+        last_played: last,
+        now,
+    }) {
+        crate::sound_policy::Verdict::Skip(reason) => {
+            tracing::debug!("状态音效未播放（{}）", reason.as_str());
+            // 只留最近一条「用户真会问」的原因：子代理、相位未变这类设计内行为
+            // 记下来只会把诊断长期占住（见 SkipReason::is_notable）
+            if reason.is_notable() {
+                *lock(&state.last_sound_skip) = Some(SoundSkipNote {
+                    reason: reason.as_str().to_string(),
+                    kind: kind_name(&event.kind),
+                    at: chrono::Local::now().timestamp_millis(),
+                });
+            }
+        }
+        crate::sound_policy::Verdict::Play { key, source, volume } => {
+            // 事件驱动唤醒：要响就先把设备叫醒，不等编排循环那 5s 轮询
+            // （那段空窗里的声音只能走冷路径垫预缓冲）。「关」仍由编排循环负责
+            // ——没会话 / 静音 / 免打扰时把设备放睡；这个 10s 窗保证它不会
+            // 在播放途中就关。
+            // 顺序有讲究：先立「保持窗」再叫醒设备。反过来的话，编排循环可能
+            // 恰在这两行之间算出 wanted=false，把刚开的流关掉。
+            state.hold_audio(SOUND_PLAY_WINDOW);
+            bark_channels::keepalive_set(true);
+            lock(&state.sound_last_played).insert(key, now);
+            let (effect, custom) = match source {
+                crate::sound_policy::SoundSource::Builtin(id) => (id, None),
+                crate::sound_policy::SoundSource::Custom(p) => ("custom".to_string(), Some(p)),
+            };
+            // 只做一次 mpsc send（win/mac）或起一个进程（linux），不再是阻塞调用，
+            // 所以不需要 spawn_blocking——事件管道这条线程上只多几微秒
+            tracing::debug!("状态音效 {}（{}）", key.as_str(), effect);
+            if let Err(e) = bark_channels::play_sound(&effect, custom.as_deref(), volume) {
+                tracing::warn!("状态音效播放失败: {e:#}");
+            }
+        }
     }
-    let cfg = read(&state.config);
-    if !cfg.notify.enabled {
-        return;
-    }
-    if in_quiet_hours(&cfg.rules.quiet_hours) {
-        return;
-    }
-    let Some(s) = cfg.notify.sound(key) else { return };
-    if s.effect.trim().is_empty() {
-        return;
-    }
-    let (effect, plays) = (s.effect.clone(), s.plays);
-    drop(cfg);
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = bark_channels::play_sound(&effect, plays) {
-            tracing::warn!("状态音效播放失败: {e:#}");
+}
+
+/// 会话期保活编排：每 5s 把「该不该让设备醒着」重新算一遍发给音频层。
+///
+/// 判定本身在 [`sound_policy::wants_keepalive`]——与播放门共用同一份配置和同样的
+/// 三关（总开关 / 静音 / 免打扰）。这两组条件以前各写一份，结果漏成「静音了还在
+/// 占着设备」；现在只有一处。
+///
+/// 5s 轮询只负责「关」和「维持」：「要响」的那一刻播放路径会先发 `keepalive_set(true)`，
+/// 不等这一轮（否则会话刚开始那几声全走冷路径）。
+pub fn spawn_keepalive_watch(state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_seen: Option<std::time::Instant> = None;
+        loop {
+            // 一次读锁取两个字段，避免每 5s 重复加锁
+            let (notify, quiet) = {
+                let cfg = read(&state.config);
+                (cfg.notify.clone(), in_quiet_hours(&cfg.rules.quiet_hours))
+            };
+            let has = !lock(&state.active_sessions).is_empty();
+            if has {
+                last_seen = Some(std::time::Instant::now());
+            }
+            let in_grace = last_seen
+                .map(|t| t.elapsed() < std::time::Duration::from_secs(30))
+                .unwrap_or(false);
+            let wanted = crate::sound_policy::wants_keepalive(
+                crate::sound_policy::KeepAliveInput {
+                    cfg: &notify,
+                    muted: state.is_muted(),
+                    quiet_now: quiet,
+                    has_sessions: has,
+                    in_grace,
+                    hold: state.audio_hold_active(),
+                },
+            );
+            bark_channels::keepalive_set(wanted);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
 }
@@ -965,6 +1118,7 @@ fn publish_event(state: &AppState, app: &AppHandle, event: &NormalizedEvent) {
 /// 返回需要展示给用户的告警（空 = 一切正常）。每条都带 agent id，
 /// 用户处理后（重新开启/关闭该 agent）由 `clear_startup_warnings` 精确清掉。
 pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
+    let lang = state.lang();
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -972,7 +1126,7 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
         let cfg = read(&state.config);
         (cfg.server.port, cfg.server.token.clone())
     };
-    let register_ctx = RegisterCtx { exe_path: exe, port, token };
+    let register_ctx = RegisterCtx { exe_path: exe, port, token, lang };
     let mut warnings = Vec::new();
 
     for adapter in bark_adapters::registry::hook_adapters() {
@@ -992,12 +1146,20 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
                 warnings.push(StartupWarning {
                     agent: id.clone(),
                     informational: false,
-                    message: format!(
-                        "「{}」的配置无法解析（{}：{}），本次未对齐、接入开关保持原样；修好该文件后在 Agents 页点一下开关即可重写",
-                        adapter.display_name(),
-                        path.display(),
-                        reason
-                    ),
+                    message: match lang {
+                        bark_core::Lang::Zh => format!(
+                            "「{}」的配置无法解析（{}：{}），本次未对齐、接入开关保持原样；修好该文件后在 Agents 页点一下开关即可重写",
+                            adapter.kind().display_name_lang(lang),
+                            path.display(),
+                            reason
+                        ),
+                        bark_core::Lang::En => format!(
+                            "The config of \"{}\" could not be parsed ({}: {}); it was not re-aligned this run and the integration switch stays unchanged; after fixing the file, toggle the integration on the Agents page to rewrite it",
+                            adapter.kind().display_name_lang(lang),
+                            path.display(),
+                            reason
+                        ),
+                    },
                 });
             }
             report => match adapter.register_for_startup(&register_ctx) {
@@ -1018,10 +1180,16 @@ pub fn sync_hook_integrations(state: &Arc<AppState>) -> Vec<StartupWarning> {
                     warnings.push(StartupWarning {
                         agent: id.clone(),
                         informational: false,
-                        message: format!(
-                            "「{}」的接入已失效且自动重写失败：{e:#}；可在 Agents 页手动重新开启",
-                            adapter.display_name()
-                        ),
+                        message: match lang {
+                            bark_core::Lang::Zh => format!(
+                                "「{}」的接入已失效且自动重写失败：{e:#}；可在 Agents 页手动重新开启",
+                                adapter.kind().display_name_lang(lang)
+                            ),
+                            bark_core::Lang::En => format!(
+                                "The integration of \"{}\" is broken and the automatic rewrite failed: {e:#}; re-enable it manually on the Agents page",
+                                adapter.kind().display_name_lang(lang)
+                            ),
+                        },
                     });
                 }
             },
@@ -1152,7 +1320,7 @@ pub async fn dismiss_session(state: &Arc<AppState>, app: &AppHandle, agent: &str
         let mut sessions = lock(&state.active_sessions);
         let mut dismissed = lock(&state.dismissed_sessions);
         dismiss_session_at(&mut sessions, &mut dismissed, &session_key(agent, sid),
-            expected_started_at, expected_last_activity, bark_core::now_millis())?;
+            expected_started_at, expected_last_activity, bark_core::now_millis(), state.lang())?;
     }
     // 已在聚合窗口内的旧提醒也不能在移除后弹出。
     let mut pending = state.pending.lock().await;
@@ -1169,13 +1337,19 @@ pub async fn dismiss_session(state: &Arc<AppState>, app: &AppHandle, agent: &str
 }
 
 fn dismiss_session_at(sessions: &mut HashMap<String, SessionStatus>, dismissed: &mut HashMap<String, i64>,
-    key: &str, started_at: i64, last_activity: i64, now: i64) -> Result<(), String> {
+    key: &str, started_at: i64, last_activity: i64, now: i64, lang: bark_core::Lang) -> Result<(), String> {
     let Some(session) = sessions.get(key) else { return Ok(()); };
     if session.started_at != started_at || session.last_activity != last_activity {
-        return Err("会话状态已更新，请查看最新状态后重试".into());
+        return Err(match lang {
+            bark_core::Lang::Zh => "会话状态已更新，请查看最新状态后重试".into(),
+            bark_core::Lang::En => "Session state has changed; review the latest state and retry".into(),
+        });
     }
     if dismissed.len() >= 4096 && !dismissed.contains_key(key) {
-        return Err("本次运行的移除记录已满，请重启应用后重试".into());
+        return Err(match lang {
+            bark_core::Lang::Zh => "本次运行的移除记录已满，请重启应用后重试".into(),
+            bark_core::Lang::En => "The removal log for this run is full; restart the app and retry".into(),
+        });
     }
     sessions.remove(key);
     dismissed.insert(key.into(), now);
@@ -1187,8 +1361,9 @@ fn suppress_dismissed(dismissed: &mut HashMap<String, i64>, event: &NormalizedEv
     let key = session_key(&event.agent, &event.session_id);
     let Some(at) = dismissed.get(&key) else { return false; };
     // 仅真实新活动恢复显示；库里的重复 running 状态、核验重读、保活均不恢复。
+    // 「核验重读」按本地证据注册表判断，不绑定具体 agent。
     let live_activity = !event.keepalive && event.timestamp > *at
-        && !event.id.starts_with(crate::codex_watch::EVENT_PREFIX)
+        && !crate::evidence::is_local_evidence(event)
         && (event.run.as_ref().is_some_and(|r| r.boundary == bark_core::RunBoundary::Started)
             || event.codex.as_ref().is_some_and(|c| c.is_user_prompt)
             || event.kind == EventKind::Activity);
@@ -1394,6 +1569,11 @@ fn apply_session_event_inner(
                     s.cwd = ev.cwd.clone();
                     s.project = ev.project.clone();
                 }
+                // transcript 路径兜底回填：Qoder 首个钩子之后才能拿到日志位置，
+                // 而终态核验要看的是「当前回合」这份文件——缺了就一直只能按 id 查。
+                if s.transcript_path.is_none() && ev.transcript_path.is_some() {
+                    s.transcript_path = ev.transcript_path.clone();
+                }
                 // 血缘兜底回填（见 backfill_lineage）：补上就算结构变化，快照立即推
                 if backfill_lineage(s, ev) {
                     delta.changed = true;
@@ -1581,6 +1761,7 @@ fn new_session(ev: &NormalizedEvent, phase: SessionPhase) -> SessionStatus {
         session_id: ev.session_id.clone(),
         project: ev.project.clone(),
         cwd: ev.cwd.clone(),
+        transcript_path: ev.transcript_path.clone(),
         phase,
         prompt: if ev.message.is_empty() { None } else { Some(bark_core::truncate_chars(&ev.message, 120)) },
         last_tool: ev.tool_name.clone(),
@@ -1620,8 +1801,9 @@ fn backfill_lineage(s: &mut SessionStatus, ev: &NormalizedEvent) -> bool {
 /// 过期离线 hook 仅进入历史，不用旧活动创建幻影会话。
 /// 此有效期不清理活跃任务；精确匹配当前回合的本地核验不受此限制。
 fn is_stale_replay(ev: &NormalizedEvent) -> bool {
-    // 调用前 Turns::accept 已按精确回合验证；旧终态仍须闭环当前已建档回合。
-    if ev.agent == "codex" && ev.id.starts_with(crate::codex_watch::EVENT_PREFIX) {
+    // 调用前 evidence::admit 已按精确回合验证过本地证据源；它们的旧终态仍须闭环
+    // 当前已建档回合，不能因为时间久远就当陈年补投丢掉。
+    if crate::evidence::is_local_evidence(ev) {
         return false;
     }
     bark_core::now_millis().saturating_sub(ev.timestamp) > REPLAY_MAX_AGE_MS
@@ -1733,7 +1915,7 @@ pub fn sync_watchers(tx: mpsc::Sender<NormalizedEvent>, state: &Arc<AppState>) -
         let running = watchers.contains_key(&id);
 
         if !adapter.is_available() {
-            if let Some(reason) = adapter.unavailable_reason() {
+            if let Some(reason) = adapter.unavailable_reason(state.lang()) {
                 runtime.errors.insert(id.clone(), reason);
             }
         }
@@ -1779,7 +1961,7 @@ pub fn watch_runtime(state: &Arc<AppState>) -> bark_adapters::registry::WatchRun
     }
     for adapter in watch_adapters() {
         if !adapter.is_available() {
-            if let Some(reason) = adapter.unavailable_reason() {
+            if let Some(reason) = adapter.unavailable_reason(state.lang()) {
                 runtime.errors.insert(adapter.kind().id().to_string(), reason);
             }
         }
@@ -1799,6 +1981,7 @@ mod tests {
             agent: "trae-code".into(),
             kind,
             session_id: "s1".into(),
+            transcript_path: None,
             cwd: "C:/p".into(),
             project: Some("p".into()),
             message: msg.into(),
@@ -1838,7 +2021,10 @@ mod tests {
         assert!(!is_stale_replay(&failure), "主动核验的旧终态仍应生效");
         apply_session_event_inner(&mut sessions, &mut finished, &failure, is_stale_replay(&failure));
         assert!(sessions.is_empty());
-        assert_eq!(sound_key_for(&failure), Some("failed"));
+        assert_eq!(
+            crate::sound_policy::key_for(&failure).map(|k| k.as_str()),
+            Some("failed")
+        );
         let mut late = adapter.normalize("PostToolUse", &serde_json::json!({
             "session_id":"s1", "turn_id":"t1"
         })).unwrap();
@@ -1852,6 +2038,56 @@ mod tests {
         assert_eq!(sessions["codex|s1"].phase, SessionPhase::Thinking);
         assert!(!turns.accept(&failure));
         assert_eq!(sessions["codex|s1"].started_at, 30000);
+    }
+
+    #[test]
+    fn qoder_transcript_failure_closes_only_the_turn_it_belongs_to() {
+        use bark_adapters::HookAdapter;
+        let adapter = bark_adapters::claude_style::qoder();
+        let (mut sessions, mut finished) = table();
+        let turn = |at: i64, prompt: &str| {
+            let mut event = adapter.normalize("UserPromptSubmit", &serde_json::json!({
+                "session_id": "s1",
+                "cwd": "D:/work/demo",
+                "prompt": prompt,
+                "transcript_path": "C:/qoder/projects/D--work-demo/s1.jsonl",
+            })).unwrap();
+            event.timestamp = at;
+            event
+        };
+        let first = turn(1000, "work");
+        apply_session_event(&mut sessions, &mut finished, &first);
+        assert_eq!(
+            sessions["qoder|s1"].transcript_path.as_deref(),
+            Some("C:/qoder/projects/D--work-demo/s1.jsonl"),
+            "hook 声明的 transcript 路径要留在会话上，供终态核验精确定位"
+        );
+        let mut failure = first.clone();
+        failure.kind = EventKind::RunFailed;
+        failure.id = format!("{}s1:2000", crate::qoder_watch::EVENT_PREFIX);
+        failure.timestamp = 2000;
+        failure.message = "Qoder 账户额度或套餐不足（HTTP 403）".into();
+        assert!(
+            !is_stale_replay(&failure),
+            "当前回合的 transcript 失败不受补投有效期限制"
+        );
+        assert!(crate::qoder_watch::still_current(sessions.get("qoder|s1"), &failure));
+        assert_eq!(
+            crate::sound_policy::key_for(&failure).map(|k| k.as_str()),
+            Some("failed")
+        );
+        let delta = apply_session_event_inner(&mut sessions, &mut finished, &failure, false);
+        assert!(delta.changed);
+        assert!(!sessions.contains_key("qoder|s1"), "失败终态必须把会话收出运行中列表");
+        // 下一回合开始后，上一回合的 transcript 失败不能再收掉它。
+        let second = turn(5000, "next");
+        apply_session_event(&mut sessions, &mut finished, &second);
+        assert!(
+            !crate::qoder_watch::still_current(sessions.get("qoder|s1"), &failure),
+            "错误早于新回合起点时，管道前必须把它丢掉"
+        );
+        assert_eq!(sessions["qoder|s1"].started_at, 5000);
+        assert_eq!(sessions["qoder|s1"].phase, SessionPhase::Thinking);
     }
 
     #[test]
@@ -1881,23 +2117,57 @@ mod tests {
 
     #[test]
     fn sound_key_follows_event_roles() {
+        // 映射本身在 sound_policy 里（那里有全量单测）；这里保留一层「事件角色
+        // 落到哪个状态」的回归，防止有人改 key_for 时把 ToolFinished 也算进去
+        let key = |kind, tool: Option<&str>| {
+            crate::sound_policy::key_for(&ev(kind, 1000, tool, "")).map(|k| k.as_str())
+        };
         for (kind, expected) in [
             (EventKind::RunCompleted, Some("completed")), (EventKind::RunFailed, Some("failed")),
             (EventKind::RunAborted, None), (EventKind::PermissionRequired, Some("waiting")),
             (EventKind::InputRequired, Some("waiting")), (EventKind::ToolFinished, None),
             (EventKind::ToolFailed, None), (EventKind::Activity, Some("thinking")),
-        ] { assert_eq!(sound_key_for(&ev(kind, 1000, None, "")), expected); }
-        assert_eq!(sound_key_for(&ev(EventKind::Activity, 1000, Some("Read"), "")), None);
+        ] { assert_eq!(key(kind, None), expected); }
+        assert_eq!(key(EventKind::Activity, Some("Read")), None);
+    }
+
+    #[test]
+    fn sound_preview_window_expires() {
+        // 测试保活窗：未点过 / 已过期都不该让设备醒着，只有仍未来到的截止时刻才算
+        let now = Instant::now();
+        assert!(!preview_active(None, now), "没点过测试 = 不保活");
+        assert!(preview_active(Some(now + std::time::Duration::from_secs(1)), now));
+        assert!(!preview_active(Some(now), now), "到点即失效");
+        assert!(!preview_active(Some(now - std::time::Duration::from_secs(1)), now));
     }
 
     #[test]
     fn thinking_sound_gated_on_phase_transition() {
-        assert!(should_play_state_sound("thinking", true), "建档/真实跃迁照常响");
-        assert!(!should_play_state_sound("thinking", false), "保活心跳不重播思考音");
-        // 其余状态音不被门拦：终态会把条目摘掉（无从比对相位），打断是一次性事件
-        assert!(should_play_state_sound("completed", false));
-        assert!(should_play_state_sound("failed", false));
-        assert!(should_play_state_sound("waiting", false));
+        // 保活心跳与新回合在事件层面无法区分，只有相位能分开（实测：不加门时
+        // 思考期间每个心跳周期都凭空响一声）。判定顺序里相位门在配置之前，
+        // 所以这里不需要给 thinking 配音效也能验到。
+        let cfg = bark_core::config::NotifyConfig::default();
+        let e = ev(EventKind::Activity, 1000, None, "");
+        let verdict = |phase_changed: bool| {
+            crate::sound_policy::decide(crate::sound_policy::SoundInput {
+                event: &e,
+                phase_changed,
+                cfg: &cfg,
+                muted: false,
+                quiet_now: false,
+                last_played: None,
+                now: Instant::now(),
+            })
+        };
+        assert_eq!(
+            verdict(false),
+            crate::sound_policy::Verdict::Skip(crate::sound_policy::SkipReason::PhaseUnchanged),
+            "保活心跳不重播思考音"
+        );
+        assert!(
+            verdict(true) != crate::sound_policy::Verdict::Skip(crate::sound_policy::SkipReason::PhaseUnchanged),
+            "真实跃迁不该被相位门拦"
+        );
     }
 
     #[test]
@@ -2756,8 +3026,12 @@ mod tests {
         let p = claim_pending(&mut pending, &key, 1).expect("本代定时器正常认领");
         assert_eq!(p.merged, 1);
         assert_eq!(
-            append_merged_note(p.notification.body.clone(), p.merged),
+            append_merged_note(p.notification.body.clone(), p.merged, bark_core::Lang::Zh),
             "done\n（合并了 1 条同类事件）"
+        );
+        assert_eq!(
+            append_merged_note(p.notification.body.clone(), p.merged, bark_core::Lang::En),
+            "done\n(merged 1 similar events)"
         );
         assert!(pending.is_empty());
     }
@@ -3213,9 +3487,17 @@ mod tests {
         let mut dismissed = HashMap::new();
         let start = ev(EventKind::Activity, 1000, Some("Read"), "work");
         apply_session_event(&mut sessions, &mut finished, &start);
-        assert!(dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 999, 2000).is_err());
+        // 状态已变化的拒绝文案：zh 原文 + en 用例都钉住（Err 直接给前端展示）
+        let stale_err =
+            dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 999, 2000, bark_core::Lang::Zh)
+                .unwrap_err();
+        assert_eq!(stale_err, "会话状态已更新，请查看最新状态后重试");
+        let stale_err =
+            dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 999, 2000, bark_core::Lang::En)
+                .unwrap_err();
+        assert_eq!(stale_err, "Session state has changed; review the latest state and retry");
         assert!(dismissed.is_empty());
-        dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 1000, 2000).unwrap();
+        dismiss_session_at(&mut sessions, &mut dismissed, "trae-code|s1", 1000, 1000, 2000, bark_core::Lang::Zh).unwrap();
         assert!(sessions.is_empty());
         assert!(finished.is_empty(), "移除不是终态");
         let mut heartbeat = ev(EventKind::Activity, 3000, None, "");

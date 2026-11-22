@@ -11,3 +11,4 @@ anyhow = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 uuid = { workspace = true }
+sys-locale = { workspace = true }

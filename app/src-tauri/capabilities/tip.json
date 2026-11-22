@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tip",
+  "description": "悬浮窗行详情独立窗口权限：自身尺寸/落位/显示/隐藏（几何由 tip.ts 按需设置），事件用 core:default 里的 listen",
+  "windows": ["widget-tip"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-show",
+    "core:window:allow-hide"
+  ]
+}

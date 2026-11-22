@@ -14,8 +14,9 @@
   --ok: #1dc981;
   --warn: #efaa17;
   --err: #e8463a;
-  /* 自绘标题栏：高度与按钮宽度对齐 Windows 11 原生标题栏比例 */
-  --titlebar-h: 34px;
+  /* 自绘标题栏：双平台统一 40px（旧 34px 对齐 Win11 原生比例但观感偏挤）；
+     按钮热区宽度保持 46px，高度随栏拉满 */
+  --titlebar-h: 40px;
   --titlebar-btn-w: 46px;
   --hover-bg: rgba(255, 255, 255, .08);
   --hover-bg-strong: rgba(255, 255, 255, .14);
@@ -32,6 +33,11 @@
   --state-waiting: #f0883e;
   --state-completed: #3fb950;
   --state-failed: #f85149;
+  /* Token 用量图三色：缓存读取 / 新输入 / 输出（浅色另覆一套保证对比度） */
+  --c-cache: #4493f8;
+  --c-input: #8b7cf6;
+  --c-output: #3fb950;
+  --chart-grid: rgba(255, 255, 255, .07);
   /* 表单控件规格：高度 / 圆角 / 底色 / 描边抽成一套变量，输入框、下拉框、时间框、
      数字框共用一套几何，避免「每个控件各撑一个高度」。深色下用比卡片略亮的
      面板底色（VS Code 的做法：控件是浮起来的），浅色下换成白底描边（见下方媒体查询）。 */
@@ -78,6 +84,10 @@
   --state-waiting: #bc4c00;
   --state-completed: #1a7f37;
   --state-failed: #cf222e;
+  --c-cache: #0969da;
+  --c-input: #6e56cf;
+  --c-output: #1a7f37;
+  --chart-grid: rgba(0, 0, 0, .08);
   /* 浅色下控件用白底 + 描边（macOS / Codex 设置页的做法）：
      卡片本身就是白的，再给灰底会显得控件是「不可用」的 */
   --field-bg: #ffffff;
@@ -168,6 +178,14 @@ body:not(.no-hover) .titlebar-btn.close:active { background: var(--close-hover-a
    盖掉 .titlebar-icon 给描边图标准备的那套 fill:none + stroke */
 .titlebar-btn.theme-btn .titlebar-icon { fill: currentColor; stroke: none; }
 
+/* macOS：原生 Overlay 标题栏（tauri.macos.conf.json），红绿灯由系统画在左侧，
+   品牌与三个窗口按钮已在 TitleBar.vue 隐藏。标题栏与 Windows 同 40px，
+   红绿灯用 trafficLightPosition {x:16,y:22} 内缩并垂直居中（y=栏高/2+2，按钮 12px），
+   左侧让出 80px；右侧主题切换收窄成居中的工具栏小按钮，留 14px 右边距不贴边 */
+.titlebar--mac { padding-left: 80px; }
+.titlebar--mac .titlebar-controls { align-items: center; padding-right: 14px; }
+.titlebar--mac .titlebar-btn { width: 30px; height: 30px; border-radius: var(--control-radius); }
+
 .sidebar {
   width: 180px;
   border-right: 1px solid var(--border);
@@ -178,10 +196,13 @@ body:not(.no-hover) .titlebar-btn.close:active { background: var(--close-hover-a
   background: var(--panel);
 }
 
-/* 导航项使用 <button>，先重置按钮默认样式再套用原导航外观 */
+/* 导航项使用 <button>，先重置按钮默认样式再套用原导航外观。
+   height 必须显式归 auto：全局按钮是 30px 定高控件，导航项靠自身 9px 上下
+   padding 撑高并居中文字，套定高会把行盒挤出内容盒、文字沉底 */
 .nav-item {
   display: block;
   width: 100%;
+  height: auto;
   padding: 9px 12px;
   border: none;
   border-radius: 8px;
@@ -198,17 +219,51 @@ body:not(.no-hover) .sidebar .nav-item:hover { background: var(--panel-2); color
 body:not(.no-hover) .sidebar .nav-item.active:hover { background: var(--brand-2); color: #fff; }
 .nav-item:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 
-.content { flex: 1; overflow-y: auto; padding: 20px 24px; }
+.content { flex: 1; overflow-y: auto; padding: 20px 24px 24px; }
 
-.page-title { font-size: 17px; font-weight: 600; margin: 0 0 16px; }
+/* ---- 统一页头：定高 32px，标题 margin 归零 ----
+   旧版各页页头三种几何（用量页标题 margin:0、其余页标题带 16px 下 margin、
+   通知页标题单独成行），切菜单时标题位置跳动。定高 + 归零后八页逐像素一致。
+   左组「标题 + 小字」基线对齐；小字行高与标题同比例，组高不被半行距撑大 */
+.page-head {
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.page-head-left { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.page-head-left .hint { line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.page-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.page-title { font-size: 17px; font-weight: 600; margin: 0; line-height: 1.2; white-space: nowrap; }
+
+/* 块级节奏：卡片 / 提示框 / 分组标题一律走 stack 的 12px 间距，
+   取代 mb-14 / mb-12 / mt-14 / mt-10 混用；直接子元素的外边距归零防叠加 */
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.stack > * { margin-top: 0; margin-bottom: 0; }
 
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 16px;
-  margin-bottom: 14px;
 }
+
+/* 卡头：统一 13px/600 标题（旧版 agent-name 14px / section-label 12px 灰 /
+   panel-title 13px 三种混用），统一下距 12px；右侧操作区与页头同一套控件几何 */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 24px;
+  margin-bottom: 12px;
+}
+.card-head-left { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.card-title { font-size: 13px; font-weight: 600; }
+.card-head .row { gap: 8px; }
 
 .row { display: flex; align-items: center; gap: 10px; }
 .between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -242,13 +297,18 @@ body:not(.no-hover) .sidebar .nav-item.active:hover { background: var(--brand-2)
 .badge.subagent { color: var(--brand); background: color-mix(in srgb, var(--brand) 18%, transparent); }
 
 /* 按钮参考 VS Code：悬停/按压用明确的底色变化（不靠 opacity 糊一层），
-   键盘 Tab 有品牌色焦点环 */
+   键盘 Tab 有品牌色焦点环。定高 30px 与输入框/下拉同一几何（旧版靠内容撑高度） */
 button {
+  height: var(--control-h);
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   background: var(--brand-2);
   color: #fff;
   border: none;
-  border-radius: 6px;
-  padding: 6px 14px;
+  border-radius: var(--control-radius);
   font-size: 13px;
   cursor: pointer;
   transition: background .12s, border-color .12s, color .12s;
@@ -470,6 +530,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
   user-select: text;
 }
 
+/* 表单行：行距统一 10px（取代卡内 mt-14 / mt-12 / mt-10 混用） */
+.form-rows { display: flex; flex-direction: column; gap: 10px; }
+
 /* 开关类设置行（设置页 / 悬浮窗页共用）：左标题 + 一行说明、右控件，
    行间发丝线分隔（VS Code / Codex 设置页的排法）。
    卡片内边距是 16px，行自身留白 10px；首末行各收掉，让卡片边缘与行距同一套节奏 */
@@ -576,7 +639,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
   font-size: 12px;
 }
 
-.agent-name { font-weight: 600; font-size: 14px; }
+.agent-name { font-weight: 600; font-size: 14px; white-space: nowrap; }
 .agent-path { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
 /* 多路径时每个子项独占一行；超长路径就地折行，不能横向撑破卡片 */
 .agent-path > span { display: block; overflow-wrap: anywhere; }
@@ -720,8 +783,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .card.disabled { opacity: 0.45; }
 .card.disabled .switch { cursor: not-allowed; }
 
-/* Agents 页分组标题（已检测到 / 未检测到 / 暂不支持接入），用于把几类软件分开 */
-.group-title { font-size: 12px; color: var(--muted); margin: 6px 2px 8px; }
+/* Agents 页分组标题（已检测到 / 未检测到 / 暂不支持接入）：间距交给 stack */
+.group-title { font-size: 12px; color: var(--muted); margin: 0 2px; }
 
 /* 「未检测到」组的折叠头：整行可点展开/收起。未安装的卡片全是禁用态，
    默认折叠避免把页面拉出长滚动条；chevron 收起时指向右、展开时指向下 */
@@ -748,7 +811,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 }
 .group-toggle .chev.open { transform: rotate(0deg); }
 
-.event-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
+.event-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .event-item:last-child { border-bottom: none; }
 .event-time { font-size: 11px; color: var(--muted); font-family: Consolas, monospace; }
 .event-msg {
@@ -780,13 +843,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 /* 纯信息文本允许选中复制（排障用），body 其余保持 user-select: none */
 .agent-path, .hint, .empty, .warn-box, .ok-box, .tooltip { user-select: text; }
 
-/* 间距与布局工具类 */
+/* 间距与布局工具类（块级间距一律走 .stack / .form-rows，这里只留卡内小间距） */
+.mt-4 { margin-top: 4px; }
 .mt-8 { margin-top: 8px; }
 .mt-10 { margin-top: 10px; }
 .mt-12 { margin-top: 12px; }
-.mt-16 { margin-top: 16px; }
+.mb-10 { margin-bottom: 10px; }
 .mb-12 { margin-bottom: 12px; }
-.mb-14 { margin-bottom: 14px; }
 .w-full { width: 100%; }
 .flex-2 { flex: 2; }
 /* 表单行左侧固定宽度标签列：收窄到放下最长标签（6 个汉字 ≈ 72px）再留少量余量，
@@ -794,9 +857,52 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .field-label { width: 96px; }
 /* 窄数字输入（替代 inline style="width: 110px"） */
 .input-narrow { width: 110px; }
-/* 更窄：只放 1~10 这类一位两位数（如声音的播放次数），和 110px 档拉开差距 */
-.input-tiny { width: 72px; }
-/* 「生效显示器」下拉：不铺满整行，但要放得下「1.显示器1(1920*1080)（主显示器）」 */
-.select-wide { max-width: 340px; }
-/* 事件列表卡片需要更小的内边距（替代 inline style="padding: 4px 16px"） */
-.card-tight { padding: 4px 16px; }
+/* 「生效显示器」下拉：不铺满整行，但要放得下「1.显示器1(1920*1080)（主显示器）」；
+   定宽档让声音区各行下拉同宽（「次数 / 测试」两列逐行对齐），带 .grow 的仍铺满 */
+.select-wide { width: 220px; max-width: 340px; }
+/* 事件列表卡片需要更小的内边距；卡头在卡内同样对齐（行自身 10px 上下留白） */
+.card-list { padding: 4px 16px; }
+.card-list .card-head { margin: 8px 0 4px; }
+
+/* ---- Token 用量页 ---- */
+/* 汇总卡：窄窗自动 2×2（auto-fit），不靠媒体查询；间距交给 stack */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.stat .k { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+.stat .v { font-size: 24px; font-weight: 700; margin: 4px 0 2px; font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+
+.usage-chart { width: 100%; height: auto; display: block; user-select: none; -webkit-tap-highlight-color: transparent; }
+/* 柱子只保留悬停提示：点击不产生浏览器默认焦点框/选中效果 */
+.usage-chart, .usage-chart * { outline: none; }
+.usage-chart text { fill: var(--muted); }
+.usage-chart .grid { stroke: var(--chart-grid); }
+.usage-chart .seg-cache { fill: var(--c-cache); }
+.usage-chart .seg-input { fill: var(--c-input); }
+.usage-chart .seg-output { fill: var(--c-output); }
+/* hover 选中：柱子自底部放大提亮、其余淡出；100ms 短过渡，观感即时 */
+.usage-chart .bar { transform-box: fill-box; transform-origin: 50% 100%; transition: transform 0.1s ease-out, opacity 0.1s ease-out, filter 0.1s ease-out; }
+.usage-chart .bar.active { transform: scale(1.06, 1.04); filter: brightness(1.15); }
+.usage-chart.has-hover .bar:not(.active) { opacity: 0.5; }
+/* 跟随光标的详情提示：fixed + pointer-events:none，不挡鼠标；Teleport 到 body 防祖先变换偏移 */
+.chart-tip { position: fixed; z-index: 9999; pointer-events: none; min-width: 190px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--tooltip-shadow); color: var(--text); font-size: 12px; line-height: 1.55; }
+.chart-tip-title { font-weight: 600; margin-bottom: 4px; }
+.chart-tip-row { display: flex; align-items: center; gap: 6px; }
+.chart-tip-row .legend-dot { margin-right: 0; }
+.chart-tip-row b { margin-left: auto; padding-left: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.chart-tip-total { margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--border); color: var(--muted); }
+.legend { display: flex; align-items: center; gap: 14px; }
+.legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+table.usage { width: 100%; border-collapse: collapse; }
+table.usage th { text-align: right; font-size: 12px; color: var(--muted); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.usage th:first-child, table.usage td:first-child { text-align: left; }
+table.usage td { padding: 9px 10px; border-bottom: 1px solid var(--border); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.usage tr:last-child td { border-bottom: none; }
+table.usage td.total { font-weight: 600; }
+
+/* 用量页脚注：已安装但无完整本地用量源的 agent 图标 */
+.usage-coverage { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 14px; padding: 0 2px; color: var(--muted); font-size: 12px; }
+.usage-coverage-label { white-space: nowrap; }
+.usage-coverage-agent { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; opacity: .55; cursor: default; transition: opacity .12s; }
+.usage-coverage-agent:hover { opacity: 1; }
+.usage-coverage-agent:focus-visible { opacity: 1; outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 3px; }

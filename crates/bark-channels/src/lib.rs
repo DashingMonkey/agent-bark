@@ -1,6 +1,15 @@
 //! 通知渠道：状态音效、Bark (iOS)、通用 Webhook 模板。
 //! 桌面 Toast 通知已下线；hook 子命令离线时只落盘待补投，不再自行提醒。
 
+#[cfg(any(windows, target_os = "macos"))]
+mod audio;
+/// Linux 等平台的保活：循环播静音文件的长进程。
+/// Win/mac 走 [`audio`] 的命令线程，不需要这套全局状态。
+#[cfg(not(any(windows, target_os = "macos")))]
+pub mod keepalive;
+#[cfg(any(windows, target_os = "macos"))]
+mod player_rodio;
+
 use bark_core::config::{BarkChannelConfig, WebhookChannelConfig};
 use bark_core::EventKind;
 use serde::Serialize;
@@ -36,7 +45,6 @@ pub struct SoundEffect {
 /// 随二进制分发，不再依赖系统自带的提示音——Windows 自带的 ding.wav 又短又轻，
 /// 实测听不清。id 与文案必须和前端 api.ts 的 SOUND_EFFECTS 保持一致。
 pub const SOUND_EFFECTS: &[SoundEffect] = &[
-    SoundEffect { id: "chime", label: "风铃", wav: include_bytes!("../assets/sounds/chime.wav") },
     SoundEffect { id: "confirm", label: "确认", wav: include_bytes!("../assets/sounds/confirm.wav") },
     SoundEffect { id: "success", label: "成功", wav: include_bytes!("../assets/sounds/success.wav") },
     SoundEffect { id: "drop", label: "水滴", wav: include_bytes!("../assets/sounds/drop.wav") },
@@ -46,32 +54,187 @@ pub const SOUND_EFFECTS: &[SoundEffect] = &[
     SoundEffect { id: "deep", label: "低叮", wav: include_bytes!("../assets/sounds/deep.wav") },
 ];
 
-/// 播放次数上限：一次事件连响超过 10 次只会惹人烦
-const MAX_PLAYS: u32 = 10;
+/// 内置音效查找（含已下架 id 的别名）。抽成函数是为了让别名只有一处、
+/// 且能单测而不用真的出声。
+pub(crate) fn builtin(effect_id: &str) -> Option<&'static SoundEffect> {
+    // 老配置兼容：chime 已下线（与 deep 同源的素材），映射到 confirm。
+    // 早期版本写进配置的 chime 因此仍然有声，而不是静默 + 每次事件记一条「未知音效」。
+    let id = if effect_id == "chime" { "confirm" } else { effect_id };
+    SOUND_EFFECTS.iter().find(|e| e.id == id)
+}
 
-/// 播放一个音效若干次（次数夹到 1..=10）。未配置（空 effect）为静默 no-op。
+/// 该 id 是否是已知的内置音效（含历史别名）。
 ///
-/// 音效内嵌在二进制里，播放前解包到临时缓存目录（已存在且长度一致就复用），
-/// 再交给各平台的原生播放器。播放在后台进程中进行，本函数立即返回；
-/// 失败由调用方记日志（无播放器/静音环境不打断主流程）。
-pub fn play_sound(effect_id: &str, plays: u32) -> anyhow::Result<()> {
+/// 供判定层区分「这个状态没配」与「配置里写了个不存在的 id」——后者要在诊断里
+/// 明说，而不是走到播放层报一句被日志吞掉的「未知音效」。
+pub fn is_known_effect(effect_id: &str) -> bool {
+    builtin(effect_id.trim()).is_some()
+}
+
+/// 播放目标：内置素材或用户文件
+enum Target<'a> {
+    Builtin(&'static SoundEffect),
+    Custom(&'a std::path::Path),
+}
+
+/// 参数校验：空 effect = 不响；custom 必须指定且存在；未知 id 报错。
+///
+/// 抽出来是因为「播放」和「试听」需要同一套校验，但对错误的处理不同：
+/// 前者只记日志，后者要把错误显示在设置页。
+fn resolve<'a>(
+    effect_id: &str,
+    custom_path: Option<&'a std::path::Path>,
+) -> anyhow::Result<Option<Target<'a>>> {
     let id = effect_id.trim();
     if id.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let effect = SOUND_EFFECTS
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| anyhow::anyhow!("未知音效: {effect_id}"))?;
-    let plays = plays.clamp(1, MAX_PLAYS);
-    let path = unpack(effect)?;
-    let mut cmd = sound_command(&path, plays).ok_or_else(|| anyhow::anyhow!("当前平台没有可用的播放器"))?;
-    spawn_detached(&mut cmd);
+    if id == "custom" {
+        let p = custom_path
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("自定义音效未选择文件"))?;
+        if !p.is_file() {
+            anyhow::bail!("自定义音效文件不存在: {}", p.display());
+        }
+        return Ok(Some(Target::Custom(p)));
+    }
+    let effect = builtin(id).ok_or_else(|| anyhow::anyhow!("未知音效: {effect_id}"))?;
+    Ok(Some(Target::Builtin(effect)))
+}
+
+fn sanitize_volume(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// 播放一个音效一次。未配置（空 effect）为静默 no-op。
+///
+/// `volume` = 0.0~1.0，与系统音量相乘（rodio 走 `Source::amplify`，Linux 三家
+/// 播放器各带自己的音量参数）。
+///
+/// **返回 Ok 只代表「已交给播放链路」**：Win/mac 把命令丢给音频线程（真正开流、
+/// 垫预缓冲、失败重试都在那条线程里），Linux 起一个播放器进程。两种情况都立即
+/// 返回，事件管道不会被音频时长或设备唤醒挂住。参数不合法 / 文件不存在会同步
+/// 报错——那是设置页「测试」需要的那类反馈，见 [`preview_sound`]。
+pub fn play_sound(
+    effect_id: &str,
+    custom_path: Option<&std::path::Path>,
+    volume: f32,
+) -> anyhow::Result<()> {
+    let Some(target) = resolve(effect_id, custom_path)? else {
+        return Ok(());
+    };
+    let volume = sanitize_volume(volume);
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        match target {
+            Target::Builtin(e) => audio::host().play(e.id, None, volume),
+            Target::Custom(p) => audio::host().play("custom", Some(p), volume),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    play_process(target, !keepalive::is_warm(), volume);
     Ok(())
+}
+
+/// 试听一次：与 [`play_sound`] 同一条链路，但等音频线程确认。
+///
+/// 设置页的「测试」需要知道「到底响没响」（文件坏了、设备开不出来都要显示出来），
+/// 而真实事件只记日志就够了。
+pub fn preview_sound(
+    effect_id: &str,
+    custom_path: Option<&std::path::Path>,
+    volume: f32,
+) -> Result<(), String> {
+    let target = resolve(effect_id, custom_path)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| "该状态未配置音效".to_string())?;
+    let volume = sanitize_volume(volume);
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        match target {
+            Target::Builtin(e) => audio::host().preview(e.id, None, volume),
+            Target::Custom(p) => audio::host().preview("custom", Some(p), volume),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        play_process(target, !keepalive::is_warm(), volume);
+        Ok(())
+    }
+}
+
+/// 保活开关（幂等）。Win/mac 交给音频线程，Linux 起/停那条循环播静音的进程。
+pub fn keepalive_set(on: bool) {
+    #[cfg(any(windows, target_os = "macos"))]
+    audio::host().keepalive(on);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    keepalive::set(on);
+}
+
+/// Linux 等平台：解包 / 直接给路径，起一个后台播放器进程
+#[cfg(not(any(windows, target_os = "macos")))]
+fn play_process(target: Target<'_>, cold: bool, volume: f32) {
+    let cmd = match target {
+        Target::Builtin(e) => match unpack(e) {
+            Ok(p) => sound_command(&p, cold, volume),
+            Err(err) => {
+                tracing::warn!("解包音效失败: {err:#}");
+                return;
+            }
+        },
+        Target::Custom(p) => sound_command(p, cold, volume),
+    };
+    match cmd {
+        Some(mut c) => spawn_detached(&mut c),
+        // 通知类声音允许失败（无播放器 / 静音环境），不打断主流程
+        None => tracing::warn!("当前平台没有可用的音频播放器"),
+    }
+}
+
+/// 生成纯零 WAV（与内置同参数：44.1kHz/16bit/mono），供冷启动 pre-roll 与保活循环
+pub fn silence_wav_bytes(secs: f32) -> Vec<u8> {
+    let rate = 44100u32;
+    let bytes = ((rate as f32 * secs) as u32) * 2;
+    let mut v = Vec::with_capacity(44 + bytes as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + bytes).to_le_bytes());
+    v.extend_from_slice(b"WAVE");
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.extend_from_slice(&(rate * 2).to_le_bytes());
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&16u16.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&bytes.to_le_bytes());
+    v.resize(44 + bytes as usize, 0);
+    v
+}
+
+/// 静音文件路径（十分之一秒为单位：5 = 0.5s pre-roll，20 = 2s 保活循环），按需生成进缓存目录
+pub fn silence_path(tenths: u8) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("agent-bark-sounds");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("silence-{tenths}.wav"));
+    let want = silence_wav_bytes(tenths as f32 / 10.0);
+    let cached = std::fs::metadata(&path)
+        .map(|m| m.len() as usize == want.len())
+        .unwrap_or(false);
+    if !cached {
+        let _ = std::fs::write(&path, &want);
+    }
+    path
 }
 
 /// 把内嵌的 WAV 解包到缓存目录，返回文件路径。
 /// 以「文件存在且长度一致」为复用条件，避免每次播放都写盘。
+#[cfg(any(not(any(windows, target_os = "macos")), test))]
 fn unpack(effect: &SoundEffect) -> anyhow::Result<std::path::PathBuf> {
     let dir = std::env::temp_dir().join("agent-bark-sounds");
     std::fs::create_dir_all(&dir)?;
@@ -85,24 +248,17 @@ fn unpack(effect: &SoundEffect) -> anyhow::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// 以「完全无窗口」的方式起一个后台进程。
+/// 以「完全无窗口」的方式起一个后台播放器进程。
 ///
-/// 只加 `-WindowStyle Hidden` 是不够的：那只是隐藏 PowerShell 自己的窗口，
-/// 进程仍会分配到控制台，用户会看到黑框闪一下。必须显式 `CREATE_NO_WINDOW`
-/// 并把 stdio 全部置空。
+/// stdio 全部置空（不让播放器往父进程的控制台/管子里写）；spawn 后必须有人 wait——
+/// Unix 上不 wait 的 Child 会变成僵尸进程，长期运行会持续累积，这里挪到后台线程 reap。
+/// 只服务 Linux 等 unix：Win/mac 已改为进程内 rodio，不再起外部进程。
+#[cfg(not(any(windows, target_os = "macos")))]
 fn spawn_detached(cmd: &mut std::process::Command) {
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     // 通知类声音允许失败（无播放器/静音环境），不打断主流程
-    // B13：spawn 后必须有人 wait——Unix 上不 wait 的 Child 会变成僵尸进程，
-    // 长期运行会持续累积。把 Child 挪到后台线程 reap（Windows 上等价无害）。
     if let Ok(mut child) = cmd.spawn() {
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -110,46 +266,48 @@ fn spawn_detached(cmd: &mut std::process::Command) {
     }
 }
 
-/// 解包出的 WAV 文件 → 播放命令。循环次数由 `plays` 控制，
-/// 两次播放之间留一小段间隔，连响才听得清是「两声」。
-#[cfg(windows)]
-fn sound_command(path: &std::path::Path, plays: u32) -> Option<std::process::Command> {
-    let ps = format!(
-        "$p = New-Object System.Media.SoundPlayer {}; 1..{plays} | ForEach-Object {{ $p.PlaySync(); Start-Sleep -Milliseconds 120 }}",
-        ps_quote(&path.display().to_string())
-    );
-    let mut c = std::process::Command::new("powershell");
-    c.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
-    Some(c)
-}
-
-/// PowerShell 单引号字符串字面量转义：串内单引号必须写成两个单引号。
-/// 不转义的话，`%TEMP%` 落在含单引号的用户名下（如 `O'Brien`）时整条命令
-/// 解析断裂，音效永久无声且无任何报错。
-#[cfg(windows)]
-fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-#[cfg(target_os = "macos")]
-fn sound_command(path: &std::path::Path, plays: u32) -> Option<std::process::Command> {
-    let script = format!("for i in $(seq 1 {plays}); do afplay {}; sleep 0.12; done", sh_quote(&path.display().to_string()));
-    let mut c = std::process::Command::new("sh");
-    c.args(["-c", &script]);
-    Some(c)
-}
-
+/// 音频文件 → 播放命令（播一次）。WAV 走 paplay（最轻）；自定义的非 WAV 格式
+/// 换支持解码的播放器（ffplay / mpv），都没有再回落 paplay（会失败、只记日志）。
+///
+/// 音量按各家量纲换算：paplay `--volume` 是 0~65536，ffplay/mpv 是 0~100。
+/// 冷启动的前置静音不占音量（它本来就是 0）。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn sound_command(path: &std::path::Path, plays: u32) -> Option<std::process::Command> {
-    let script = format!("for i in $(seq 1 {plays}); do paplay {}; sleep 0.12; done", sh_quote(&path.display().to_string()));
+fn sound_command(
+    path: &std::path::Path,
+    cold: bool,
+    volume: f32,
+) -> Option<std::process::Command> {
+    let quoted = sh_quote(&path.display().to_string());
+    let pre = if cold {
+        format!("paplay {}; ", sh_quote(&silence_path(5).display().to_string()))
+    } else {
+        String::new()
+    };
+    let is_wav = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+    let vol = volume.clamp(0.0, 1.0);
+    let pa_vol = (vol * 65536.0).round() as u32;
+    let pct = (vol * 100.0).round() as u32;
+    let script = if is_wav {
+        format!("{pre}paplay --volume={pa_vol} {quoted}")
+    } else {
+        format!(
+            "{pre}if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet -volume {pct} {quoted}; elif command -v mpv >/dev/null 2>&1; then mpv --no-video --really-quiet --volume={pct} {quoted}; else paplay --volume={pa_vol} {quoted}; fi"
+        )
+    };
     let mut c = std::process::Command::new("sh");
     c.args(["-c", &script]);
     Some(c)
 }
 
 /// POSIX sh 单引号字面量转义：`'` → `'\''`（闭合、转义引号、再重开）。
+/// 调用方都在非 macOS 的 unix 播放路径（paplay）；macOS 上仅测试引用，
+/// Windows 测试构建会因 cfg(test) 编入却无引用，故两者都压掉 dead_code。
 #[cfg(any(unix, test))]
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -368,11 +526,87 @@ mod tests {
             assert_eq!(&e.wav[..4], b"RIFF", "音效 {} 不是 WAV", e.id);
             let path = unpack(e).unwrap();
             assert!(path.exists(), "音效 {} 解包失败: {}", e.id, path.display());
-            assert!(sound_command(&path, 2).is_some(), "音效 {} 没有播放实现", e.id);
+            #[cfg(not(any(windows, target_os = "macos")))]
+            assert!(sound_command(&path, false, 1.0).is_some(), "音效 {} 没有播放实现", e.id);
+            #[cfg(any(windows, target_os = "macos"))]
+            assert!(player_rodio::parse_wav(e.wav).is_ok(), "音效 {} WAV 解析失败", e.id);
         }
         // 未配置（空 effect）在 play_sound 层是静默 no-op；未知 id 报错
-        assert!(play_sound("", 1).is_ok());
-        assert!(play_sound("nope", 1).is_err());
+        assert!(play_sound("", None, 1.0).is_ok());
+        assert!(play_sound("nope", None, 1.0).is_err());
+        // 自定义：没选文件 / 文件不存在都报错，不静默吞掉（测试按钮要给用户反馈）
+        assert!(play_sound("custom", None, 1.0).is_err());
+        assert!(play_sound("custom", Some(std::path::Path::new("/nonexistent/x.mp3")), 1.0).is_err());
+    }
+
+    #[test]
+    fn legacy_chime_maps_to_confirm() {
+        // chime 已从目录下线（素材与 deep 同源），老配置里可能还留着：
+        // 必须映射到 confirm 而不是报「未知音效」——否则升级后该状态永久静默
+        assert_eq!(builtin("chime").map(|e| e.id), Some("confirm"));
+        assert_eq!(builtin("confirm").map(|e| e.id), Some("confirm"));
+        assert!(builtin("nope").is_none());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn rodio_play_private_silence() {
+        // 静音缓冲不出声；私有流 open→入队→后台等播完 drop 全路径（冷含唤醒）。
+        // play_private 现在立即返回，连续多次调用会短时并存多个流，正是要验的寿命组合
+        for i in 0..6 {
+            player_rodio::play_private(player_rodio::silence_source(0.3), i == 0).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        // 等后台线程把流放干净再退出（否则进程退出时 join 掉大半个波形）
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        eprintln!("rodio private silence survived");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    #[ignore]
+    fn audio_host_churn_survives() {
+        // 保活高频开关：命令线程必须串行消化、不崩、不死锁。
+        // 以前这条测的是全局 Mutex 下的 start/stop 竞态；现在设备只属于一条线程，
+        // 剩下要验的是「命令风暴里开流/drop 不会把线程搞挂」。
+        for i in 0..60 {
+            keepalive_set(i % 2 == 0);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        keepalive_set(true);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        keepalive_set(false);
+        eprintln!("audio host churn survived");
+    }
+
+    #[test]
+    fn keepalive_commands_are_idempotent() {
+        // 连发同一条命令不卡死、不 panic（真正的设备状态在音频线程里，
+        // 调用方无状态可断言——这正是这次重构要的效果）
+        keepalive_set(true);
+        keepalive_set(true);
+        keepalive_set(false);
+        keepalive_set(false);
+    }
+
+    #[test]
+    fn silence_wav_is_valid_and_cached() {
+        let b = silence_wav_bytes(0.5);
+        assert_eq!(&b[..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        // 0.5s * 44100 * 2 bytes
+        assert_eq!(b.len(), 44 + 44100);
+        let p5 = silence_path(5);
+        let p20 = silence_path(20);
+        assert!(p5.exists() && p20.exists());
+        assert_eq!(std::fs::metadata(&p20).unwrap().len() as usize, 44 + 44100 * 2 * 2);
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let (ch, rate, data) = player_rodio::parse_wav(&b).unwrap();
+            assert_eq!(ch, 1);
+            assert_eq!(rate, 44100);
+            assert_eq!(data.len(), 44100);
+        }
     }
 
     #[test]
@@ -501,8 +735,6 @@ mod tests {
     #[test]
     fn shell_quotes_escape_embedded_single_quotes() {
         // %TEMP% 在含单引号的用户名下（如 O'Brien）时命令不能断裂
-        #[cfg(windows)]
-        assert_eq!(ps_quote(r"C:\Users\O'Brien\Temp\x.wav"), r#"'C:\Users\O''Brien\Temp\x.wav'"#);
         #[cfg(unix)]
         assert_eq!(sh_quote("/tmp/O'Brien/x.wav"), "'/tmp/O'\\''Brien/x.wav'");
     }

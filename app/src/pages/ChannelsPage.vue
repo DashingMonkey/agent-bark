@@ -1,10 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { api, type BarkConfig } from "../api";
 import { toast } from "../toast";
 
+const { t } = useI18n();
+
 // 未配置渠道的默认模板：只在用户真正编辑该渠道时才会写入配置
 const DEFAULT_WEBHOOK_TEMPLATE = '{"title": "{title}", "body": "{body}", "agent": "{agent}"}';
+
+/** 模板可用占位符的展示串（语言无关，直接从代码传参进词表，避免在消息里转义花括号） */
+const TEMPLATE_PLACEHOLDERS = "{title} {body} {agent} {event} {project}";
 
 const config = ref<BarkConfig | null>(null);
 const saving = ref(false);
@@ -30,7 +36,7 @@ async function load() {
     config.value = await api.getConfig();
     savedSnapshot.value = JSON.stringify(config.value.channels); // 已落盘基线
   } catch (e) {
-    loadError.value = `加载配置失败：${e}`;
+    loadError.value = t("common.loadConfigFailed", { error: String(e) });
   }
 }
 
@@ -42,9 +48,9 @@ async function save() {
   try {
     await api.saveConfig({ channels: config.value.channels });
     savedSnapshot.value = JSON.stringify(config.value.channels); // 基线跟上，「未保存」提示消失
-    toast("已保存");
+    toast(t("common.saved"));
   } catch (e) {
-    toast(`保存失败：${e}`, "error");
+    toast(t("common.saveFailed", { error: String(e) }), "error");
   } finally {
     saving.value = false;
   }
@@ -64,9 +70,9 @@ async function test(channel: string) {
         config.value?.channels.webhook?.template ?? null,
       );
     }
-    testResult[channel] = { ok: true, text: "已发送，请查收" };
+    testResult[channel] = { ok: true, text: t("channels.testSent") };
   } catch (e) {
-    testResult[channel] = { ok: false, text: `失败：${e}` };
+    testResult[channel] = { ok: false, text: t("channels.testFailed", { error: String(e) }) };
   } finally {
     testing.value = null;
   }
@@ -144,101 +150,105 @@ function setWebhookTemplate(template: string) {
 
 <template>
   <div v-if="config">
-    <div class="between mb-14">
-      <h1 class="page-title">第三方通知</h1>
-      <button :disabled="saving" @click="save">保存</button>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("channels.title") }}</h1></div>
+      <div class="page-actions"><button :disabled="saving" @click="save">{{ $t("common.save") }}</button></div>
     </div>
-    <!-- 未保存提示：URL / 模板只在「保存」时落盘（切页不丢——页面被 KeepAlive 保活），给个明示 -->
-    <div v-if="dirty" class="warn-box mb-14">有未保存的修改：点右上角「保存」写入配置（切页不会丢失）</div>
+    <div class="stack">
+      <!-- 未保存提示：URL / 模板只在「保存」时落盘（切页不丢——页面被 KeepAlive 保活），给个明示 -->
+      <div v-if="dirty" class="warn-box">{{ $t("common.unsavedChanges") }}</div>
 
-    <!-- Bark -->
-    <div class="card">
-      <div class="between">
-        <div class="col">
-          <span class="agent-name">Bark (iOS)</span>
-          <span class="hint">手机推送。填服务地址，如 https://api.day.app/YourKey</span>
+      <!-- Bark -->
+      <div class="card">
+        <div class="card-head">
+          <div class="card-head-left">
+            <span class="card-title">Bark (iOS)</span>
+            <span class="hint">{{ $t("channels.barkHint") }}</span>
+          </div>
+          <div class="row">
+            <label class="switch">
+              <input type="checkbox" :checked="!!config.channels.bark?.enabled" @change="setBarkEnabled(($event.target as HTMLInputElement).checked)" />
+              <span class="track"></span>
+            </label>
+            <button class="ghost" :disabled="testing === 'bark' || !config.channels.bark?.url" @click="test('bark')">{{ $t("common.test") }}</button>
+          </div>
         </div>
-        <div class="row">
-          <label class="switch">
-            <input type="checkbox" :checked="!!config.channels.bark?.enabled" @change="setBarkEnabled(($event.target as HTMLInputElement).checked)" />
-            <span class="track"></span>
-          </label>
-          <button class="ghost" :disabled="testing === 'bark' || !config.channels.bark?.url" @click="test('bark')">测试</button>
+        <div class="form-rows">
+          <input
+            type="text"
+            class="w-full"
+            placeholder="https://api.day.app/YourKey"
+            :value="config.channels.bark?.url ?? ''"
+            @focus="ensureBark()"
+            @input="setBarkUrl(($event.target as HTMLInputElement).value)"
+          />
+          <div
+            v-if="testResult.bark"
+            :class="[testResult.bark.ok ? 'ok-box' : 'warn-box']"
+          >{{ testResult.bark.text }}</div>
         </div>
       </div>
-      <div class="mt-10">
-        <input
-          type="text"
-          class="w-full"
-          placeholder="https://api.day.app/YourKey"
-          :value="config.channels.bark?.url ?? ''"
-          @focus="ensureBark()"
-          @input="setBarkUrl(($event.target as HTMLInputElement).value)"
-        />
-      </div>
-      <div
-        v-if="testResult.bark"
-        :class="[testResult.bark.ok ? 'ok-box' : 'warn-box', 'mt-8']"
-      >{{ testResult.bark.text }}</div>
-    </div>
 
-    <!-- Webhook 模板 -->
-    <div class="card">
-      <div class="between">
-        <div class="col">
-          <span class="agent-name">Webhook（通用模板）</span>
-          <span class="hint">飞书 / 企业微信 / 钉钉 / ntfy / Server酱 等自定义 Webhook</span>
+      <!-- Webhook 模板 -->
+      <div class="card">
+        <div class="card-head">
+          <div class="card-head-left">
+            <span class="card-title">{{ $t("channels.webhookTitle") }}</span>
+            <span class="hint">{{ $t("channels.webhookHint") }}</span>
+          </div>
+          <div class="row">
+            <label class="switch">
+              <input type="checkbox" :checked="!!config.channels.webhook?.enabled" @change="setWebhookEnabled(($event.target as HTMLInputElement).checked)" />
+              <span class="track"></span>
+            </label>
+            <button class="ghost" :disabled="testing === 'webhook' || !config.channels.webhook?.url" @click="test('webhook')">{{ $t("common.test") }}</button>
+          </div>
         </div>
-        <div class="row">
-          <label class="switch">
-            <input type="checkbox" :checked="!!config.channels.webhook?.enabled" @change="setWebhookEnabled(($event.target as HTMLInputElement).checked)" />
-            <span class="track"></span>
-          </label>
-          <button class="ghost" :disabled="testing === 'webhook' || !config.channels.webhook?.url" @click="test('webhook')">测试</button>
+        <div class="form-rows">
+          <div class="row">
+            <input
+              type="text"
+              class="flex-2"
+              placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+              :value="config.channels.webhook?.url ?? ''"
+              @focus="ensureWebhook()"
+              @input="setWebhookUrl(($event.target as HTMLInputElement).value)"
+            />
+            <select
+              :value="config.channels.webhook?.method ?? 'POST'"
+              @focus="ensureWebhook()"
+              @change="setWebhookMethod(($event.target as HTMLSelectElement).value)"
+            >
+              <button><selectedcontent></selectedcontent></button>
+              <option>POST</option>
+              <option>GET</option>
+            </select>
+          </div>
+          <div class="col">
+            <textarea
+              rows="3"
+              spellcheck="false"
+              class="code w-full"
+              :placeholder="DEFAULT_WEBHOOK_TEMPLATE"
+              :value="config.channels.webhook?.template ?? ''"
+              @focus="ensureWebhook()"
+              @input="setWebhookTemplate(($event.target as HTMLTextAreaElement).value)"
+            ></textarea>
+            <div class="hint">{{ $t("channels.templateHint", { placeholders: TEMPLATE_PLACEHOLDERS }) }}</div>
+            <div v-if="config.channels.webhook?.method === 'GET'" class="hint">{{ $t("channels.getNoBody") }}</div>
+          </div>
+          <div
+            v-if="testResult.webhook"
+            :class="[testResult.webhook.ok ? 'ok-box' : 'warn-box']"
+          >{{ testResult.webhook.text }}</div>
         </div>
       </div>
-      <div class="mt-10 row">
-        <input
-          type="text"
-          class="flex-2"
-          placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
-          :value="config.channels.webhook?.url ?? ''"
-          @focus="ensureWebhook()"
-          @input="setWebhookUrl(($event.target as HTMLInputElement).value)"
-        />
-        <select
-          :value="config.channels.webhook?.method ?? 'POST'"
-          @focus="ensureWebhook()"
-          @change="setWebhookMethod(($event.target as HTMLSelectElement).value)"
-        >
-          <button><selectedcontent></selectedcontent></button>
-          <option>POST</option>
-          <option>GET</option>
-        </select>
-      </div>
-      <div class="mt-8">
-        <textarea
-          rows="3"
-          spellcheck="false"
-          class="code w-full"
-          :placeholder="DEFAULT_WEBHOOK_TEMPLATE"
-          :value="config.channels.webhook?.template ?? ''"
-          @focus="ensureWebhook()"
-          @input="setWebhookTemplate(($event.target as HTMLTextAreaElement).value)"
-        ></textarea>
-        <div class="hint">占位符：{title} {body} {agent} {event} {project}</div>
-        <div v-if="config.channels.webhook?.method === 'GET'" class="hint">GET 方法不使用 body 模板</div>
-      </div>
-      <div
-        v-if="testResult.webhook"
-        :class="[testResult.webhook.ok ? 'ok-box' : 'warn-box', 'mt-8']"
-      >{{ testResult.webhook.text }}</div>
     </div>
   </div>
 
   <div v-else-if="loadError" class="empty">
     {{ loadError }}
-    <div class="mt-12"><button class="ghost" @click="load">重试</button></div>
+    <div class="mt-12"><button class="ghost" @click="load">{{ $t("common.retry") }}</button></div>
   </div>
-  <div v-else class="empty">加载配置中…</div>
+  <div v-else class="empty">{{ $t("common.loadingConfig") }}</div>
 </template>

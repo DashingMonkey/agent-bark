@@ -17,6 +17,8 @@
   --fail-border: #815057;
   --hover: #ffffff09;
   --line: #41414a;
+  --ring-hi: rgba(200, 207, 215, .9);
+  --ring-lo: rgba(200, 207, 215, .1);
 }
 :root[data-theme="light"] {
   color-scheme: light;
@@ -34,6 +36,8 @@
   --fail-border: #e5aaa5;
   --hover: #00000005;
   --line: #d8dfe5;
+  --ring-hi: rgba(120, 130, 141, .9);
+  --ring-lo: rgba(120, 130, 141, .08);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
@@ -98,9 +102,29 @@ body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, san
 .edge-moving #app { will-change: transform; }
 .edge-collapsed #app { visibility: hidden; }
 .edge-collapsed #edge-handle { display: block; }
-.card[data-dock-preview="top"] { border-top-color: var(--blue); }
-.card[data-dock-preview="left"] { border-left-color: var(--blue); }
-.card[data-dock-preview="right"] { border-right-color: var(--blue); }
+/* 展开时改原生窗口几何前先藏起假窄条：WebView 的布局视口会晚一帧才重排，
+   这一帧里 `right: 0` 的窄条会按旧 6px 视口画到新窗口左缘。等一帧提交后
+   再改几何，窄条只在边缘位置出现；左/顶共用这条路径，只是本来就不会错位。
+   紧跟 `.edge-collapsed #edge-handle` 之后，同优先级靠源顺序覆盖。 */
+.edge-handle-hidden #edge-handle { display: none; }
+/* 吸附预览：渐变光环——覆盖卡片最外圈边框，接触边最亮、向对侧渐隐成环。
+   挂在 #app 而非 .card：.card 的 overflow:hidden 按内边距盒裁剪，外圈 1px
+   会被裁掉；#app 与窗口同界不受裁剪。环 1px、最亮端 90%；亮段延伸用绝对
+   像素 13px（168×112 设计稿上的左 8% / 上 12% 折算 ≈13.4px，恰好刚过 10px
+   圆角）——真实卡片 280 宽、高度随内容可变，百分比口径在两个方向上不等价。
+   纯亮 40%（5px）后线性淡出。 */
+#app[data-dock-preview]::before {
+  content: ""; position: absolute; inset: 0; z-index: 1;
+  border-radius: 10px; padding: 1px;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  pointer-events: none;
+}
+#app[data-dock-preview="left"]::before  { background: linear-gradient(to right,  var(--ring-hi) 0, var(--ring-hi) 5px, var(--ring-lo) 13px); }
+#app[data-dock-preview="right"]::before { background: linear-gradient(to left,   var(--ring-hi) 0, var(--ring-hi) 5px, var(--ring-lo) 13px); }
+#app[data-dock-preview="top"]::before   { background: linear-gradient(to bottom, var(--ring-hi) 0, var(--ring-hi) 5px, var(--ring-lo) 13px); }
 .ctx-separator { height: 1px; margin: 4px; background: var(--line); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
 

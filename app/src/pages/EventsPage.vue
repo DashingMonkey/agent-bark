@@ -6,18 +6,22 @@ import {
   agentName,
   agentIcon,
   eventBadgeClass,
-  EVENT_LABELS,
+  eventLabel,
+  EVENT_KINDS,
   formatTime,
   isSubagentSession,
   parentTail,
-  PHASE_LABELS,
+  phaseLabel,
   phaseBadgeClass,
   placeholderName,
   sessionRows,
   subagentRowClass,
   type SessionStatus,
 } from "../api";
-import { formatDuration } from "../session-time";
+// 事件流页面被 session-time.test.mjs 以 VM 沙箱直载，i18n 走 ../i18n 的全局
+// `t` / `locale()`（与 useI18n 返回的同一个 global composer，模板里同样响应切语言）
+import { locale, t } from "../i18n";
+import { durationUnits, formatDuration } from "../session-time";
 
 const historyLoaded = ref(false);
 const historyError = ref("");
@@ -33,7 +37,7 @@ async function dismiss(s: SessionStatus) {
     await api.dismissSession(s);
     await loadSessions();
   } catch (e) {
-    dismissError.value = `移除失败：${e}`;
+    dismissError.value = t("events.removeFailed", { error: String(e) });
     await loadSessions();
   } finally { dismissing.value = null; }
 }
@@ -87,7 +91,7 @@ async function loadHistory() {
       }
     } catch (e) {
       // 历史加载失败只作为提示展示，已到达的实时事件继续正常渲染
-      historyError.value = `加载历史事件失败：${e}`;
+      historyError.value = t("events.loadHistoryFailed", { error: String(e) });
     }
     // 合并成功或失败都收工；只有上面那条 continue 会进到第二轮
     break;
@@ -159,12 +163,12 @@ onUnmounted(stopTimers);
 
 function durationLabel(s: SessionStatus): string {
   // started_at 是回合发起时间，等待授权/输入也仍展示整个回合的耗时。
-  return `已运行 ${formatDuration(s.started_at, now.value)}`;
+  return t("events.ranFor", { d: formatDuration(s.started_at, now.value, durationUnits(locale())) });
 }
 
 function statsLabel(s: SessionStatus): string {
-  const parts = [`${s.turn_count} 回合`, `${s.tool_calls} 次工具调用`];
-  if (s.last_tool && s.phase === "tool_running") parts.unshift(`工具：${s.last_tool}`);
+  const parts = [t("events.turns", s.turn_count), t("events.toolCalls", s.tool_calls)];
+  if (s.last_tool && s.phase === "tool_running") parts.unshift(t("events.toolLabel", { name: s.last_tool }));
   return parts.join(" · ");
 }
 
@@ -189,7 +193,7 @@ async function clear() {
     cleared = await api.clearEvents(kind);
   } catch (e) {
     // 后端没清掉就保持列表原样：本地清了也会被历史补回来，不如老实报错
-    clearError.value = `清空事件失败：${e}`;
+    clearError.value = t("events.clearFailed", { error: String(e) });
     return;
   } finally {
     clearing.value = false;
@@ -203,129 +207,131 @@ async function clear() {
 
 <template>
   <div>
-    <div class="between mb-14">
-      <h1 class="page-title">事件流</h1>
-      <div class="row">
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("events.title") }}</h1></div>
+      <div class="page-actions">
         <select v-model="filter">
           <button><selectedcontent></selectedcontent></button>
-          <option value="">全部类型</option>
-          <option v-for="(label, kind) in EVENT_LABELS" :key="kind" :value="kind">{{ label }}</option>
+          <option value="">{{ $t("events.filterAll") }}</option>
+          <option v-for="kind in EVENT_KINDS" :key="kind" :value="kind">{{ eventLabel(kind) }}</option>
         </select>
         <button class="ghost" :disabled="clearing" @click="clear">
-          {{ clearing ? "清空中…" : filter ? "清空当前筛选" : "清空显示" }}
+          {{ clearing ? $t("events.clearing") : filter ? $t("events.clearFiltered") : $t("events.clearAll") }}
         </button>
       </div>
     </div>
 
-    <!-- 清空失败：列表保持原样（后端没清掉，本地清了也会被历史补回来） -->
-    <div v-if="clearError" class="warn-box mb-14">
-      <div class="row">
-        <span class="grow">{{ clearError }}</span>
-        <button class="ghost" :disabled="clearing" @click="clear">重试</button>
-      </div>
-    </div>
-
-    <div v-if="dismissError" class="warn-box mb-14" role="alert">{{ dismissError }}</div>
-    <div v-if="!historyLoaded" class="empty">加载历史事件…</div>
-
-    <template v-else>
-      <!-- 运行中的 agent 会话（实时状态，心跳推送）：
-           子代理行打 ↳ + 缩进 + 灰徽标（与悬浮窗、下面的事件列表同一套视觉语言），
-           正文弱化，视线自然落在「需要我的那个主会话」上 -->
-      <div v-if="runningRows.length" class="card card-tight mb-14">
-        <div class="row mb-8">
-          <span class="hint grow">运行中会话（{{ runningRows.length }}）</span>
-          <label class="hint id-toggle">
-            <input type="checkbox" v-model="showIds" />
-            显示 ID
-          </label>
-        </div>
-        <div v-if="store.sessions.length >= 64" class="warn-box mb-14">
-          已达到 64 个会话的显示上限。新会话暂不加入此列表，可移除已停止的条目腾出位置。
-        </div>
-        <div
-          v-for="row in runningRows"
-          :key="`${row.session.agent}|${row.session.session_id}`"
-          class="event-item"
-          :class="subagentRowClass(row)"
-        >
-          <div class="row">
-            <span v-if="row.depth > 0" class="sub-tree">↳</span>
-            <span v-if="!row.placeholder" :class="phaseBadgeClass(row.session.phase)">{{ PHASE_LABELS[row.session.phase] }}</span>
-            <span v-else class="badge">已结束</span>
-            <span class="agent-icon" v-html="agentIcon(row.session.agent)"></span>
-            <!-- 占位父行：快照里没有这个会话（回合已结束/被淘汰），只是为了给还在跑的子代理
-                 一个落脚点而合成的一行（见 api.ts 的 SessionRow.placeholder） -->
-            <span class="agent-name" :class="{ 'is-sub': row.placeholder }">
-              {{ row.placeholder ? placeholderName(row.session.session_id) : agentName(row.session.agent) }}
-            </span>
-            <!-- 两个工作区各开一个 DSH 会话时，光看 agent 名分不出是哪一行，
-                 而「子代理挂在哪个会话下」全靠这个项目名来认 -->
-            <span v-if="row.session.project" class="hint">{{ row.session.project }}</span>
-            <span v-if="isSubagentSession(row.session) && !row.placeholder" class="badge">子代理</span>
-            <!-- 子代理的血缘小字：父行在快照里时指向它，父行缺席时指向上面那行占位父行 -->
-            <span v-if="isSubagentSession(row.session) && !row.placeholder" class="kin">← …{{ parentTail(row.session.parent!) }}</span>
-            <span class="grow"></span>
-            <span class="event-time">{{ row.placeholder ? "" : durationLabel(row.session) }}</span>
-            <button v-if="!row.placeholder" class="ghost" :disabled="dismissing !== null"
-              title="仅从本应用移除，不会停止 Agent；新的真实活动会恢复显示"
-              @click="dismiss(row.session)">移除</button>
-          </div>
-          <div v-if="row.session.prompt" class="event-msg" tabindex="0" role="region" aria-label="可滚动的事件正文">{{ row.session.prompt }}</div>
-          <!-- 占位行没有统计数据（它不在快照里，数字全是 0），别显示成「0 回合」 -->
-          <div v-if="!row.placeholder" class="hint mt-8">{{ statsLabel(row.session) }}</div>
-          <!-- 「显示 ID」：daemon 实际下发的会话 id 与它声明的父 id。
-               父子归属有疑问时，这一行就是判据（父 id 对不上 = 插件报错了血缘） -->
-          <div v-if="showIds" class="id-line">
-            <span>{{ row.session.agent }}|{{ row.session.session_id }}</span>
-            <span v-if="row.session.parent"> parent={{ row.session.parent }}</span>
-            <span v-else-if="row.placeholder"> 父行已被摘档（快照里没有这个会话）</span>
-          </div>
-        </div>
-      </div>
-      <!-- 历史加载失败：非阻塞提示，实时事件列表照常渲染 -->
-      <div v-if="historyError" class="warn-box mb-12">
+    <div class="stack">
+      <!-- 清空失败：列表保持原样（后端没清掉，本地清了也会被历史补回来） -->
+      <div v-if="clearError" class="warn-box">
         <div class="row">
-          <span class="grow">{{ historyError }}</span>
-          <button class="ghost" @click="loadHistory">重试</button>
+          <span class="grow">{{ clearError }}</span>
+          <button class="ghost" :disabled="clearing" @click="clear">{{ $t("common.retry") }}</button>
         </div>
       </div>
 
-      <!-- 空态：还有会话在跑时不再显示「暂无事件」——上面的运行中卡片已经说明
-           有 agent 在工作（清空显示后尤甚：进行中的会话不产生历史事件，空态会一直挂着） -->
-      <div v-if="!filteredEvents.length && (filter || !runningRows.length)" class="empty">
-        {{
-          filter
-            ? "当前保留的最近事件中没有该类型"
-            : "暂无事件 —— 接入 agent 后，任务完成/打断时事件会实时出现在这里"
-        }}
-      </div>
+      <div v-if="dismissError" class="warn-box" role="alert">{{ dismissError }}</div>
+      <div v-if="!historyLoaded" class="empty">{{ $t("events.loadingHistory") }}</div>
 
-      <!-- 事件卡片只在真有条目时渲染：清空后若仍有会话在跑，空态与卡片都不出现，
-           不能留下一个没有内容的空面板 -->
-      <div v-else-if="filteredEvents.length" class="card card-tight">
-        <div
-          v-for="e in filteredEvents"
-          :key="e.id"
-          class="event-item"
-          :class="{ 'is-sub': e.is_subagent }"
-        >
-          <div class="row">
-            <span :class="e.completion_deferred ? 'badge' : eventBadgeClass(e.type)">{{ e.completion_deferred ? "回合结束（暂不报完成）" : EVENT_LABELS[e.type] }}</span>
-            <span class="agent-icon" v-html="agentIcon(e.agent)"></span>
-            <span class="agent-name">{{ agentName(e.agent) }}</span>
-            <span v-if="e.project" class="hint">{{ e.project }}</span>
-            <!-- 「子代理」徽标走品牌色：四态色表达「它在干什么」，子代理表达「它属于谁」，
-                 用中性灰会和「工具失败」撞色。历史事件不带血缘（后端历史里没有父会话边），
-                 父子关系在上面「运行中会话」卡片里用 ↳ + ← …尾号 表达 -->
-            <span v-if="e.is_subagent" class="badge subagent">子代理</span>
-            <span class="grow"></span>
-            <span class="event-time">{{ formatTime(e.timestamp) }}</span>
+      <template v-else>
+        <!-- 运行中的 agent 会话（实时状态，心跳推送）：
+             子代理行打 ↳ + 缩进 + 灰徽标（与悬浮窗、下面的事件列表同一套视觉语言），
+             正文弱化，视线自然落在「需要我的那个主会话」上 -->
+        <div v-if="runningRows.length" class="card card-list">
+          <div class="card-head">
+            <span class="card-title">{{ $t("events.runningSessions", { n: runningRows.length }) }}</span>
+            <label class="hint id-toggle">
+              <input type="checkbox" v-model="showIds" />
+              {{ $t("events.showIds") }}
+            </label>
           </div>
-          <div v-if="e.message" class="event-msg" tabindex="0" role="region" aria-label="可滚动的事件正文">{{ e.message }}</div>
+          <div v-if="store.sessions.length >= 64" class="warn-box mb-12">
+            {{ $t("events.sessionLimit") }}
+          </div>
+          <div
+            v-for="row in runningRows"
+            :key="`${row.session.agent}|${row.session.session_id}`"
+            class="event-item"
+            :class="subagentRowClass(row)"
+          >
+            <div class="row">
+              <span v-if="row.depth > 0" class="sub-tree">↳</span>
+              <span v-if="!row.placeholder" :class="phaseBadgeClass(row.session.phase)">{{ phaseLabel(row.session.phase) }}</span>
+              <span v-else class="badge">{{ $t("events.ended") }}</span>
+              <span class="agent-icon" v-html="agentIcon(row.session.agent)"></span>
+              <!-- 占位父行：快照里没有这个会话（回合已结束/被淘汰），只是为了给还在跑的子代理
+                   一个落脚点而合成的一行（见 api.ts 的 SessionRow.placeholder） -->
+              <span class="agent-name" :class="{ 'is-sub': row.placeholder }">
+                {{ row.placeholder ? placeholderName(row.session.session_id) : agentName(row.session.agent) }}
+              </span>
+              <!-- 两个工作区各开一个 DSH 会话时，光看 agent 名分不出是哪一行，
+                   而「子代理挂在哪个会话下」全靠这个项目名来认 -->
+              <span v-if="row.session.project" class="hint">{{ row.session.project }}</span>
+              <span v-if="isSubagentSession(row.session) && !row.placeholder" class="badge">{{ $t("events.subagent") }}</span>
+              <!-- 子代理的血缘小字：父行在快照里时指向它，父行缺席时指向上面那行占位父行 -->
+              <span v-if="isSubagentSession(row.session) && !row.placeholder" class="kin">← …{{ parentTail(row.session.parent!) }}</span>
+              <span class="grow"></span>
+              <span class="event-time">{{ row.placeholder ? "" : durationLabel(row.session) }}</span>
+              <button v-if="!row.placeholder" class="ghost" :disabled="dismissing !== null"
+                :title="$t('events.removeHint')"
+                @click="dismiss(row.session)">{{ $t("events.remove") }}</button>
+            </div>
+            <div v-if="row.session.prompt" class="event-msg" tabindex="0" role="region" :aria-label="$t('events.scrollableBody')">{{ row.session.prompt }}</div>
+            <!-- 占位行没有统计数据（它不在快照里，数字全是 0），别显示成「0 回合」 -->
+            <div v-if="!row.placeholder" class="hint mt-8">{{ statsLabel(row.session) }}</div>
+            <!-- 「显示 ID」：daemon 实际下发的会话 id 与它声明的父 id。
+                 父子归属有疑问时，这一行就是判据（父 id 对不上 = 插件报错了血缘） -->
+            <div v-if="showIds" class="id-line">
+              <span>{{ row.session.agent }}|{{ row.session.session_id }}</span>
+              <span v-if="row.session.parent"> parent={{ row.session.parent }}</span>
+              <span v-else-if="row.placeholder"> {{ $t("events.parentArchived") }}</span>
+            </div>
+          </div>
         </div>
-      </div>
-    </template>
+        <!-- 历史加载失败：非阻塞提示，实时事件列表照常渲染 -->
+        <div v-if="historyError" class="warn-box">
+          <div class="row">
+            <span class="grow">{{ historyError }}</span>
+            <button class="ghost" @click="loadHistory">{{ $t("common.retry") }}</button>
+          </div>
+        </div>
+
+        <!-- 空态：还有会话在跑时不再显示「暂无事件」——上面的运行中卡片已经说明
+             有 agent 在工作（清空显示后尤甚：进行中的会话不产生历史事件，空态会一直挂着） -->
+        <div v-if="!filteredEvents.length && (filter || !runningRows.length)" class="empty">
+          {{
+            filter
+              ? $t("events.emptyFiltered")
+              : $t("events.empty")
+          }}
+        </div>
+
+        <!-- 事件卡片只在真有条目时渲染：清空后若仍有会话在跑，空态与卡片都不出现，
+             不能留下一个没有内容的空面板 -->
+        <div v-else-if="filteredEvents.length" class="card card-list">
+          <div
+            v-for="e in filteredEvents"
+            :key="e.id"
+            class="event-item"
+            :class="{ 'is-sub': e.is_subagent }"
+          >
+            <div class="row">
+              <span :class="e.completion_deferred ? 'badge' : eventBadgeClass(e.type)">{{ e.completion_deferred ? $t("events.completionDeferred") : eventLabel(e.type) }}</span>
+              <span class="agent-icon" v-html="agentIcon(e.agent)"></span>
+              <span class="agent-name">{{ agentName(e.agent) }}</span>
+              <span v-if="e.project" class="hint">{{ e.project }}</span>
+              <!-- 「子代理」徽标走品牌色：四态色表达「它在干什么」，子代理表达「它属于谁」，
+                   用中性灰会和「工具失败」撞色。历史事件不带血缘（后端历史里没有父会话边），
+                   父子关系在上面「运行中会话」卡片里用 ↳ + ← …尾号 表达 -->
+              <span v-if="e.is_subagent" class="badge subagent">{{ $t("events.subagent") }}</span>
+              <span class="grow"></span>
+              <span class="event-time">{{ formatTime(e.timestamp) }}</span>
+            </div>
+            <div v-if="e.message" class="event-msg" tabindex="0" role="region" :aria-label="$t('events.scrollableBody')">{{ e.message }}</div>
+          </div>
+        </div>
+      </template>
+    </div>
   </div>
 </template>
 
@@ -347,5 +353,4 @@ async function clear() {
   word-break: break-all;
   user-select: text;
 }
-.mb-8 { margin-bottom: 8px; }
 </style>

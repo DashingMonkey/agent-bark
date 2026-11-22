@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
-import { api, type BarkConfig, type Diagnostics } from "../api";
+import { useI18n } from "vue-i18n";
+import { api, type BarkConfig, type Diagnostics, type LanguagePref } from "../api";
 import { toast } from "../toast";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+
+const { t } = useI18n();
 
 const config = ref<BarkConfig | null>(null);
 const diag = ref<Diagnostics | null>(null);
@@ -13,8 +16,31 @@ const autostartError = ref("");
 const loadError = ref("");
 const errorMsg = ref("");
 
-/** 「免打扰时段」标签旁感叹号的悬停提示（使用统一的帮助提示样式） */
-const QUIET_TIP = "未设置，事件全天推送";
+/** 「界面语言」当前偏好（auto/zh/en，跟随 config，不进本页的未保存快照——
+ *  选项一改立即落盘并全窗口生效，与自启动开关同一交互模式） */
+const languagePref = ref<LanguagePref>("auto");
+
+/**
+ * 切换界面语言：立即保存（后端检测到 language 变化会刷新缓存并对**全部窗口**
+ * 广播 bark://locale-changed，本页与悬浮窗/托盘菜单实时换文案，见 src/i18n.ts）。
+ * 保存失败把下拉回滚到原值——显示值必须始终与后端实际生效的偏好一致。
+ */
+async function changeLanguage(pref: LanguagePref) {
+  if (!config.value || pref === languagePref.value) return;
+  const prev = languagePref.value;
+  languagePref.value = pref;
+  try {
+    await api.saveConfig({ language: pref });
+    errorMsg.value = ""; // 成功清空旧报错（失败提示不该一直挂着）
+  } catch (e) {
+    languagePref.value = prev;
+    toast(t("common.saveFailed", { error: String(e) }), "error");
+  }
+}
+
+/** 「免打扰时段」标签旁感叹号的悬停提示（使用统一的帮助提示样式）；
+ *  computed 跟随切语言实时更新 */
+const QUIET_TIP = computed(() => t("settings.quietTip"));
 
 // ---- 未保存提示（本页表单只在「保存」时落盘；页面被 KeepAlive 保活，切页不丢但也不落盘）----
 
@@ -91,14 +117,14 @@ function removeUnrecognized(u: string) {
 function quietValidationError(): string {
   for (const s of quietSegments.value) {
     if (!s.start || !s.end) {
-      return "免打扰时段有未填完整的起止时间，请补全或删除该行";
+      return t("settings.quietIncomplete");
     }
     // 24:00 只在区间终点有定义（与后端 parse_hhmm 口径一致）：起点用 24:00 是无效值
     if (s.start === "24:00") {
-      return `免打扰时段 ${s.start}-${s.end} 的开始时间不能是 24:00（24:00 只能作为结束时间），请修改或删除该行`;
+      return t("settings.quietStart24", { range: `${s.start}-${s.end}` });
     }
     if (s.start === s.end) {
-      return `免打扰时段 ${s.start}-${s.end} 起止相同不会生效，请修改或删除该行`;
+      return t("settings.quietSame", { range: `${s.start}-${s.end}` });
     }
   }
   return "";
@@ -109,9 +135,10 @@ async function load() {
   try {
     config.value = await api.getConfig();
     parseQuietHours(config.value.rules.quiet_hours);
+    languagePref.value = config.value.language;
     savedSnapshot.value = formSnapshot(); // 已落盘基线：之后的差异都算「未保存的修改」
   } catch (e) {
-    loadError.value = `加载配置失败：${e}`;
+    loadError.value = t("common.loadConfigFailed", { error: String(e) });
   }
   // 开机自启动状态单独读取：它失败不能让整个页面变成错误态（config 已就绪时
   // 错误分支本就不可达），只在开关旁给出提示。
@@ -125,7 +152,7 @@ async function loadAutostart() {
   try {
     autostart.value = await isEnabled();
   } catch (e) {
-    autostartError.value = `读取开机自启动状态失败：${e}`;
+    autostartError.value = t("settings.autostartReadFailed", { error: String(e) });
   }
 }
 
@@ -135,7 +162,7 @@ async function loadDiagnostics() {
     diagError.value = "";
   } catch (e) {
     diag.value = null;
-    diagError.value = `诊断信息获取失败：${e}`;
+    diagError.value = t("settings.diagFailed", { error: String(e) });
   }
 }
 
@@ -167,7 +194,7 @@ async function persist(): Promise<boolean> {
     await api.saveConfig({ rules: config.value.rules });
     return true;
   } catch (e) {
-    toast(`保存失败：${e}`, "error");
+    toast(t("common.saveFailed", { error: String(e) }), "error");
     return false;
   }
 }
@@ -188,7 +215,7 @@ function normalizeAggregateWindow(): string {
   cfg.rules.aggregate_window_ms = fixed;
   return fixed === raw
     ? ""
-    : `事件聚合窗口「${raw}」无效（整数、0~600000），已修正为 ${fixed}ms 并按此保存`;
+    : t("settings.aggregateFixed", { raw: String(raw), fixed });
 }
 
 async function save() {
@@ -211,10 +238,25 @@ async function save() {
       // 保存成功清空旧报错；本次校正提示（如果有）接着展示——值已按提示落盘
       errorMsg.value = aggNotice;
       savedSnapshot.value = formSnapshot(); // 已落盘基线跟上，「未保存」提示消失
-      toast("已保存");
+      toast(t("common.saved"));
     }
   } finally {
     saving.value = false;
+  }
+}
+
+/** Token 用量统计开关：即时落盘（与语言下拉同款），失败回滚勾选态。
+ *  不进本页未保存快照——它不是「保存」按钮负责的表单段。 */
+async function toggleTokenMonitor(on: boolean) {
+  if (!config.value) return;
+  const prev = config.value.token_monitor.enabled;
+  config.value.token_monitor.enabled = on;
+  try {
+    await api.saveConfig({ token_monitor: { enabled: on } });
+    errorMsg.value = "";
+  } catch (e) {
+    config.value.token_monitor.enabled = prev;
+    toast(t("common.saveFailed", { error: String(e) }), "error");
   }
 }
 
@@ -227,7 +269,7 @@ async function toggleAutostart(on: boolean) {
     }
     errorMsg.value = ""; // 设置成功清空旧报错（失败提示不该一直挂着）
   } catch (e) {
-    errorMsg.value = `开机自启动设置失败：${e}`;
+    errorMsg.value = t("settings.autostartFailed", { error: String(e) });
   }
   // 无论成败都回读真实状态，避免勾选态与实际自启动状态相反
   await loadAutostart();
@@ -262,121 +304,150 @@ onUnmounted(stopDiagTimer);
 
 <template>
   <div v-if="config">
-    <div class="between mb-14">
-      <h1 class="page-title">设置</h1>
-      <div class="row">
-        <button :disabled="saving" @click="save">保存</button>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("settings.title") }}</h1></div>
+      <div class="page-actions">
+        <button :disabled="saving" @click="save">{{ $t("common.save") }}</button>
       </div>
     </div>
-    <!-- 未保存提示：表单只在「保存」时落盘（切页不丢——页面被 KeepAlive 保活），给个明示 -->
-    <div v-if="dirty" class="warn-box mb-14">有未保存的修改：点右上角「保存」写入配置（切页不会丢失）</div>
-    <div v-if="errorMsg" class="warn-box mb-14">{{ errorMsg }}</div>
+    <div class="stack">
+      <!-- 未保存提示：表单只在「保存」时落盘（切页不丢——页面被 KeepAlive 保活），给个明示 -->
+      <div v-if="dirty" class="warn-box">{{ $t("common.unsavedChanges") }}</div>
+      <div v-if="errorMsg" class="warn-box">{{ errorMsg }}</div>
 
-    <!-- 开关类设置：左标题 + 一行说明、右开关，行间发丝线分隔（VS Code / Codex 设置页的排法） -->
-    <div class="card">
-      <div class="setting-row">
-        <div class="setting-text">
-          <span class="setting-label">开机自启动</span>
-        </div>
-        <label class="switch">
-          <input type="checkbox" :checked="autostart" @change="toggleAutostart(($event.target as HTMLInputElement).checked)" />
-          <span class="track"></span>
-        </label>
-      </div>
-      <div v-if="autostartError" class="warn-box mt-10 mb-10">
-        <div class="row">
-          <span class="grow">{{ autostartError }}</span>
-          <button class="ghost" @click="loadAutostart">重试</button>
-        </div>
-      </div>
-      <!-- 悬浮窗的启用开关已移入侧边栏「悬浮窗」页 -->
-    </div>
-
-    <div class="card">
-      <span class="agent-name">通知规则</span>
-      <div class="mt-14 col">
-        <div class="row">
-          <span class="hint field-label">事件聚合窗口</span>
-          <div class="input-group input-narrow">
-            <input type="number" v-model.number="config.rules.aggregate_window_ms" min="0" max="600000" step="100" />
-            <span class="input-unit">ms</span>
+      <!-- 开关类设置：左标题 + 一行说明、右开关，行间发丝线分隔（VS Code / Codex 设置页的排法） -->
+      <div class="card">
+        <div class="setting-row">
+          <div class="setting-text">
+            <span class="setting-label">{{ $t("settings.language") }}</span>
           </div>
-          <span class="hint">同 agent 同类事件在窗口内合并为一条</span>
+          <!-- 与悬浮窗/托盘菜单同款可定制下拉（NotifyPage 的显示器选择同款排法）。
+               语言名按惯例用各自母语书写（中文菜单里也显示 English）；
+               auto 档标签随界面语言（跟随系统 / Follow System） -->
+          <select :value="languagePref" @change="changeLanguage(($event.target as HTMLSelectElement).value as LanguagePref)">
+            <button><selectedcontent></selectedcontent></button>
+            <option value="auto">{{ $t("settings.languageAuto") }}</option>
+            <option value="zh">{{ $t("settings.languageZh") }}</option>
+            <option value="en">{{ $t("settings.languageEn") }}</option>
+          </select>
         </div>
-        <!-- 免打扰时段：一行一段，两个原生时间选择器各带自己的描边与焦点环，
-             中间是「起 → 止」箭头，删除用图标按钮、添加用虚线框（VS Code 列表行的做法）。
-             标签按右侧首行控件的中线对齐（.row.top），不再对着整段列表居中 -->
-        <div class="row top">
-          <span class="hint field-label label-line">
-            <span class="label-text">免打扰时段</span>
-            <!-- 口径说明收进悬停提示：感叹号样式与 Agents 接入页的「接入说明」同一套 -->
-            <span v-tooltip="QUIET_TIP" class="help-mark" role="img" :aria-label="QUIET_TIP">
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <circle cx="8" cy="8" r="6.1" />
-                <path d="M8 4.9v4" />
-                <circle class="dot" cx="8" cy="11.1" r="0.9" />
-              </svg>
+        <div class="setting-row">
+          <div class="setting-text">
+            <span class="setting-label">{{ $t("settings.autostart") }}</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" :checked="autostart" @change="toggleAutostart(($event.target as HTMLInputElement).checked)" />
+            <span class="track"></span>
+          </label>
+        </div>
+        <div v-if="autostartError" class="warn-box mt-10 mb-10">
+          <div class="row">
+            <span class="grow">{{ autostartError }}</span>
+            <button class="ghost" @click="loadAutostart">{{ $t("common.retry") }}</button>
+          </div>
+        </div>
+        <!-- 悬浮窗的启用开关已移入侧边栏「悬浮窗」页 -->
+        <div class="setting-row">
+          <div class="setting-text">
+            <span class="setting-label">{{ $t("settings.tokenMonitor") }}</span>
+          </div>
+          <label class="switch">
+            <input
+              type="checkbox"
+              :checked="config.token_monitor.enabled"
+              @change="toggleTokenMonitor(($event.target as HTMLInputElement).checked)"
+            />
+            <span class="track"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">{{ $t("settings.rulesTitle") }}</span></div>
+        <div class="form-rows">
+          <div class="row">
+            <span class="hint field-label">{{ $t("settings.aggregateWindow") }}</span>
+            <div class="input-group input-narrow">
+              <input type="number" v-model.number="config.rules.aggregate_window_ms" min="0" max="600000" step="100" />
+              <span class="input-unit">ms</span>
+            </div>
+            <span class="hint">{{ $t("settings.aggregateHint") }}</span>
+          </div>
+          <!-- 免打扰时段：一行一段，两个原生时间选择器各带自己的描边与焦点环，
+               中间是「起 → 止」箭头，删除用图标按钮、添加用虚线框（VS Code 列表行的做法）。
+               标签按右侧首行控件的中线对齐（.row.top），不再对着整段列表居中 -->
+          <div class="row top">
+            <span class="hint field-label label-line">
+              <span class="label-text">{{ $t("settings.quietHours") }}</span>
+              <!-- 口径说明收进悬停提示：感叹号样式与 Agents 接入页的「接入说明」同一套 -->
+              <span v-tooltip="QUIET_TIP" class="help-mark" role="img" :aria-label="QUIET_TIP">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <circle cx="8" cy="8" r="6.1" />
+                  <path d="M8 4.9v4" />
+                  <circle class="dot" cx="8" cy="11.1" r="0.9" />
+                </svg>
+              </span>
             </span>
-          </span>
-          <div class="col grow">
-            <div v-if="quietSegments.length || quietUnrecognized.length" class="quiet-list">
-              <div v-for="(seg, i) in quietSegments" :key="seg.id" class="quiet-item">
-                <input type="time" v-model="seg.start" />
-                <svg class="quiet-arrow" viewBox="0 0 16 16"><path d="M2.5 8h10M9.5 4.5L13 8l-3.5 3.5" /></svg>
-                <input type="time" v-model="seg.end" />
-                <!-- 24:00 只在区间终点有定义（与后端 parse_hhmm 口径一致），起点用 24:00 报错 -->
-                <span v-if="seg.start === '24:00'" class="quiet-warn">24:00 只能作为结束时间</span>
-                <span v-else-if="seg.start && seg.end && seg.start === seg.end" class="quiet-warn">起止相同不会生效</span>
-                <button class="icon-btn danger" title="删除该时段" @click="removeQuietSegment(i)">
-                  <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
-                </button>
+            <div class="col grow">
+              <div v-if="quietSegments.length || quietUnrecognized.length" class="quiet-list">
+                <div v-for="(seg, i) in quietSegments" :key="seg.id" class="quiet-item">
+                  <input type="time" v-model="seg.start" />
+                  <svg class="quiet-arrow" viewBox="0 0 16 16"><path d="M2.5 8h10M9.5 4.5L13 8l-3.5 3.5" /></svg>
+                  <input type="time" v-model="seg.end" />
+                  <!-- 24:00 只在区间终点有定义（与后端 parse_hhmm 口径一致），起点用 24:00 报错 -->
+                  <span v-if="seg.start === '24:00'" class="quiet-warn">{{ $t("settings.onlyEnd24") }}</span>
+                  <span v-else-if="seg.start && seg.end && seg.start === seg.end" class="quiet-warn">{{ $t("settings.sameNoEffect") }}</span>
+                  <button class="icon-btn danger" :title="$t('settings.deleteSegment')" @click="removeQuietSegment(i)">
+                    <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
+                  </button>
+                </div>
+                <div v-for="u in quietUnrecognized" :key="u" class="quiet-item legacy">
+                  <span class="hint">{{ $t("settings.unrecognized", { value: u }) }}</span>
+                  <button class="icon-btn danger" :title="$t('common.delete')" @click="removeUnrecognized(u)">
+                    <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
+                  </button>
+                </div>
               </div>
-              <div v-for="u in quietUnrecognized" :key="u" class="quiet-item legacy">
-                <span class="hint">无法识别的时段「{{ u }}」· 按原样保留</span>
-                <button class="icon-btn danger" title="删除" @click="removeUnrecognized(u)">
-                  <svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
-                </button>
+              <div class="row">
+                <button class="quiet-add" @click="addQuietSegment">{{ $t("settings.addSegment") }}</button>
               </div>
+              <span class="hint">{{ $t("settings.quietHint") }}</span>
             </div>
-            <div class="row">
-              <button class="quiet-add" @click="addQuietSegment">＋ 添加时段</button>
-            </div>
-            <span class="hint">免打扰期间事件照常记录，但不推送通知、也不响状态音效；跨零点直接把开始设得比结束晚（如 22:00-08:00）。</span>
           </div>
         </div>
       </div>
-    </div>
 
-    <div class="card">
-      <span class="agent-name">服务信息</span>
-      <div v-if="diag?.server_error" class="warn-box mb-12">
-        事件服务器启动失败：{{ diag.server_error }}（端口可能被占用，实时事件与 hook 上报将不可用）
-      </div>
-      <div v-if="diag?.restart_required" class="warn-box mb-12">
-        端口或鉴权 token 已修改，但运行中的事件服务器仍使用启动时的值——重启 agent-bark 后生效
-      </div>
-      <div v-if="diagError" class="hint mt-8">{{ diagError }}</div>
-      <div class="mt-10 col">
-        <div class="row">
-          <span class="hint field-label">本地事件端口</span>
-          <span class="code-chip">127.0.0.1:{{ config.server.port }}/event</span>
+      <div class="card">
+        <div class="card-head"><span class="card-title">{{ $t("settings.serverTitle") }}</span></div>
+        <div class="form-rows">
+          <div v-if="diag?.server_error" class="warn-box">
+            {{ $t("settings.serverError", { error: diag.server_error }) }}
+          </div>
+          <div v-if="diag?.restart_required" class="warn-box">
+            {{ $t("settings.restartRequired") }}
+          </div>
+          <div v-if="diagError" class="hint">{{ diagError }}</div>
+          <div class="row">
+            <span class="hint field-label">{{ $t("settings.localPort") }}</span>
+            <span class="code-chip">127.0.0.1:{{ config.server.port }}/event</span>
+          </div>
+          <div class="row">
+            <span class="hint field-label">{{ $t("settings.authToken") }}</span>
+            <span class="code-chip">{{ config.server.token.slice(0, 6) }}…</span>
+            <span class="hint">{{ $t("settings.tokenHint") }}</span>
+          </div>
+          <span class="hint">{{ $t("settings.hookHint") }}</span>
+          <span class="hint">{{ $t("settings.restartHint") }}</span>
         </div>
-        <div class="row">
-          <span class="hint field-label">鉴权 token</span>
-          <span class="code-chip">{{ config.server.token.slice(0, 6) }}…</span>
-          <span class="hint">存储于应用配置目录下的 config.json</span>
-        </div>
-        <span class="hint">hook 子命令从配置文件读取端口与 token，token 不会写入各 agent 的配置</span>
-        <span class="hint">端口与鉴权 token 修改需重启生效（运行中的服务器保留启动时的值）</span>
       </div>
     </div>
   </div>
 
   <div v-else-if="loadError" class="empty">
     {{ loadError }}
-    <div class="mt-12"><button class="ghost" @click="load">重试</button></div>
+    <div class="mt-12"><button class="ghost" @click="load">{{ $t("common.retry") }}</button></div>
   </div>
-  <div v-else class="empty">加载配置中…</div>
+  <div v-else class="empty">{{ $t("common.loadingConfig") }}</div>
 </template>
 
 <style scoped>
@@ -428,19 +499,20 @@ onUnmounted(stopDiagTimer);
 .quiet-warn { font-size: 12px; color: var(--warn); margin: 0 6px; white-space: nowrap; }
 
 /* 图标按钮：裸图标 + 悬停浅底；删除类悬停变红（对齐标题栏关闭钮的做法）。
+   几何收进全局控件规格（30px 定高，与同排时间框对齐）。
    border 必须显式清掉：`.danger` 在全局是「描边按钮」，不覆盖就会给图标按钮
    套一圈红框（旧版就是这样，一排红框比图标还显眼） */
 .icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: var(--control-h);
+  height: var(--control-h);
   flex-shrink: 0;
   padding: 0;
   background: transparent;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--control-radius);
   color: var(--muted);
 }
 .icon-btn svg {
@@ -462,7 +534,7 @@ onUnmounted(stopDiagTimer);
 .quiet-add {
   display: inline-flex;
   align-items: center;
-  height: 28px;
+  height: var(--control-h);
   padding: 0 11px;
   background: transparent;
   border: 1px dashed var(--field-border);

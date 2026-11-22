@@ -13,6 +13,26 @@ function compile(source) {
 const timeModule = {};
 runInNewContext(compile(readFileSync(new URL("../src/session-time.ts", import.meta.url), "utf8")), { exports: timeModule });
 
+// EventsPage 直载时的 ../i18n 替身：按当前 zh 词表做最简插值（断言里的中文文案
+// 直接跟着词表走，词表改动若影响文案会在这里暴露）
+const zhMessages = JSON.parse(readFileSync(new URL("../src/locales/zh-CN.json", import.meta.url), "utf8"));
+const zhT = (key, params) => {
+  const text = key.split(".").reduce((node, part) => (node == null ? undefined : node[part]), zhMessages);
+  return typeof text === "string" ? text.replace(/\{(\w+)\}/g, (_, name) => String(params?.[name] ?? "")) : key;
+};
+
+test("durationUnits maps locales to unit suffixes and formatDuration accepts them", () => {
+  // VM 沙箱里的对象原型来自另一个 realm，先摊平成本 realm 的对象再比较
+  const unitsOf = (locale) => ({ ...timeModule.durationUnits(locale) });
+  assert.deepEqual(unitsOf("zh"), { hour: "小时", minute: "分", second: "秒" });
+  assert.deepEqual(unitsOf("en"), { hour: "h", minute: "m", second: "s" });
+  // 未知语言按中文兜底
+  assert.deepEqual(unitsOf("fr"), { hour: "小时", minute: "分", second: "秒" });
+  assert.equal(timeModule.formatDuration(100000, 100000 + 59999, timeModule.durationUnits("en")), "59s");
+  assert.equal(timeModule.formatDuration(100000, 100000 + 60000, timeModule.durationUnits("en")), "1m00s");
+  assert.equal(timeModule.formatDuration(100000, 100000 + 3601000, timeModule.durationUnits("en")), "1h00m01s");
+});
+
 test("duration keeps seconds across minute/hour boundaries and clamps clock rollback", () => {
   for (const [elapsed, expected] of [[-1000, "0秒"], [59999, "59秒"], [60000, "1分00秒"],
     [3599000, "59分59秒"], [3600000, "1小时00分00秒"], [3601000, "1小时00分01秒"]]) {
@@ -45,6 +65,7 @@ function eventsPage() {
       sessionRows: (sessions) => sessions,
     },
     "../session-time": timeModule,
+    "../i18n": { t: zhT, locale: () => "zh" },
   };
   const source = readFileSync(new URL("../src/pages/EventsPage.vue", import.meta.url), "utf8")
     .match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1];

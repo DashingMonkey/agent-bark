@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::i18n::LanguagePref;
+
 /// agent-bark 全局配置。
 /// 实际路径见 [`BarkConfig::path`]：平台配置目录下的 `agent-bark/config.json`
 /// （Windows: `%APPDATA%\agent-bark\config.json`）。
@@ -19,6 +21,26 @@ pub struct BarkConfig {
     pub glow: GlowConfig,
     /// 桌面悬浮窗（当前活动会话的小卡片）
     pub widget: WidgetConfig,
+    /// 界面语言（auto=跟随系统 / zh / en；解析逻辑见 crate::i18n）。
+    /// 放 config.json 而非 localStorage：Rust 侧（推送标题、错误提示）在窗口
+    /// 创建之前就要知道语言，config 是 Rust 唯一能读的存储。
+    pub language: LanguagePref,
+    /// Token 用量统计（本地采集 + 按日聚合）；关闭即停采集并隐藏菜单
+    pub token_monitor: TokenMonitorConfig,
+}
+
+/// Token 用量统计开关。默认启用：旧配置文件没有该字段，serde(default) 走
+/// Default，老用户升级后自动开启，无需迁移。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenMonitorConfig {
+    pub enabled: bool,
+}
+
+impl Default for TokenMonitorConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,19 +62,15 @@ impl Default for ServerConfig {
 }
 
 /// 单个状态的音效设置（「通知」页「声音」区的一行）
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StateSound {
-    /// 音效 id（见 bark-channels 的 `SOUND_EFFECTS`）；空串 = 该状态不响
+    /// 音效 id（见 bark-channels 的 `SOUND_EFFECTS`，或 "custom" = 自定义音频文件）；
+    /// 空串 = 该状态不响
     pub effect: String,
-    /// 播放次数（播放时夹到 1~10）
-    pub plays: u32,
-}
-
-impl Default for StateSound {
-    fn default() -> Self {
-        Self { effect: String::new(), plays: 1 }
-    }
+    /// 自定义音效的文件路径（仅 effect = "custom" 时有意义）；空串 = 未选文件。
+    /// 旧配置的 plays 键已下线：serde 忽略未知字段，老文件加载不报错、下次保存自然消失
+    pub custom_path: String,
 }
 
 /// 通知设置。
@@ -66,6 +84,17 @@ impl Default for StateSound {
 pub struct NotifyConfig {
     /// 总开关。默认开：音效本来就是逐状态自愿配置的，再默认关等于双重关闭
     pub enabled: bool,
+    /// 提示音音量（0~100，默认 100）。
+    ///
+    /// 用整数而不是 f32：本结构派生了 `Eq`（配置整体比较用于「是否有未保存修改」），
+    /// 浮点进不来；百分比也正好是 UI 滑杆的量纲。独立于系统音量——想听清提示音时
+    /// 不必把整个系统的音量一起压下去。
+    pub volume: u8,
+    /// 同状态连续提示的合并窗口（毫秒，0 = 不合并，默认 250）。
+    ///
+    /// 多会话并行时，一个回合的终态可能被两条通道各报一次，或几个会话几乎同时
+    /// 结束——窗口内只响第一声，避免叠成一片「糊」。想听出「完成了几次」可以设 0。
+    pub throttle_ms: u32,
     /// 思考（新回合开始 / agent 干活中）
     pub thinking: StateSound,
     /// 等待（等待确认 / 等待输入）
@@ -80,6 +109,8 @@ impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            volume: 100,
+            throttle_ms: 250,
             thinking: StateSound::default(),
             waiting: StateSound::default(),
             completed: StateSound::default(),
@@ -197,11 +228,14 @@ pub struct WidgetConfig {
     pub dock_side: Option<WidgetDockSide>,
     /// 停靠显示器名称，消除混合 DPI 下逻辑坐标区间重叠的歧义。
     pub dock_monitor: Option<String>,
+    /// 行悬停详情面板开关（默认开启）。关闭后鼠标移到会话行上不弹详情；
+    /// 悬浮窗右键菜单里切换。详情独立成窗，与卡片几何解耦。
+    pub detail_tip: bool,
 }
 
 impl Default for WidgetConfig {
     fn default() -> Self {
-        Self { enabled: true, x: -1.0, y: -1.0, pinned: false, dock_side: None, dock_monitor: None }
+        Self { enabled: true, x: -1.0, y: -1.0, pinned: false, dock_side: None, dock_monitor: None, detail_tip: true }
     }
 }
 
@@ -726,7 +760,7 @@ mod tests {
     fn config_json_roundtrip() {
         let mut cfg = BarkConfig::default();
         cfg.set_agent_enabled("claude-code", true);
-        cfg.notify.completed = StateSound { effect: "ding".into(), plays: 2 };
+        cfg.notify.completed = StateSound { effect: "custom".into(), custom_path: r"C:\sounds\ding.mp3".into() };
         cfg.channels.bark = Some(BarkChannelConfig {
             enabled: true,
             url: "https://api.day.app/key".into(),
@@ -739,8 +773,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let loaded: BarkConfig = serde_json::from_str(&text).unwrap();
         assert!(loaded.agent_enabled("claude-code"));
-        assert_eq!(loaded.notify.completed.effect, "ding");
-        assert_eq!(loaded.notify.completed.plays, 2);
+        assert_eq!(loaded.notify.completed.effect, "custom");
+        assert_eq!(loaded.notify.completed.custom_path, r"C:\sounds\ding.mp3");
         // 未配置的状态默认不响
         assert_eq!(loaded.notify.thinking, StateSound::default());
         assert!(loaded.notify.thinking.effect.is_empty());
@@ -827,7 +861,12 @@ system = false
         )
         .unwrap();
         assert!(cfg.notify.enabled);
-        assert_eq!(cfg.notify.completed, StateSound { effect: "ding".into(), plays: 2 });
+        // 旧配置的 plays 键被忽略（字段已下线），其余照常解析
+        assert_eq!(cfg.notify.completed, StateSound { effect: "ding".into(), custom_path: String::new() });
+        // 本轮新增的两个字段在老配置里不存在，必须落到「满音量 + 250ms 合并」
+        // 而不是 0（0 会被理解成静音/每次都响，等于把老用户的音效偷走或变吵）
+        assert_eq!(cfg.notify.volume, 100, "老配置缺 volume 时不能变成静音");
+        assert_eq!(cfg.notify.throttle_ms, 250, "老配置缺 throttle_ms 时取默认合并窗");
         assert!(BarkConfig::default().notify.enabled);
     }
 
@@ -1175,5 +1214,21 @@ system = false
         assert_eq!(cfg.rules.aggregate_window_ms, MAX_AGGREGATE_WINDOW_MS);
         let cfg = BarkConfig::parse_and_validate(r#"{"rules":{"aggregate_window_ms":1500},"server":{"token":"t"}}"#).unwrap();
         assert_eq!(cfg.rules.aggregate_window_ms, 1500);
+    }
+
+    #[test]
+    fn language_defaults_to_auto_and_roundtrips() {
+        // 老配置没有 language 键：serde default 必须补 auto（跟随系统），
+        // 不能让升级用户的界面语言解析失败
+        let cfg: BarkConfig = serde_json::from_str(r#"{"server":{"token":"t"}}"#).unwrap();
+        assert_eq!(cfg.language, LanguagePref::Auto);
+        // 三个档位能存能读
+        for pref in ["auto", "zh", "en"] {
+            let cfg = BarkConfig::parse_and_validate(&format!(r#"{{"server":{{"token":"t"}},"language":"{pref}"}}"#)).unwrap();
+            let restored = serde_json::to_value(&cfg).unwrap();
+            assert_eq!(restored["language"], pref);
+        }
+        // 未知值照 ServerConfig 等键的口径走 typed 解析报错，不静默回 auto
+        assert!(BarkConfig::parse_and_validate(r#"{"server":{"token":"t"},"language":"jp"}"#).is_err());
     }
 }

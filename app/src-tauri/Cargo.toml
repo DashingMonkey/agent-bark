@@ -24,12 +24,15 @@ bark-cli = { workspace = true }
 bark-server = { workspace = true }
 bark-adapters = { workspace = true }
 bark-channels = { workspace = true }
-tauri = { workspace = true }
+# macOS 上 transparent() 需要 macos-private-api（光效/悬浮窗/托盘菜单的透明窗口都依赖它）
+tauri = { workspace = true, features = ["macos-private-api"] }
 tauri-plugin-autostart = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
+zstd = { workspace = true }
+dirs = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -39,3 +42,13 @@ reqwest = { workspace = true }
 # 最小订阅者：仅 fmt + std（不启用 ansi/env-filter，避免额外依赖）。
 # 没有订阅者时 tracing::warn! 是空操作，用户看不到任何告警。
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+rfd = "0.18.0"
+
+# macOS 拖动重建事件用（与 tao 同版本，锁文件已含，无新增编译成本）
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+# 悬浮窗/流光转 NSPanel：普通 NSWindow 在 macOS Sonoma+ 的「点壁纸显示桌面」/
+# 调度中心显示桌面时会被系统推走，NSPanel（utility/auxiliary 类窗口）不受影响
+tauri-nspanel = "2.1.1"

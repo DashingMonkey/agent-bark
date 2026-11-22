@@ -362,15 +362,20 @@ impl WatchAdapter for DoubaoWorkWatch {
         !sessions_roots().is_empty()
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
         if self.is_available() {
             return None;
         }
-        Some(
+        let (zh, en) = (
             "未找到豆包工作的会话目录（User Data/<profile>/.doubaowork/.../.sessions）。\
-             可能未安装豆包工作，或装了但从未使用过 Agent 模式"
-                .into(),
-        )
+             可能未安装豆包工作，或装了但从未使用过 Agent 模式",
+            "Doubao Work session directory not found (User Data/<profile>/.doubaowork/.../.sessions). \
+             Doubao Work may not be installed, or is installed but Agent mode has never been used",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh.into(),
+            bark_core::Lang::En => en.into(),
+        })
     }
 
     fn spawn(
@@ -1662,7 +1667,7 @@ mod tests {
             "installed={} available={} reason={:?}",
             watch.is_installed(),
             watch.is_available(),
-            watch.unavailable_reason()
+            watch.unavailable_reason(bark_core::Lang::Zh)
         );
         let (tx, mut rx) = mpsc::channel(64);
         let stop = Arc::new(AtomicBool::new(false));

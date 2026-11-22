@@ -298,7 +298,8 @@ impl HookAdapter for KimiCodeAdapter {
         }
     }
 
-    fn trust_hint(&self) -> Option<&'static str> {
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let _ = lang;
         None
     }
 }
@@ -320,6 +321,7 @@ mod tests {
             exe_path: r"C:\Program Files\AgentBark\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         }
     }
 
@@ -381,7 +383,7 @@ api_key = "sk-test"
         let adapter = KimiCodeAdapter::with_config(cfg.clone());
         adapter.register(&ctx()).unwrap();
 
-        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into() };
+        let moved = RegisterCtx { exe_path: r"D:\new\AgentBark.exe".into(), port: 1, token: "t".into(), lang: bark_core::Lang::Zh };
         assert!(matches!(adapter.verify(&moved), VerifyReport::StalePath { .. }));
         adapter.register(&moved).unwrap();
         assert!(matches!(adapter.verify(&moved), VerifyReport::Ok));

@@ -15,8 +15,11 @@
 //! 是因为主窗口 CSP 的 `connect-src 'self'` 不允许页面直连外网。
 
 use serde::Serialize;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+
+use crate::commands::tr;
+use crate::state::AppState;
 
 /// 仓库坐标：`owner/name`。Gitee 与 GitHub 的 owner/repo 都不区分大小写，两边共用一个 slug。
 /// 主源是 Gitee（国内可达性最好、海外也能访问），GitHub 为备源，两边同 tag 发版。
@@ -96,34 +99,36 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// 「关于」页「检查更新」：问两个源要最新版本，返回最终结论。
 #[tauri::command]
-pub async fn check_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+pub async fn check_update(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<UpdateInfo, String> {
     // package_info 在主线程/运行时线程都能读，先取出来再进阻塞线程
     let current = app.package_info().version.to_string();
-    tokio::task::spawn_blocking(move || check(&current))
+    let lang = state.lang();
+    tokio::task::spawn_blocking(move || check(&current, lang))
         .await
         .map_err(|e| e.to_string())?
 }
 
 /// 「关于」页「下载新版本」：用系统默认浏览器打开上次应答源的发布页。
 #[tauri::command]
-pub fn open_release_page() -> Result<(), String> {
-    let url = lock(last_page())
-        .clone()
-        .ok_or_else(|| "还没有可打开的发布页，请先检查更新".to_string())?;
-    open_url(&url).map_err(|e| format!("打开发布页失败: {e}"))
+pub fn open_release_page(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let lang = state.lang();
+    let url = lock(last_page()).clone().ok_or_else(|| {
+        tr(lang, "还没有可打开的发布页，请先检查更新", "No release page to open yet — check for updates first")
+    })?;
+    open_url(&url).map_err(|e| tr(lang, format!("打开发布页失败: {e}"), format!("Failed to open release page: {e}")))
 }
 
 /// 双源检查（阻塞，调用方在后台线程执行）。
 ///
 /// 内部再开两个线程并行请求：最坏耗时 = 单源超时而不是两倍；一边卡住不影响另一边。
-fn check(current: &str) -> Result<UpdateInfo, String> {
+fn check(current: &str, lang: bark_core::Lang) -> Result<UpdateInfo, String> {
     let slug = repo();
     let (gitee_api, gitee_page) = gitee_urls(&slug);
     let (github_api, github_page) = github_urls(&slug);
     let (gitee, github) = std::thread::scope(|s| {
-        let g = s.spawn(|| fetch(&gitee_api, &gitee_page, "gitee", current));
-        let h = s.spawn(|| fetch(&github_api, &github_page, "github", current));
-        (join(g), join(h))
+        let g = s.spawn(|| fetch(&gitee_api, &gitee_page, "gitee", current, lang));
+        let h = s.spawn(|| fetch(&github_api, &github_page, "github", current, lang));
+        (join(g, lang), join(h, lang))
     });
     let info = match (gitee, github) {
         // 两边都成功：以主源为准（同 tag 发版，正常情况下两边版本号一致）
@@ -138,37 +143,40 @@ fn check(current: &str) -> Result<UpdateInfo, String> {
 }
 
 /// 收线程结果：子线程 panic 也算该源失败，不把异常升级到命令层
-fn join(handle: std::thread::ScopedJoinHandle<'_, Result<UpdateInfo, String>>) -> Result<UpdateInfo, String> {
-    handle.join().unwrap_or_else(|_| Err("检查线程异常退出".into()))
+fn join(handle: std::thread::ScopedJoinHandle<'_, Result<UpdateInfo, String>>, lang: bark_core::Lang) -> Result<UpdateInfo, String> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err(tr(lang, "检查线程异常退出", "Update check thread terminated unexpectedly")))
 }
 
 /// 单源检查：请求 `releases/latest` 并解析 `tag_name`。
 ///
 /// 404（仓库没发过版本）/ 网络失败 / 解析失败一律按「该源失败」抛出，由 check 决定静默与否。
-fn fetch(api: &str, page: &str, source: &str, current: &str) -> Result<UpdateInfo, String> {
+fn fetch(api: &str, page: &str, source: &str, current: &str, lang: bark_core::Lang) -> Result<UpdateInfo, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(TIMEOUT)
         // GitHub 强制要求 User-Agent（缺了直接 403），Gitee 一并带上便于排查
         .user_agent(format!("agent-bark/{current}"))
         .build()
-        .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
+        .map_err(|e| tr(lang, format!("HTTP 客户端初始化失败: {e}"), format!("Failed to initialize HTTP client: {e}")))?;
 
     let resp = client
         .get(api)
         .header("Accept", "application/json")
         .send()
-        .map_err(|e| format!("网络请求失败: {e}"))?;
+        .map_err(|e| tr(lang, format!("网络请求失败: {e}"), format!("Network request failed: {e}")))?;
     let status = resp.status();
     // 先取正文再判状态：限流的具体原因（rate limit）在 body 里，不在状态码上
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(http_error(status.as_u16(), &body));
+        return Err(http_error(status.as_u16(), &body, lang));
     }
 
-    let root: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| "接口响应解析失败".to_string())?;
+    let root: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| tr(lang, "接口响应解析失败", "Failed to parse the API response"))?;
     let tag = root.get("tag_name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let remote = parse_ver(&tag).ok_or_else(|| format!("远端版本号无法解析：{tag}"))?;
+    let remote = parse_ver(&tag)
+        .ok_or_else(|| tr(lang, format!("远端版本号无法解析：{tag}"), format!("Failed to parse remote version: {tag}")))?;
     // 本地版本理论上一定解析得出来；真解析不出来时不敢说「有新版本」，按最新处理
     let newer = parse_ver(current).is_some_and(|local| compare_ver(&remote, &local).is_gt());
 
@@ -185,16 +193,21 @@ fn fetch(api: &str, page: &str, source: &str, current: &str) -> Result<UpdateInf
 ///
 /// 限流（GitHub 403 / Gitee 429，两平台匿名配额均为每小时 60 次）说成「凭证失效」会误导；
 /// 404 在这个接口上是「仓库还没发过版本」，而不是地址写错了。
-fn http_error(status: u16, body: &str) -> String {
+/// 文案直接展示给 UI，按界面语言取词。
+fn http_error(status: u16, body: &str, lang: bark_core::Lang) -> String {
     let lower = body.to_lowercase();
     if lower.contains("rate limit") || lower.contains("请求过于频繁") {
-        return "请求过于频繁，请稍后再试".into();
+        return tr(lang, "请求过于频繁，请稍后再试", "Too many requests; try again later");
     }
     match status {
-        401 | 403 => "接口拒绝访问（可能是请求过于频繁，请稍后再试）".into(),
-        404 => "仓库尚未发布任何版本".into(),
-        429 => "请求过于频繁，请稍后再试".into(),
-        s => format!("接口返回 HTTP {s}"),
+        401 | 403 => tr(
+            lang,
+            "接口拒绝访问（可能是请求过于频繁，请稍后再试）",
+            "Access denied by the API (possibly rate limited; try again later)",
+        ),
+        404 => tr(lang, "仓库尚未发布任何版本", "The repository has not published any releases yet"),
+        429 => tr(lang, "请求过于频繁，请稍后再试", "Too many requests; try again later"),
+        s => tr(lang, format!("接口返回 HTTP {s}"), format!("API returned HTTP {s}")),
     }
 }
 
@@ -261,6 +274,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bark_core::Lang;
     use std::cmp::Ordering;
 
     #[test]
@@ -295,10 +309,17 @@ mod tests {
 
     #[test]
     fn http_error_翻译限流与未发版() {
-        assert_eq!(http_error(404, "{}"), "仓库尚未发布任何版本");
-        assert_eq!(http_error(429, ""), "请求过于频繁，请稍后再试");
-        assert_eq!(http_error(403, "API rate limit exceeded"), "请求过于频繁，请稍后再试");
-        assert!(http_error(500, "").contains("500"));
+        // 中文界面：原文照搬
+        assert_eq!(http_error(404, "{}", Lang::Zh), "仓库尚未发布任何版本");
+        assert_eq!(http_error(429, "", Lang::Zh), "请求过于频繁，请稍后再试");
+        assert_eq!(http_error(403, "API rate limit exceeded", Lang::Zh), "请求过于频繁，请稍后再试");
+        assert!(http_error(500, "", Lang::Zh).contains("500"));
+        // 英文界面：对应文案（限流按 body 关键词识别，两平台同文案）
+        assert_eq!(http_error(404, "{}", Lang::En), "The repository has not published any releases yet");
+        assert_eq!(http_error(429, "", Lang::En), "Too many requests; try again later");
+        assert_eq!(http_error(403, "API rate limit exceeded", Lang::En), "Too many requests; try again later");
+        assert_eq!(http_error(403, "forbidden", Lang::En), "Access denied by the API (possibly rate limited; try again later)");
+        assert!(http_error(500, "", Lang::En).contains("500"));
     }
 
     #[test]

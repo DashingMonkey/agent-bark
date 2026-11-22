@@ -21,13 +21,17 @@
 {
   "server": { "port": 36573, "token": "首次启动自动生成" },
   // 状态音效：每个状态可选一个内置音效，effect 为空 = 不响（默认）。
-  // 可选：chime 风铃 / confirm 确认 / success 成功 / drop 水滴 /
-  //       pluck 弹拨 / glass 玻璃 / error 错误 / deep 低叮
+  // 内置可选：confirm 确认 / success 成功 / drop 水滴 / pluck 弹拨 /
+  //           glass 玻璃 / error 错误 / deep 低叮
+  // 也可用自选音频文件：effect 写 "custom"，文件绝对路径写进 custom_path
   "notify": {
-    "thinking":   { "effect": "", "plays": 1 },   // 思考（新回合开始）
-    "waiting":    { "effect": "", "plays": 1 },   // 等待（等待确认 / 等待输入）
-    "completed":  { "effect": "", "plays": 1 },   // 完成
-    "failed":     { "effect": "", "plays": 1 }    // 失败（明确的任务失败信号）
+    "enabled": true,        // 声音总开关
+    "volume": 100,          // 提示音音量 0~100（与系统音量相乘，不动系统音量）
+    "throttle_ms": 250,     // 同状态连续提示的合并窗口；0 = 每次都响
+    "thinking":   { "effect": "", "custom_path": "" },   // 思考（新回合开始）
+    "waiting":    { "effect": "", "custom_path": "" },   // 等待（等待确认 / 等待输入）
+    "completed":  { "effect": "", "custom_path": "" },   // 完成
+    "failed":     { "effect": "", "custom_path": "" }    // 失败（明确的任务失败信号）
   },
   "rules": {
     "aggregate_window_ms": 1500,       // 聚合窗口：同 agent 同类事件在窗口内合并为一条
@@ -43,6 +47,9 @@
     }
   },
   "agents": [{ "kind": "claude-code", "enabled": true }],
+  // 界面语言：auto=跟随操作系统语言（首次启动即按系统语言选择，默认）/
+  // zh=简体中文 / en=English；可在设置页「界面语言」下拉随时切换，实时生效
+  "language": "auto",
   "glow": {
     "enabled": true,              // 屏幕光效总开关（启动 / 停止）
     "edge": true,                 // 边缘光效总开关：关掉后只收边缘灯带，全屏特效照常
@@ -72,6 +79,7 @@
 - 端口 / 鉴权 token 改过之后，运行中的事件服务器仍用启动时的值——UI 会提示「需重启生效」；
 - 配置采用原子写入（临时文件 + fsync + rename）；
 - `widget.{x,y,pinned,dock_side,dock_monitor}` 由悬浮窗自己的拖动 / 右键菜单写入，主窗口保存配置时会保留这些字段（不会被旧值覆盖）；
+- `language` 的 `auto` 档在**每次启动**时按操作系统语言现解析（zh* → 中文，其余 → 英文）；显式指定 `zh` / `en` 后固定。切换语言经后端广播到主面板、悬浮窗与托盘菜单，实时生效无需重启；
 - 旧版的 `glow.effect` / `glow.fullscreen_effect`（全局类型）只作**迁移源**：升级后四态各按它补齐一次，之后再改它们不再生效（运行时只读 `edge_effects` / `burst_effects`）。
 
 ### Webhook 模板占位符
@@ -233,7 +241,7 @@
 | 完成 | `run_completed`（多会话并行时某一个会话完成也会响） |
 | 失败 | `run_failed`（静默和读取失败不触发失败色） |
 
-用户主动中止（`run_aborted`）不响（自己按的停止）；子代理事件不响；托盘「静音」与免打扰时段内不响。默认全部未选 = 完全静音；播放次数范围 1~10。
+用户主动中止（`run_aborted`）不响（自己按的停止）；子代理事件不响；托盘「静音」与免打扰时段内不响。默认全部未选 = 完全静音；选「自定义」时必须先指定音频文件，文件被移走或删掉后该状态不响（只记日志，不打断主流程）。
 
 ---
 
@@ -266,7 +274,7 @@ agent-bark/
 - 前端：**两条都要跑**——`pnpm --dir app typecheck`（`vue-tsc --noEmit`，类型检查）
   与 `pnpm --dir app build`（`vite build`，产出 index/glow/widget/menu 四个入口）。
   注意 `build` **不含**类型检查（`package.json` 里是两个独立脚本），只跑 build 会漏掉类型错误；
-  `build.bat` 也把 `pnpm typecheck` 单列为一个步骤。
+  发布前必须单独跑一次 `pnpm typecheck`。
 
 ### ⚠️ 构建桌面应用必须走 Tauri CLI（踩过的坑）
 
@@ -286,8 +294,8 @@ pnpm tauri dev                # 开发模式（需要 vite 起在 5173）
 3. 想确认「前端确实内嵌了」：在 exe 里搜 `dist/assets/` 下的资源名（如 `assets/main-BlPIIZQF.js`），搜得到即已内嵌；
 4. 最彻底的一招：起一个假 dev server 占住 `127.0.0.1:5173`（只记日志），再启动 exe——如果它来请求这个端口，就说明是 dev 模式构建。
 
-- Hook 侧调试：设 `BARK_DEBUG=1`，hook 会在 stderr 打印上报结果（含失败原因，不含 token 明文）。
+- Hook 侧调试：设 `BARK_DEBUG=1`，hook 会在 stderr 打印上报结果（含失败原因，不含 token 明文）与 `transcript_path`（Codex/Qoder/CodeBuddy 的本地终态核验用）。
 - 「关于」页检查更新的联调：设 `BARK_UPDATE_REPO=owner/name` 可把两个平台的查询指到别的仓库（默认 `dashingmonkey/agent-bark`）——指到一个**已发过版本**的仓库就能验证「发现新版本 → 下载新版本」这条路径，不必等本仓库先发版。
-- 运行状态核验：每 5 分钟触发一次；托盘「检测运行状态」可立即触发。各 Agent 的数据库/日志监控继续使用原有秒级周期。静默不再自动终止会话，`BARK_STALE_AFTER_MS` 已移除。来源不可用时保留最后已知状态。事件流中的「移除」只清除本地会话显示并重新对齐光效，不停止 Agent、不产生终态或通知；缓存心跳不会重新建档，新的真实活动可恢复显示。Kimi Work 与豆包工作降级分支在日志连续 5 分钟无增长后停止合成心跳，仍保留会话。显示上限为 64 条，满时保留已有会话并提示移除停滞条目。具体支持范围见 [agent-integration.md](agent-integration.md)。
+- 运行状态核验：每 5 分钟触发一次；托盘「检测运行状态」可立即触发。各 Agent 的数据库/日志监控继续使用原有秒级周期；Qoder 的回合失败核验（当前回合 transcript 的合成 API 错误）与 CodeBuddy 的漏收 Stop 核验（`transcript_path` 里显式 `status=completed` 的助手回答；IDE 的正文文件每秒重读、索引按 (size, mtime) 缓存，候选稳定 5 秒才收档）也按秒读取，主动核验时重读有限尾部。静默不再自动终止会话，`BARK_STALE_AFTER_MS` 已移除。来源不可用时保留最后已知状态。事件流中的「移除」只清除本地会话显示并重新对齐光效，不停止 Agent、不产生终态或通知；缓存心跳不会重新建档，新的真实活动可恢复显示。Kimi Work 与豆包工作降级分支在日志连续 5 分钟无增长后停止合成心跳，仍保留会话。显示上限为 64 条，满时保留已有会话并提示移除停滞条目。具体支持范围见 [agent-integration.md](agent-integration.md)。
 - Hook 进程的三条硬约束（见 `crates/bark-cli/src/lib.rs` 模块注释）：永远退出码 0；读 stdin 必须带超时；只读配置、绝不写盘。
 - 验证某个 agent 到底读哪份配置 / 哪些事件真的会触发：见 [agent-integration.md 的「探针验证法」](agent-integration.md#23-探针验证法文档与实测冲突时用)。

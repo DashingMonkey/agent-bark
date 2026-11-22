@@ -146,11 +146,17 @@ fn ensure_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     if let Some(w) = app.get_webview_window(LABEL) {
         return Ok(w);
     }
-    let muted = app.state::<Arc<AppState>>().is_muted();
+    let state = app.state::<Arc<AppState>>();
+    let muted = state.is_muted();
+    // 窗口标题用户看不到，顺手跟随界面语言（语言缓存在 AppState，见 bark-core::i18n）
+    let lang = state.lang();
     let init = serde_json::to_string(&MenuInit { muted }).unwrap_or_else(|_| "null".to_string());
     // 可聚焦：失焦即收靠它（glow/widget 不可聚焦是为了不抢焦点，菜单正相反）
     WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("menu.html".into()))
-        .title("agent-bark 托盘菜单")
+        .title(match lang {
+            bark_core::Lang::Zh => "AgentBark 托盘菜单",
+            bark_core::Lang::En => "AgentBark Tray Menu",
+        })
         .transparent(true)
         .decorations(false)
         .shadow(false)

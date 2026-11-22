@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { reactive } from "vue";
+import { t as i18nT } from "./i18n";
 
 // ---- agent 品牌图标（内联 SVG，见 assets/agents/README.md 的来源与对应关系）----
 // mono 图标（opencode / generic）用 currentColor，跟随文字颜色；
@@ -116,6 +117,55 @@ export interface SessionStatus {
   parent?: string;
 }
 
+// ---- Token 用量统计（后端 usage_store.rs 的序列化形态）----
+
+/** 按日 × agent 聚合；credits 为历史字段（Qoder credit-only 采集已下线），当前恒为 0 */
+export interface DailyUsage {
+  day: string;
+  agent: string;
+  requests: number;
+  input_new: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+  reasoning: number;
+  credits: number;
+}
+
+export interface AgentUsage {
+  agent: string;
+  /** 后端按界面语言填的展示名 */
+  display_name: string;
+  requests: number;
+  input_new: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+  reasoning: number;
+  credits: number;
+}
+
+/** 按小时 × agent 聚合（hour 为本地时区 "00".."23"） */
+export interface HourlyUsage {
+  hour: string;
+  agent: string;
+  requests: number;
+  input_new: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+  reasoning: number;
+  credits: number;
+}
+
+/** 用量页脚注：已安装但没有完整本地用量源的 agent */
+export type UsageCoverageReason = "no_local_source" | "custom_only";
+export interface UsageCoverage {
+  kind: string;
+  display_name: string;
+  reason: UsageCoverageReason;
+}
+
 /** 会话是否是子代理（悬浮窗、事件流的「运行中会话」区共用这一条判据） */
 export function isSubagentSession(s: SessionStatus): boolean {
   return typeof s.parent === "string" && s.parent.length > 0;
@@ -156,7 +206,7 @@ export const SESSION_INDENT_MAX = 2;
 
 /** 占位父行的展示名：`会话 …8ec9f`（与血缘小字同一套尾号口径） */
 export function placeholderName(sessionId: string): string {
-  return `会话 …${sessionId.slice(-6)}`;
+  return i18nT("events.placeholderSession", { id: sessionId.slice(-6) });
 }
 
 /**
@@ -325,6 +375,8 @@ export interface Diagnostics {
   startup_warnings: string[];
   /** 更新成功后的操作提醒，不表示接入故障。 */
   startup_notices: string[];
+  /** 最近一次「该有声音却没响」的原因（判定层给出的跳过理由） */
+  last_sound_skip: { reason: string; kind: string; at: number } | null;
 }
 
 /** 「关于」页检查更新的结果（对应后端 update::UpdateInfo） */
@@ -407,41 +459,45 @@ export interface WidgetConfig {
   /** 靠边隐藏方向；位置始终保存展开时的卡片左上角。 */
   dock_side: "top" | "left" | "right" | null;
   dock_monitor: string | null;
+  /** 行悬停详情面板开关（默认开启；悬浮窗右键菜单里切换） */
+  detail_tip: boolean;
 }
 
 /** 「通知」页「声音」里单个状态的音效设置（对应后端 StateSound） */
 export interface StateSound {
-  /** 音效 id，见 SOUND_EFFECTS；空串 = 该状态不响（默认） */
+  /** 音效 id，见 SOUND_EFFECTS；"custom" = 自定义音频文件；空串 = 该状态不响（默认） */
   effect: string;
-  /** 播放次数（1~10） */
-  plays: number;
+  /** 自定义音效的文件路径（仅 effect = "custom" 时有意义）；空串 = 未选文件 */
+  custom_path: string;
 }
 
-/** 可选音效目录（与后端 bark-channels 的 SOUND_EFFECTS 保持一致；全部为随应用内置的 CC0 素材） */
-export const SOUND_EFFECTS: { id: string; label: string }[] = [
-  { id: "chime", label: "风铃" },
-  { id: "confirm", label: "确认" },
-  { id: "success", label: "成功" },
-  { id: "drop", label: "水滴" },
-  { id: "pluck", label: "弹拨" },
-  { id: "glass", label: "玻璃" },
-  { id: "error", label: "错误" },
-  { id: "deep", label: "低叮" },
+/** 可选音效目录（与后端 bark-channels 的 SOUND_EFFECTS 保持一致；全部为随应用内置的 CC0 素材）。
+ *  label 指向词表 `sounds.*`，渲染处 `$t(item.labelKey)`——常量在模块加载期只建一次，
+ *  存 key 不存译文，切语言才能跟着更新。
+ *  「自定义」不在此目录：它不是内置素材，由渲染处单独追加选项 */
+export const SOUND_EFFECTS: { id: string; labelKey: string }[] = [
+  { id: "confirm", labelKey: "sounds.confirm" },
+  { id: "success", labelKey: "sounds.success" },
+  { id: "drop", labelKey: "sounds.drop" },
+  { id: "pluck", labelKey: "sounds.pluck" },
+  { id: "glass", labelKey: "sounds.glass" },
+  { id: "error", labelKey: "sounds.error" },
+  { id: "deep", labelKey: "sounds.deep" },
 ];
 
 /** 「屏幕光效」每状态「边缘光效 → 类型」下拉的选项（对应后端 canon_edge_effect；默认项紧跟「无」） */
-export const EDGE_EFFECTS: { id: string; label: string }[] = [
-  { id: "none", label: "无" },
-  { id: "comet", label: "流光" },
-  { id: "breathing", label: "呼吸" },
+export const EDGE_EFFECTS: { id: string; labelKey: string }[] = [
+  { id: "none", labelKey: "effects.none" },
+  { id: "comet", labelKey: "effects.comet" },
+  { id: "breathing", labelKey: "effects.breathing" },
 ];
 
 /** 「屏幕光效」每状态「全屏特效 → 类型」下拉的选项（对应后端 canon_burst_effect；默认项紧跟「无」） */
-export const BURST_EFFECTS: { id: string; label: string }[] = [
-  { id: "none", label: "无" },
-  { id: "scan", label: "扫描" },
-  { id: "fog", label: "雾散" },
-  { id: "rain", label: "矩阵雨" },
+export const BURST_EFFECTS: { id: string; labelKey: string }[] = [
+  { id: "none", labelKey: "effects.none" },
+  { id: "scan", labelKey: "effects.scan" },
+  { id: "fog", labelKey: "effects.fog" },
+  { id: "rain", labelKey: "effects.rain" },
 ];
 
 export interface BarkConfig {
@@ -450,6 +506,10 @@ export interface BarkConfig {
   notify: {
     /** 总开关：关闭后所有状态音效都不响（各状态自己的设置保留） */
     enabled: boolean;
+    /** 提示音音量（0~100），与系统音量相乘 */
+    volume: number;
+    /** 同状态连续提示的合并窗口（毫秒），0 = 不合并 */
+    throttle_ms: number;
     thinking: StateSound;
     waiting: StateSound;
     completed: StateSound;
@@ -463,7 +523,14 @@ export interface BarkConfig {
   agents: { kind: string; enabled: boolean }[];
   glow: GlowConfig;
   widget: WidgetConfig;
+  /** 界面语言偏好（auto=跟随系统；解析与广播在后端，见 src/i18n.ts） */
+  language: LanguagePref;
+  /** Token 用量统计开关（默认启用；关闭即停采集并隐藏侧边栏菜单） */
+  token_monitor: { enabled: boolean };
 }
+
+/** 界面语言偏好（与后端 bark-core::i18n::LanguagePref 的 serde 取值一致） */
+export type LanguagePref = "auto" | "zh" | "en";
 
 // ---- 全局事件流 store ----
 
@@ -531,8 +598,9 @@ export const api = {
   setAgentEnabled: (kind: string, enabled: boolean) =>
     invoke<string | null>("set_agent_enabled", { kind, enabled }),
   getConfig: () => invoke<BarkConfig>("get_config"),
-  saveConfig: (config: Partial<Pick<BarkConfig, "channels" | "rules" | "notify" | "glow">> & {
+  saveConfig: (config: Partial<Pick<BarkConfig, "channels" | "rules" | "notify" | "glow" | "language">> & {
     widget?: Partial<Pick<BarkConfig["widget"], "enabled">>;
+    token_monitor?: Partial<Pick<BarkConfig["token_monitor"], "enabled">>;
   }) => invoke<void>("save_config", { config }),
   listEvents: (limit?: number) => invoke<NormalizedEvent[]>("list_events", { limit }),
   /// 清空后端事件历史（事件流页的「清空显示」）：不传 kind 清空全部，否则只清该类型。
@@ -540,6 +608,14 @@ export const api = {
   /// 返回**后端确实删掉的事件 id**：前端按它删本地副本，两边口径才一致。
   clearEvents: (kind?: string) => invoke<string[]>("clear_events", { kind: kind ?? null }),
   listActiveSessions: () => invoke<SessionStatus[]>("list_active_sessions"),
+  /// Token 用量：按日 × agent 聚合（day 闭区间 YYYY-MM-DD）；统计关闭时返回空数组
+  usageDaily: (from: string, to: string) => invoke<DailyUsage[]>("usage_daily", { from, to }),
+  /// Token 用量：窗口内按 agent 聚合（分 agent 表格）
+  usageByAgent: (from: string, to: string) => invoke<AgentUsage[]>("usage_by_agent", { from, to }),
+  /// Token 用量：按小时 × agent 聚合（"今天"视图的小时柱）
+  usageHourly: (from: string, to: string) => invoke<HourlyUsage[]>("usage_hourly", { from, to }),
+  /// Token 用量页脚注：已安装但没有完整本地用量源的 agent
+  usageCoverage: () => invoke<UsageCoverage[]>("usage_coverage"),
   dismissSession: (s: SessionStatus) => invoke<void>("dismiss_session", {
     agent: s.agent, sessionId: s.session_id,
     expectedStartedAt: s.started_at, expectedLastActivity: s.last_activity,
@@ -550,7 +626,10 @@ export const api = {
   testChannel: (channel: string, url: string | null, template: string | null) =>
     invoke<void>("test_channel", { channel, url, template }),
   /// 「通知」页「声音」的测试按钮：立即把选定音效播放若干次
-  testSound: (effect: string, plays: number) => invoke<void>("test_sound", { effect, plays }),
+  testSound: (effect: string, customPath: string | null) =>
+    invoke<void>("test_sound", { effect, customPath }),
+  /** 自定义音效文件选择：原生对话框，取消返回 null */
+  pickSoundFile: () => invoke<string | null>("pick_sound_file"),
   diagnostics: () => invoke<Diagnostics>("diagnostics"),
   /// 启动引导判定：本机一个 agent 都没接上（配置开关与磁盘上的接入都没到位）时返回 true，
   /// 前端据此自动弹出面板并停在「Agents 接入」页（见 App.vue 的 guideToAgents）
@@ -568,12 +647,16 @@ export const api = {
   glowOff: () => invoke<void>("glow_off"),
   /// 「屏幕光效」页：实时枚举当前所有显示器（插拔后重新进页面即可刷新）
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),
-  /// 等原生拖动真正结束，返回是否发生位移。
-  startWidgetDrag: () => invoke<boolean>("start_widget_drag"),
+  /// 等原生拖动真正结束：moved 是否位移，before 是拖动开始前的窗口位置（物理像素），
+  /// mouse 是松手时的全局鼠标位置（macOS 才有，点单位、左上原点）。
+  /// macOS 的 moved 恒为 false（start_dragging 即返回），before 供前端做位置对比兜底。
+  startWidgetDrag: () => invoke<{ moved: boolean; before: [number, number]; mouse?: [number, number] }>("start_widget_drag"),
   /// 悬浮窗位置记忆（拖动松手后上报，低频）：只写 widget 段，不整份落盘
   saveWidgetPosition: (x: number, y: number, dockSide: WidgetConfig["dock_side"] = null, dockMonitor: string | null = null) => invoke<void>("save_widget_position", { x, y, dockSide, dockMonitor }),
   /// 悬浮窗右键菜单「固定位置」开关（落盘到 widget.pinned，重启后保持）
   setWidgetPinned: (pinned: boolean) => invoke<void>("set_widget_pinned", { pinned }),
+  /// 悬浮窗右键菜单「启用/关闭详情面板」开关（落盘到 widget.detail_tip）
+  setWidgetDetailTip: (enabled: boolean) => invoke<void>("set_widget_detail_tip", { enabled }),
   takeWidgetReveal: () => invoke<boolean>("take_widget_reveal"),
   /// 悬浮窗右键菜单「关闭悬浮窗」：关掉开关并销毁窗口；
   /// 主窗口的悬浮窗设置页经 bark://widget-closed 同步勾选态
@@ -584,6 +667,9 @@ export const api = {
 
 // ---- 工具 ----
 
+/** agent id → 展示名。全部是品牌名（语言无关，与 Rust `AgentKind::display_name` 同一份）；
+ *  唯一例外 doubao-work 走词表（zh「豆包工作」/ en「Doubao Work」，与
+ *  Rust `AgentKind::display_name_lang` 同口径），见 [`agentName`] */
 export const AGENT_NAMES: Record<string, string> = {
   "claude-code": "Claude Code",
   "trae-code": "TraeCode",
@@ -595,10 +681,10 @@ export const AGENT_NAMES: Record<string, string> = {
   dsh: "DeepSeek Harness",
   "trae-work": "TraeWork",
   workbuddy: "WorkBuddy",
-  "doubao-work": "豆包工作",
 };
 
 export function agentName(id: string): string {
+  if (id === "doubao-work") return i18nT("agents.name.doubao-work");
   return AGENT_NAMES[id] ?? id;
 }
 
@@ -618,15 +704,22 @@ export function agentShortName(id: string): string {
   return AGENT_SHORT_NAMES[id] ?? agentName(id);
 }
 
-export const EVENT_LABELS: Record<EventKind, string> = {
-  session_start: "会话开始",
-  tool_failed: "工具失败",
-  permission_required: "需要确认",
-  input_required: "等待输入",
-  run_completed: "任务完成",
-  run_failed: "任务失败",
-  run_aborted: "已终止",
-};
+/** 全部事件类型（事件流的类型筛选下拉按此顺序渲染，与旧 Record 定义序一致） */
+export const EVENT_KINDS: EventKind[] = [
+  "session_start",
+  "tool_failed",
+  "permission_required",
+  "input_required",
+  "run_completed",
+  "run_failed",
+  "run_aborted",
+];
+
+/** 事件类型的显示名（词表 `events.kind.*`）。记录 → 字符串的常量在切语言时不会更新，
+ *  所以导出取词函数；未知 kind（后端新增/坏数据）原样显示 */
+export function eventLabel(kind: EventKind): string {
+  return EVENT_KINDS.includes(kind) ? i18nT(`events.kind.${kind}`) : String(kind);
+}
 
 /**
  * 事件徽标四色规范，与屏幕光效（glow.rs `GlowState::color`）同一套色板：
@@ -650,14 +743,10 @@ export function eventBadgeClass(kind: EventKind): string {
   }
 }
 
-export const PHASE_LABELS: Record<SessionPhase, string> = {
-  thinking: "思考中",
-  tool_running: "执行工具",
-  waiting_permission: "等待确认",
-  waiting_input: "等待输入",
-  waiting_children: "等待子代理",
-  settling: "等待汇总",
-};
+/** 会话相位的显示名（词表 `phases.*`）。未知 phase（后端新增/坏推送）原样显示 */
+export function phaseLabel(phase: SessionPhase): string {
+  return i18nT(`phases.${phase}`);
+}
 
 export function phaseBadgeClass(phase: SessionPhase): string {
   switch (phase) {

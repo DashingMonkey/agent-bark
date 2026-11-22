@@ -36,8 +36,10 @@ pub trait WatchAdapter: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
-    /// 不可用原因（展示给用户）
-    fn unavailable_reason(&self) -> Option<String> {
+    /// 不可用原因（直接整句展示给用户，按界面语言取词）。
+    /// 实现里探测缓存的错误串必须与语言无关：语言相关的分支要在进缓存之前处理。
+    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
+        let _ = lang;
         None
     }
 }
@@ -90,6 +92,8 @@ fn emit_inner(
         agent: kind.id().to_string(),
         kind: event,
         session_id: session_id.to_string(),
+        // 监控型来源读的是数据库/日志，不是 hook 会话日志；没有 transcript_path 可声明
+        transcript_path: None,
         cwd: cwd.to_string(),
         project: project_name_from_cwd(cwd),
         message: message.to_string(),
@@ -396,23 +400,43 @@ impl WatchAdapter for WorkBuddyWatch {
             .is_ok()
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
-        let db = Self::db_path();
-        let probe = Self::schema_probe().get_or_init(|| match &db {
-            Some(p) if p.exists() => match snapshot_rows(p, Self::QUERY) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(format!("{e:#}")),
-            },
-            _ => Err("未找到 ~/.workbuddy/workbuddy.db（未安装或从未运行过会话）".into()),
+    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
+        // 库缺失在进探测缓存**之前**按语言给出原因：缓存串必须与语言无关
+        // （OnceLock 缓存的结果会被不同语言的调用方读到）
+        let db = match Self::db_path().filter(|p| p.exists()) {
+            Some(p) => p,
+            None => {
+                return Some(match lang {
+                    bark_core::Lang::Zh => {
+                        "未找到 ~/.workbuddy/workbuddy.db（未安装或从未运行过会话）".into()
+                    }
+                    bark_core::Lang::En => {
+                        "~/.workbuddy/workbuddy.db not found (WorkBuddy is not installed or has never run a session)"
+                            .into()
+                    }
+                });
+            }
+        };
+        let probe = Self::schema_probe().get_or_init(|| match snapshot_rows(&db, Self::QUERY) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{e:#}")),
         });
         match probe {
             Ok(()) => None,
-            Err(e) => Some(format!(
-                "WorkBuddy 会话库探测失败，暂停监控：{e}。\
-                 表/列名已按 2.137.1 校准，若刚升级 WorkBuddy，请核对 watch.rs 的 QUERY 常量\
-                 （库文件：{}）",
-                db.map(|p| p.display().to_string()).unwrap_or_else(|| "未找到".into())
-            )),
+            Err(e) => Some(match lang {
+                bark_core::Lang::Zh => format!(
+                    "WorkBuddy 会话库探测失败，暂停监控：{e}。\
+                     表/列名已按 2.137.1 校准，若刚升级 WorkBuddy，请核对 watch.rs 的 QUERY 常量\
+                     （库文件：{}）",
+                    db.display()
+                ),
+                bark_core::Lang::En => format!(
+                    "WorkBuddy session database probe failed; monitoring paused: {e}. \
+                     Table/column names are calibrated for 2.137.1; if you just upgraded WorkBuddy, \
+                     verify the QUERY constant in watch.rs (database: {})",
+                    db.display()
+                ),
+            }),
         }
     }
 
@@ -803,19 +827,37 @@ impl WatchAdapter for TraeWorkWatch {
         Self::probe().get_or_init(|| Self::probe_with_retry(&db)).is_ok()
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
-        let db = Self::db_path();
-        let probe = Self::probe().get_or_init(|| match &db {
-            Some(p) if p.exists() => Self::probe_with_retry(p),
-            _ => Err("未找到 TraeWork 会话库（未安装或从未使用过 SOLO 模式）".into()),
-        });
+    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
+        // 库缺失在进探测缓存**之前**按语言给出原因（缓存串必须与语言无关）
+        let db = match Self::db_path().filter(|p| p.exists()) {
+            Some(p) => p,
+            None => {
+                return Some(match lang {
+                    bark_core::Lang::Zh => {
+                        "未找到 TraeWork 会话库（未安装或从未使用过 SOLO 模式）".into()
+                    }
+                    bark_core::Lang::En => {
+                        "TraeWork session database not found (not installed or SOLO mode never used)"
+                            .into()
+                    }
+                });
+            }
+        };
+        let probe = Self::probe().get_or_init(|| Self::probe_with_retry(&db));
         match probe {
             Ok(()) => None,
-            Err(e) => Some(format!(
-                "TraeWork 会话库暂不可用，暂停监控：{e}。\
-                 可用 tools/traework-probe.mjs 核对密钥常量与 schema（库文件：{}）",
-                db.map(|p| p.display().to_string()).unwrap_or_else(|| "未找到".into())
-            )),
+            Err(e) => Some(match lang {
+                bark_core::Lang::Zh => format!(
+                    "TraeWork 会话库暂不可用，暂停监控：{e}。\
+                     可用 tools/traework-probe.mjs 核对密钥常量与 schema（库文件：{}）",
+                    db.display()
+                ),
+                bark_core::Lang::En => format!(
+                    "TraeWork session database is unavailable; monitoring paused: {e}. \
+                     Use tools/traework-probe.mjs to verify the key constants and schema (database: {})",
+                    db.display()
+                ),
+            }),
         }
     }
 

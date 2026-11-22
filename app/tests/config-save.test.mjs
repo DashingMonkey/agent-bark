@@ -16,6 +16,8 @@ function page(name, api, exports) {
   const noop = () => {};
   const imports = {
     vue: { ...vue, onMounted: noop, onUnmounted: noop, onActivated: noop, onDeactivated: noop },
+    // 页面脚本 setup 里的 useI18n()：这些用例只关心提交的配置分片，翻译按 key 原样返回即可
+    "vue-i18n": { useI18n: () => ({ t: (key) => key }) },
     "../api": { api, SOUND_EFFECTS: [], EDGE_EFFECTS: [], BURST_EFFECTS: [] },
     "../toast": { toast: noop },
     "@tauri-apps/api/event": { listen: async () => noop },
@@ -36,6 +38,7 @@ test("cached settings pages only submit their own sections", async () => {
     widget: { enabled: true, x: 10, y: 20, pinned: true },
     notify: { enabled: true, ...Object.fromEntries(["thinking", "waiting", "completed", "failed"].map((k) => [k, { effect: "", plays: 1 }])) },
     glow: { enabled: true, monitors: "all" },
+    token_monitor: { enabled: true },
   };
   const submitted = [];
   const api = {
@@ -48,7 +51,7 @@ test("cached settings pages only submit their own sections", async () => {
   };
   const channels = page("ChannelsPage", api, ["load", "save", "config"]);
   const widget = page("WidgetPage", api, ["load", "toggle", "config"]);
-  const settings = page("SettingsPage", api, ["load", "save", "config"]);
+  const settings = page("SettingsPage", api, ["load", "save", "config", "toggleTokenMonitor"]);
   const notify = page("NotifyPage", api, ["load", "persist", "config"]);
   for (const view of [channels, widget, settings, notify]) await view.load();
   await widget.toggle("enabled", false);
@@ -59,6 +62,12 @@ test("cached settings pages only submit their own sections", async () => {
   notify.config.value.notify.enabled = false;
   await notify.persist();
   assert.deepEqual(submitted.map((patch) => Object.keys(patch).sort()), [["widget"], ["channels"], ["rules"], ["glow", "notify"]]);
+  // 用量统计开关：即时落盘、只提交自己的分区
+  await settings.toggleTokenMonitor(false);
+  assert.deepEqual(submitted.at(-1), { token_monitor: { enabled: false } });
+  assert.equal(saved.token_monitor.enabled, false);
+  await settings.toggleTokenMonitor(true);
+  assert.deepEqual(submitted.at(-1), { token_monitor: { enabled: true } });
   assert.equal(saved.widget.enabled, false);
   assert.equal(saved.channels.bark.url, "new");
   assert.equal(saved.rules.aggregate_window_ms, 2000);

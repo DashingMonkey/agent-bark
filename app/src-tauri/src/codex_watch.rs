@@ -2,7 +2,7 @@
 //! SQLite 只定位 rollout；按精确回合读取提问、回答与明确终态。
 //! 日志静默、读取失败、普通工具错误均不代表回合结束。
 
-use crate::state::{lock, read, session_key, AppState};
+use crate::state::{lock, read, session_key, AppState, SessionStatus};
 use bark_core::event::CodexContext;
 use bark_core::{EventKind, NormalizedEvent};
 use serde_json::{json, Value};
@@ -187,7 +187,9 @@ struct Signal {
     message: String,
 }
 
-fn parse_line(line: &str) -> Option<Signal> {
+/// 按 Codex transcript 日志行解析终态信号。`lang`：合成的 message 会进事件流与
+/// 推送正文（见 [`Signal::event`]），按界面语言取词；agent 自带的 message 原样保留。
+fn parse_line(line: &str, lang: bark_core::Lang) -> Option<Signal> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("type")?.as_str()? != "event_msg" {
         return None;
@@ -216,12 +218,18 @@ fn parse_line(line: &str) -> Option<Signal> {
             turn_id: turn_id.into(),
             timestamp,
             message: if ty == "turn_aborted" {
-                "用户已中止 Codex 回合".into()
+                match lang {
+                    bark_core::Lang::Zh => "用户已中止 Codex 回合".into(),
+                    bark_core::Lang::En => "Codex turn aborted by user".into(),
+                }
             } else {
                 payload
                     .get("last_agent_message")
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex 回合已完成")
+                    .unwrap_or(match lang {
+                        bark_core::Lang::Zh => "Codex 回合已完成",
+                        bark_core::Lang::En => "Codex turn completed",
+                    })
                     .into()
             },
         });
@@ -240,13 +248,19 @@ fn parse_line(line: &str) -> Option<Signal> {
         return None;
     }
     let message = if code == "usage_limit_exceeded" {
-        if message.is_empty() {
-            "额度已用完（usage_limit_exceeded）".into()
-        } else {
-            format!("额度已用完（usage_limit_exceeded）：{message}")
+        match lang {
+            bark_core::Lang::Zh if message.is_empty() => "额度已用完（usage_limit_exceeded）".into(),
+            bark_core::Lang::Zh => format!("额度已用完（usage_limit_exceeded）：{message}"),
+            bark_core::Lang::En if message.is_empty() => {
+                "Usage limit reached (usage_limit_exceeded)".into()
+            }
+            bark_core::Lang::En => format!("Usage limit reached (usage_limit_exceeded): {message}"),
         }
     } else if message.is_empty() {
-        format!("Codex 回合失败：{code}")
+        match lang {
+            bark_core::Lang::Zh => format!("Codex 回合失败：{code}"),
+            bark_core::Lang::En => format!("Codex turn failed: {code}"),
+        }
     } else {
         message.to_owned()
     };
@@ -300,7 +314,6 @@ impl Signal {
     }
 }
 
-#[derive(Default)]
 struct Tail {
     offset: u64,
     created: Option<SystemTime>,
@@ -312,11 +325,31 @@ struct Tail {
     turn_hint: Option<(String, i64)>,
     // call_id -> (tool_name, timestamp)。异步 accepted 不移除，直到用户消息出现。
     questions: HashMap<String, (String, i64)>,
+    /// 界面语言：本 tail 合成的事件 message（见 parse_line 与提问兜底文案）按它取词。
+    /// watch 线程每轮循环从 AppState 现取回填，语言切换后新事件即跟随。
+    lang: bark_core::Lang,
+}
+
+impl Default for Tail {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            created: None,
+            initialized: false,
+            carry: Vec::new(),
+            skip_line: false,
+            turn_id: None,
+            turn_hint: None,
+            questions: HashMap::new(),
+            // 默认中文：测试与「未显式设置」的兜底都落在中文原文（与推送标题的历史行为一致）
+            lang: bark_core::Lang::Zh,
+        }
+    }
 }
 
 impl Tail {
     fn parse(&mut self, line: &str) -> Option<Signal> {
-        if let Some(signal) = parse_line(line) {
+        if let Some(signal) = parse_line(line, self.lang) {
             self.questions.clear();
             return Some(signal);
         }
@@ -407,7 +440,13 @@ impl Tail {
                         .collect::<Vec<_>>()
                         .join("\n")
                 })
-                .unwrap_or_else(|| "请选择或回答问题".into());
+                .unwrap_or_else(|| {
+                    match self.lang {
+                        bark_core::Lang::Zh => "请选择或回答问题",
+                        bark_core::Lang::En => "Please pick or answer the question",
+                    }
+                    .into()
+                });
             return Some(Signal {
                 kind: EventKind::PermissionRequired,
                 suffix: format!("question:{call}"),
@@ -501,6 +540,25 @@ fn replaces_pending(old: &NormalizedEvent, event: &NormalizedEvent) -> bool {
         || ((terminal(event) || !terminal(old)) && event.timestamp >= old.timestamp)
 }
 
+/// 该 agent **所有**事件进入状态机前的过滤：回合身份、内部建议请求、已结束回合的
+/// 迟到 hook。由 `evidence` 注册表在管道入口统一调用（不是只在终态事件上）。
+pub fn accept(state: &AppState, event: &NormalizedEvent) -> bool {
+    lock(&state.codex_turns).accept(event)
+}
+
+/// 本地失败事件只对仍在运行中表里的会话生效。
+///
+/// 回合身份由 [`accept`] 的 `Turns` 负责；这里只回答「这条会话还在吗」——已被终态
+/// 收掉或用户移除的不补发失败通知。
+pub fn still_current(session: Option<&SessionStatus>, _event: &NormalizedEvent) -> bool {
+    session.is_some()
+}
+
+/// 应用事件前的相位修正：异步提问等待回答期间，工具心跳不能解除等待。
+pub fn preserve_wait(state: &AppState, event: &NormalizedEvent) -> bool {
+    lock(&state.codex_turns).preserve_wait(event)
+}
+
 pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
     // 文件 IO 在独立线程中执行，不阻塞 Tauri/tokio 的事件管道。
     let result = std::thread::Builder::new().name("codex-terminal-watch".into()).spawn(move || {
@@ -520,6 +578,8 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
             if !read(&state.config).agent_disabled("codex") {
                 let watching = lock(&state.codex_turns).watching();
                 let sessions = lock(&state.active_sessions).clone();
+                // 合成事件 message 的取词依据每轮现取：语言切换后新事件即跟随
+                let lang = state.lang();
                 let mut paths = HashSet::new();
                 for (sid, mut turn) in watching {
                     let Some(session) = sessions.get(&session_key("codex", &sid)) else { continue };
@@ -533,6 +593,7 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
                     paths.insert(path.clone());
                     let tail = tails.entry(path.clone()).or_default();
                     tail.turn_hint = Some((turn.id.clone(), Turns::lower_bound(&turn)));
+                    tail.lang = lang;
                     match tail.poll(path) {
                         Ok(failures) => for failure in failures {
                             if let Some(event) = failure.event(&sid, &turn, session) {
@@ -572,6 +633,7 @@ pub fn spawn(state: Arc<AppState>, tx: mpsc::Sender<NormalizedEvent>) {
 mod tests {
     use super::*;
     use bark_adapters::HookAdapter;
+    use bark_core::Lang;
     use std::io::Write;
 
     const FAILURE: &str = r#"{"timestamp":"2026-10-15T02:38:45.966Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null,"error":{"message":"You’ve hit your usage limit.","codex_error_info":"usage_limit_exceeded"}}}"#;
@@ -587,10 +649,17 @@ mod tests {
 
     #[test]
     fn only_explicit_task_complete_errors_are_failures() {
-        let failure = parse_line(FAILURE).unwrap();
+        let failure = parse_line(FAILURE, Lang::Zh).unwrap();
         assert_eq!(failure.turn_id, "turn-1");
         assert_eq!(failure.timestamp, 1792031925966);
         assert!(failure.message.starts_with("额度已用完"));
+        // 英文界面：合成 message 跟随界面语言（会进事件流与推送正文）
+        let failure_en = parse_line(FAILURE, Lang::En).unwrap();
+        assert!(
+            failure_en.message.starts_with("Usage limit reached"),
+            "英文 message: {}",
+            failure_en.message
+        );
         for replacement in [
             FAILURE.replace("task_complete", "error"),
             FAILURE.replace("task_complete", "token_count"),
@@ -599,25 +668,34 @@ mod tests {
             FAILURE.replace("turn-1", ""),
             FAILURE.replace("2026-10-15T02:38:45.966Z", "invalid"),
         ] {
-            assert!(parse_line(&replacement).is_none());
+            assert!(parse_line(&replacement, Lang::Zh).is_none());
         }
         let mut normal: Value = serde_json::from_str(FAILURE).unwrap();
         normal["payload"]["error"] = Value::Null;
         assert_eq!(
-            parse_line(&normal.to_string()).unwrap().kind,
+            parse_line(&normal.to_string(), Lang::Zh).unwrap().kind,
             EventKind::RunCompleted
         );
         normal["payload"]["type"] = json!("turn_aborted");
         assert_eq!(
-            parse_line(&normal.to_string()).unwrap().kind,
+            parse_line(&normal.to_string(), Lang::Zh).unwrap().kind,
             EventKind::RunAborted
+        );
+        // 中止 message 双语：zh 原文 + en 用例
+        assert_eq!(
+            parse_line(&normal.to_string(), Lang::Zh).unwrap().message,
+            "用户已中止 Codex 回合"
+        );
+        assert_eq!(
+            parse_line(&normal.to_string(), Lang::En).unwrap().message,
+            "Codex turn aborted by user"
         );
         normal["payload"]["type"] = json!("task_complete");
         normal["payload"]["error"] = json!({});
-        assert!(parse_line(&normal.to_string()).is_none());
+        assert!(parse_line(&normal.to_string(), Lang::Zh).is_none());
         normal["payload"]["error"] = json!({"message": "Authentication failed"});
         assert_eq!(
-            parse_line(&normal.to_string()).unwrap().message,
+            parse_line(&normal.to_string(), Lang::Zh).unwrap().message,
             "Authentication failed"
         );
     }
@@ -870,6 +948,7 @@ mod tests {
             session_id: "s1".into(),
             project: None,
             cwd: "C:/work".into(),
+            transcript_path: None,
             phase: crate::state::SessionPhase::Thinking,
             lifecycle: Default::default(),
             active_descendants: 0,
@@ -882,7 +961,7 @@ mod tests {
             parent: None,
             parent_key: None,
         };
-        let failure = parse_line(FAILURE).unwrap();
+        let failure = parse_line(FAILURE, Lang::Zh).unwrap();
         assert!(failure.event("s1", &turn, &session).is_none());
         let matching = Turn {
             id: "turn-1".into(),

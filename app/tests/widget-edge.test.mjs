@@ -29,6 +29,20 @@ test("only top/left/right edges dock, with top taking precedence at corners", ()
   ]) assert.equal(edge.edgeAtPoint(point, screen, [], 6), expected);
 });
 
+test("macOS widens the snap band to clear the menu-bar fullscreen gesture zone", () => {
+  // 顶部菜单栏占约 25 逻辑 px，拖窗口顶到菜单栏停留会触发系统全屏手势并弹回；
+  // macOS 的吸附意图信号是「鼠标贴边」（指针能精确贴到 x=0；卡片几何不行——
+  // 拖动跟手时卡片边缘永远停在屏内几十像素），24px 对指针足够精确
+  const macEdge = module(compile("widget-edge"), { "./widget-layout": layout }, {
+    navigator: { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15" },
+  });
+  assert.equal(macEdge.edgeThreshold(), 24);
+  const winEdge = module(compile("widget-edge"), { "./widget-layout": layout }, {
+    navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+  });
+  assert.equal(winEdge.edgeThreshold(), 6);
+});
+
 test("shared edges are ignored using physical coordinates across differently scaled monitors", () => {
   const left = { x: -2560, y: -300, width: 2560, height: 1440 };
   const above = { x: 0, y: -1080, width: 1920, height: 1080 };
@@ -106,13 +120,17 @@ function setup(init = {}, options = {}) {
     __WIDGET_INIT__: initial,
     setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, at: now + ms }); return id; },
     clearTimeout: (id) => timers.delete(id),
+    // 沙箱没有 macOS 的真实窗口环境，hover 轮询不启动
+    setInterval: () => 0,
+    clearInterval: () => {},
   };
+  const hiddenDuringGeometry = [];
   const monitor = options.monitor ?? { position: { x: 0, y: 0 }, size: { width: 1920, height: 1080 }, workArea: { position: { x: 0, y: 0 }, size: { width: 1920, height: 1040 } }, scaleFactor: 1 };
   const native = {
     position: { x: initial.x, y: initial.y }, size: { width: 280, height: 44 }, pointer: { x: 800, y: 500 },
     outerPosition: async () => native.position, scaleFactor: async () => 1,
-    async setSize(size) { native.size = size; calls.push(["size", size.width, size.height]); },
-    async setPosition(position) { native.position = position; calls.push(["position", position.x, position.y]); moved?.({ payload: position }); },
+    async setSize(size) { hiddenDuringGeometry.push(document.body.classList.contains("edge-handle-hidden")); native.size = size; calls.push(["size", size.width, size.height]); },
+    async setPosition(position) { hiddenDuringGeometry.push(document.body.classList.contains("edge-handle-hidden")); native.position = position; calls.push(["position", position.x, position.y]); moved?.({ payload: position }); },
     async show() { calls.push(["show"]); }, async hide() { calls.push(["hide"]); },
     onMoved: async (fn) => { moved = fn; return noop; },
     // Native startDragging only acknowledges dispatch; it resolves before movement/mouse release.
@@ -125,7 +143,13 @@ function setup(init = {}, options = {}) {
     async startWidgetDrag() {
       const before = { ...native.position };
       await native.startDragging();
-      return new Promise((resolve) => { endDrag = () => resolve(before.x !== native.position.x || before.y !== native.position.y); });
+      return new Promise((resolve) => {
+        endDrag = () => resolve({
+          moved: !options.ipcMovedFalse && (before.x !== native.position.x || before.y !== native.position.y),
+          before: [before.x, before.y],
+          mouse: [native.pointer.x, native.pointer.y],
+        });
+      });
     },
     listActiveSessions: async () => options.initialSessions ?? [], saveWidgetPosition: async (...args) => saves.push(args),
     takeWidgetReveal: async () => { const pending = pendingReveal; pendingReveal = false; return pending; },
@@ -133,23 +157,33 @@ function setup(init = {}, options = {}) {
     showPanel: async () => {},
   };
   const result = module(widgetCode, {
-    "./widget-edge": edge, "./widget-layout": layout,
+    // isMacOS 读 navigator.userAgent，mac 场景要按 options.navigator 重建 edge 模块
+    "./widget-edge": options.navigator
+      ? module(compile("widget-edge"), { "./widget-layout": layout }, { navigator: options.navigator })
+      : edge,
+    "./widget-layout": layout,
     "./assets/logo.png": "logo.png",
     "./api": {
-      api, EVENT_LABELS: { run_completed: "任务完成", run_failed: "任务失败", run_aborted: "手动终止" }, PHASE_LABELS: {}, SESSION_INDENT_MAX: 2,
+      api, eventLabel: (kind) => kind, phaseLabel: (phase) => phase, placeholderName: (id) => `session …${id}`,
+      SESSION_INDENT_MAX: 2,
       agentName: (name) => name, agentIcon: () => "", isSubagentSession: (s) => !!s.parent,
       sessionRows: (sessions) => sessions.map((session) => ({ session, depth: 0 })),
     },
+    "./i18n": {
+      initI18n: async () => {}, t: (key) => key, locale: () => "zh", onLocaleChanged: () => noop,
+    },
+    "./session-time": { durationUnits: () => ({ hour: "h", minute: "m", second: "s" }) },
     "./theme": { initTheme: noop, onThemeChange: noop },
-    "./widget-tip": Object.fromEntries(["hideRowTip", "initRowTip", "refreshRowTip", "scheduleRowTip", "scheduleTipHide"].map((key) => [key, noop])),
-    "@tauri-apps/api/event": { listen: async (name, fn) => { listeners.set(name, fn); return noop; } },
+    "./widget-tip": Object.fromEntries(["hideRowTip", "initRowTip", "refreshRowTip", "scheduleRowTip", "scheduleTipHide", "setRowTipLabels"].map((key) => [key, noop])),
+    "@tauri-apps/api/event": { listen: async (name, fn) => { listeners.set(name, fn); return noop; }, emitTo: async () => {} },
     "@tauri-apps/api/window": {
       getCurrentWindow: () => native, currentMonitor: async () => monitor, availableMonitors: async () => [monitor],
       cursorPosition: async () => native.pointer, LogicalPosition: Position, LogicalSize: Size, PhysicalPosition: Position, PhysicalSize: Size,
     },
   }, {
     document, window, console: { ...console, warn: (...args) => { if (!options.failPin) console.warn(...args); } }, Date: Clock, performance: { now: () => now },
-    requestAnimationFrame: (fn) => window.setTimeout(fn, 16), matchMedia: () => ({ matches: !!options.reducedMotion }),
+    requestAnimationFrame: (fn) => options.frameMs === null ? 0 : window.setTimeout(fn, options.frameMs ?? 16), matchMedia: () => ({ matches: !!options.reducedMotion }),
+    ...(options.navigator ? { navigator: options.navigator } : {}),
   });
   async function flush() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
   async function advance(ms) {
@@ -163,7 +197,7 @@ function setup(init = {}, options = {}) {
     now = until; await flush();
   }
   return {
-    result, native, document, saves, calls, animations, advance,
+    result, native, document, saves, calls, animations, hiddenDuringGeometry, advance,
     node: (id) => document.getElementById(id),
     sessions: (sessions) => listeners.get("bark://sessions")({ payload: sessions }),
     event: (event) => listeners.get("bark://event")({ payload: event }),
@@ -196,19 +230,59 @@ test("restart restores a visible handle, hover reverses an in-flight slide, and 
   assert.deepEqual(ui.saves.at(-1), [1640, 120, "right", null]);
 });
 
+test("the fake handle is hidden before the native window grows", async () => {
+  const ui = setup();
+  await ui.advance(300);
+  assert.equal(ui.native.size.width, 6);
+  const before = ui.hiddenDuringGeometry.length;
+  await ui.document.dispatch("mouseenter");
+  await ui.advance(300);
+  assert.equal(ui.native.size.width, 280);
+  // 展开时第一次改原生几何之前必须已经藏好窄条。否则 WebView 合成器会拿旧 6px
+  // 视口把 right:0 的窄条画到新窗口左缘——鼠标移入时闪一下的收缩条。
+  const during = ui.hiddenDuringGeometry.slice(before);
+  assert.ok(during.length >= 2, "expansion should touch both position and size");
+  // 发生在动画结束、卡片已经露出来之后，不再要求 edge-handle-hidden。
+  assert.equal(during[0], true, "the first native geometry call must already hide the handle");
+  assert.equal(during[1], true, "the size call must already hide the handle");
+  assert.equal(ui.document.body.classList.contains("edge-handle-hidden"), false);
+});
+
+test("expansion completes even if requestAnimationFrame never fires", async () => {
+  const ui = setup({}, { frameMs: null });
+  await ui.advance(300);
+  assert.equal(ui.native.size.width, 6);
+  const before = ui.calls.length;
+  await ui.document.dispatch("mouseenter");
+  await ui.advance(79);
+  // 双 rAF 永不回调：超时兜底（80ms）之前不许改原生几何。
+  assert.equal(ui.native.size.width, 6);
+  assert.equal(ui.document.body.classList.contains("edge-handle-hidden"), true);
+  await ui.advance(30);
+  assert.equal(ui.native.size.width, 280);
+  assert.equal(ui.document.body.classList.contains("edge-collapsed"), false);
+  assert.ok(ui.calls.length - before >= 2, "timeout must still apply native geometry");
+  await ui.advance(300);
+  assert.equal(ui.document.body.classList.contains("edge-handle-hidden"), false);
+  assert.equal(ui.result.snapshot().edgeMoving, false);
+});
+
 test("slides use the compositor, including reduced motion, and shrink native bounds only after finishing", async () => {
   for (const side of ["left", "right", "top"]) {
     for (const reducedMotion of [false, true]) {
       const ui = setup({ dock_side: side }, { reducedMotion });
       await ui.advance(0);
       const callsBefore = ui.calls.length;
-      await ui.document.dispatch("mouseenter"); await ui.advance(30);
+      await ui.document.dispatch("mouseenter");
+      await ui.advance(16);
+      assert.equal(ui.calls.length, callsBefore, "native geometry must wait for a paint");
+      await ui.advance(16);
       const slide = ui.animations.find(({ target }) => target === ui.node("app"));
       assert.ok(slide.timing.duration >= 160);
       assert.match(slide.timing.easing, /^cubic-bezier/);
       assert.notEqual(slide.keyframes[0].transform, slide.keyframes[1].transform);
       const during = ui.calls.length;
-      assert.equal(during - callsBefore, 2);
+      assert.equal(during - callsBefore, 2, "expanding touches native position and size once each");
       await ui.advance(50);
       assert.equal(ui.calls.length, during, "animation frames must not send window geometry IPC");
       assert.equal(ui.result.snapshot().edgeMoving, true);
@@ -228,7 +302,7 @@ test("slides use the compositor, including reduced motion, and shrink native bou
 test("reversing a slide starts at the compositor's eased position without resizing the window", async () => {
   const ui = setup({}, { animationProgress: .7 });
   await ui.advance(0);
-  await ui.document.dispatch("mouseenter"); await ui.advance(30);
+  await ui.document.dispatch("mouseenter"); await ui.advance(60);
   const callsBefore = ui.calls.length;
   ui.result.requestEdge(true); await ui.advance(0);
   assert.ok(Math.abs(ui.result.snapshot().edgeProgress - .3) < 1e-8);
@@ -314,6 +388,31 @@ test("dragging to an edge docks, clicks retain docking, and dragging inland undo
   assert.equal(ui.result.snapshot().dockSide, null);
   assert.equal(ui.native.size.width, 280);
   assert.deepEqual(ui.saves.at(-1), [500, 300]);
+});
+
+test("macOS snaps by the pointer at the screen edge from the drag report", async () => {
+  // 拖动时卡片跟着抓取点走，鼠标出不了屏，卡片边缘永远停在屏内几十像素——
+  // 卡片几何判定永远差一口气。吸附意图信号是「鼠标贴边」：拖动回执带松手时
+  // 的全局鼠标位置（CoreGraphics 直读，无 tao cursorPosition 的 Retina bug）
+  const macNavigator = { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15" };
+  const ui = setup({ x: 600, y: 400, dock_side: null }, { navigator: macNavigator });
+  await ui.advance(0);
+  await ui.node("app").dispatch("mousedown", { button: 0, clientX: 30, detail: 1 });
+  // 窗口拖到左缘附近，鼠标贴住左边缘（x=0 ≤ 24 阈值）
+  ui.move(5, 570, { x: 0, y: 570 });
+  await ui.advance(0); ui.endDrag(); await ui.advance(300);
+  assert.equal(ui.result.snapshot().dockSide, "left");
+  assert.equal(ui.native.size.width, 6);
+  // 收起态先移入展开，第一次点击只展开不拖（与 Windows 同一交互序列）
+  await ui.document.dispatch("mouseenter"); await ui.advance(300);
+  await ui.node("app").dispatch("mousedown", { button: 0, clientX: 30, detail: 1 });
+  ui.endDrag(); await ui.advance(0);
+  // 拖离边缘取消停靠——鼠标已离开边缘带，窗口位置远离边缘
+  await ui.node("app").dispatch("mousedown", { button: 0, clientX: 30, detail: 1 });
+  ui.move(500, 300, { x: 500, y: 310 });
+  await ui.advance(0); ui.endDrag(); await ui.advance(300);
+  assert.equal(ui.result.snapshot().dockSide, null);
+  assert.equal(ui.native.size.height, 44);
 });
 
 test("pinning clears docking only after a successful save", async () => {
@@ -475,6 +574,19 @@ test("dispatch acknowledgement cannot finish a drag before release, even when mo
 
 test("the final native position docks even when WebView missed all moved events", async () => {
   const ui = setup({ dock_side: null, x: 600, y: 300 });
+  await ui.advance(0);
+  await ui.node("app").dispatch("mousedown", { button: 0, clientX: 100, detail: 1 });
+  ui.move(1640, 300, { x: 1740, y: 322 }, false);
+  ui.endDrag(); await ui.advance(300);
+  assert.equal(ui.result.snapshot().dockSide, "right");
+  assert.equal(ui.native.size.width, 6);
+  assert.deepEqual(ui.saves.at(-1), [1640, 300, "right", null]);
+});
+
+test("macOS fallback: docking works on position comparison when moved events and the IPC moved flag are all lost", async () => {
+  // macOS 的 start_dragging 即返回（回执 moved 恒 false），模态拖动期间 onMoved 也可能
+  // 不派发——两个信号全丢也不能跳过吸附判定：松手位置 ≠ 拖动前位置就是真的拖动了
+  const ui = setup({ dock_side: null, x: 600, y: 300 }, { ipcMovedFalse: true });
   await ui.advance(0);
   await ui.node("app").dispatch("mousedown", { button: 0, clientX: 100, detail: 1 });
   ui.move(1640, 300, { x: 1740, y: 322 }, false);

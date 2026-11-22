@@ -5,6 +5,27 @@ export interface Point { x: number; y: number }
 export const EDGE_THRESHOLD = 6;
 export const EDGE_PEEK = 6;
 
+/**
+ * 平台判定：tao 的 cursorPosition 在 macOS Retina 上 y 值错一整屏（物理像素高减
+ * 点坐标后仍按逻辑乘 scale，见 widget.ts dockTarget 的注释），macOS 的吸附判定
+ * 不能依赖全局光标坐标，需要退化到卡片几何。
+ * 测试沙箱没有 navigator，视为非 macOS。
+ */
+export function isMacOS(): boolean {
+  return typeof navigator === "undefined" ? false : navigator.userAgent.includes("Macintosh");
+}
+
+/**
+ * 吸附判定带（逻辑像素）。macOS 略放宽到 24：
+ * 顶边是菜单栏（workArea.y ≈ 25 逻辑 px），且把窗口拖到菜单栏处停留会触发
+ * 系统的「进入全屏/调度中心」手势——手势接管拖动，松手窗口被弹回原位。
+ * 判定的意图信号是「鼠标贴边」（点能精确贴到 x=0，见 dockTarget 的说明），
+ * 24px 对指针足够精确；其它平台保持原有的 6px 精确吸附。
+ */
+export function edgeThreshold(): number {
+  return isMacOS() ? 24 : EDGE_THRESHOLD;
+}
+
 /** Animate content in a full-sized viewport; shrink the native window only after settling. */
 export function edgeTransform(width: number, height: number, side: EdgeSide, progress: number) {
   const amount = Math.max(0, Math.min(1, progress));

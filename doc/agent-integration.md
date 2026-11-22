@@ -38,6 +38,8 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 
 所有接入共用 `NormalizedEvent / EventKind → state.rs 会话状态机 → 事件流、悬浮窗、流光和通知`。适配器负责把宿主信号翻译为统一事件，并补齐结束原因；状态机负责跃迁、移除运行态和抑制重复终态。正常完成、明确取消、执行失败分别为 `run_completed`、`run_aborted`、`run_failed`，不应仅凭宿主字段名 `completed` 就认定成功。前端事件流和悬浮窗共用事件标签，取消统一展示「已终止」。
 
+> **「本地证据」终态补偿的扩展点**：有些 agent 的关键终态**不发 hook**（Codex 的 `task_complete.error`、Qoder 的合成 API 错误、CodeBuddy 漏收的 `Stop`），只能读它自己的 transcript / 日志补出统一事件。这类 watcher 在 `app/src-tauri/src/evidence.rs` 注册：声明所属 agent、事件 id 前缀、入口过滤和「是否仍属于当前回合」的判据。`run_pipeline` / `is_stale_replay` 只做一次通用询问，**不含具体 agent 分支**；新增一个这类源 = 新 watcher 模块 + 注册表一行，状态机不用改。
+
 > **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败只由明确失败信号确认；Codex 异步提问未回答时保留等待相位，工具事件仍正常记录。
 
 > **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 要从回合记录区分取消与完成、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
@@ -49,7 +51,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | Qoder | `SessionEnd`（实测） | 立即释放（run_aborted） |
 | ZCode | 本地日志推断（非官方，~1s） | 立即释放（run_aborted） |
 | Claude Code | `SessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
-| CodeBuddy | `SessionEnd`（官方文档；本机可实测） | 同 Claude Code |
+| CodeBuddy | `SessionEnd`（官方文档；未实测） | 同 Claude Code |
 | OpenCode | `session.error` 带 `MessageAbortedError`（社区插件实证，未实测） | 立即释放（run_aborted，其后的 idle 被压制） |
 | WorkBuddy | 回合 JSONL 的 assistant/incomplete + skipRun + `Interrupted by user`；运行中被归档也视为终止 | 下一轮轮询释放（约 5 秒） |
 | TraeWork | `chat_turn.turn_status=canceled`（实测） | 立即释放（run_aborted） |
@@ -135,11 +137,18 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | --- | --- |
 | id | `codebuddy` |
 | 配置文件 | `~/.codebuddy/settings.json` |
-| 安装标记 | `~/.codebuddy` 目录存在 |
+| 安装标记 | `~/.codebuddy/settings.json` / `.mcp.json` / `skills/`，或原生二进制 `%LOCALAPPDATA%\codebuddy\bin`、`~/.local/bin/codebuddy`（**不能只看 `~/.codebuddy` 目录**：WorkBuddy 也会创建它） |
 | 注册事件 | `SessionStart`、`UserPromptSubmit`/`PreToolUse`→activity、`Notification`→input_required、`PostToolUseFailure`→tool_failed、`Stop`→run_completed、**`StopFailure`→run_failed**、**`SessionEnd`→run_aborted（会话结束释放）** |
 | 需要你做 | 在会话里运行 `/hooks` 面板，**审核外部修改的 hooks** 后才会生效 |
 
-**坑**：官方 CLI 事件表此前未公开，现在已挂出（codebuddy.ai/docs/zh/cli/hooks，CodeBuddy Code CLI v1.16.0+ Beta，27+ 事件，近逐字镜像 Claude Code）——已按 Claude Code 同款口径补齐 SessionEnd / StopFailure / 心跳（**未实测**，但本机装有 CodeBuddy 可直接验证）。官方同样明确 Stop 在用户中断时不触发，中止释放逻辑与 §1 Claude Code 一致。升级后需**重新开关一次**让新事件写入配置（校验只认 exe 路径，旧配置不会误报失效，但缺新事件）。
+**坑**：官方 CLI 事件表此前未公开，现在已挂出（codebuddy.ai/docs/zh/cli/hooks，CodeBuddy Code CLI v1.16.0+ Beta，27+ 事件，近逐字镜像 Claude Code）——已按 Claude Code 同款口径补齐 SessionEnd / StopFailure / 心跳（**本机未安装 CodeBuddy，未实测**；有装机的机器可直接用 `/hooks` 面板核对）。官方同样明确 Stop 在用户中断时不触发，中止释放逻辑与 §1 Claude Code 一致。升级后需**重新开关一次**让新事件写入配置（校验只认 exe 路径，旧配置不会误报失效，但缺新事件）。
+
+**漏收 Stop 的兜底（2026-11-20，本机未安装 CodeBuddy，未现场实测）**：CodeBuddy 的 `Stop` hook 是 fire-and-forget，IDE 版还有「任务已完成但 hook 没送达 / 宿主提前回收进程」的反馈；此前 5 分钟核验对 CodeBuddy 没有任何来源可读，一次漏收就会永远停在「思考中」。现在 daemon 按 hook 声明的 `transcript_path`（官方 hooks 口径是每条 hook 都带；本机未实测）做只读核验：
+
+- CLI / WebUI 的 `~/.codebuddy/projects/<mangled-cwd>/<session_id>.jsonl`：只认最后一条记录是助手回答、`status=completed`，且没有失败/中断标记（`error`、`isApiErrorMessage`、`aborted`、`providerData.skipRun`）；后面还有 `function_call` / `function_call_result` / `reasoning` 或任何**非元数据**记录（只放行 `session-meta` / `file-history-snapshot` / `turn-metrics` / `summary` / `ai-title`），或状态是 `incomplete`、缺 `status`、缺时间戳，都不算完成。末尾没有换行的最后一条记录也会被读取。
+- IDE / VS Code 扩展的 `CodeBuddyExtension/Data/.../history/<ws>/<conversation>/index.json`：只认 `messages[]` 最后一条是 `assistant`，**以它的 `messages/<id>.json` 为准**（每秒重读：索引不变时 body 后落盘/半写也能补到）；body 缺失或不可解析时才退回索引里的内联副本。最后一条是 `tool` 或 `user`、没有显式 `status`、没有时间戳都不收档；索引里的 `id` 必须是单段文件名（防跨目录读取）。
+- 候选还必须晚于本回合起点与最近一次 hook 活动，并稳定 5 秒才投递（防止模型先落文本、随后才追加工具调用的半回合误报；这个窗口只是代理证据，实测到更大的「文本记录 → 工具记录」间隔时应调大）；5 分钟定时核验和托盘「检测运行状态」都会重读，已投递的同一答案不会重复通知。
+- 读取失败、文件不存在、格式漂移都**保留最后已知状态**，等 hook 或下一次核验；只读，不写 CodeBuddy 任何文件。`transcript_path` 缺失/非法时**不做全盘扫描、也不按 session id 查找**（CodeBuddy 没有 Qoder 那种精确查找兜底），只保留最后已知状态。若反馈者仍复现，先设 `BARK_DEBUG=1` 看 hook 是否带 `transcript_path`、该文件是否就是上述两种形态之一，再决定是否补新格式。
 
 ---
 
@@ -151,7 +160,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | 配置文件 | **`~/.qoder/settings.json`（国际版，桌面应用 / IDE / CLI 三个入口共用）** · **`~/.qoder-cn/settings.json`（国内版 Qoder CN）** |
 | 安装标记 | `~/.qoder` 或 `~/.qoder-cn` 目录存在（装任一版本都能检测到） |
 | 注册事件 | `UserPromptSubmit`→activity、`PreToolUse`→activity、`Notification`→**见下（授权等待=等待色）**、`PostToolUseFailure`→tool_failed、`Stop`→run_completed、**`SessionEnd`→run_aborted（主动中断清场）** |
-| 需要你做 | 改完配置**要完全退出并重启对应应用**（三个入口都只在启动时加载 hooks） |
+| 需要你做 | 桌面版实测改完即生效；若未生效，完全退出并重启对应应用 |
 
 > 国际版与国内版**合并成一条 adapter**（与 TraeCode 的「国际版 / 国内版」同样式）：存在哪个配置文件就写哪个，两个都在就都写——一般人不会同时装两个版本。原来的独立条目 `qoder-cn` 已下线，老配置里的开关会在加载时并到 `qoder` 上。
 
@@ -164,6 +173,8 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 - 「等你授权」两版一致：**`Notification` + `notification_type=permission_prompt`**（`message` 形如 `Tool Bash requires confirmation`）→ 归一到 `InputRequired` 后被 `normalize()` 升级为 `PermissionRequired` → 等待色「需要确认」；
 - 「主动中断」两版一致：正常回合是 `… Stop` + `SessionEnd`（相隔约 150ms），**用户主动中断的回合只有 `SessionEnd`、没有 `Stop`**。不注册 `SessionEnd` 的话，被中断的会话会永远留在「运行中」列表、流光一直停在思考色；它归一成 `run_aborted`（中止）——会话立即清出列表，流光在没有别的会话在跑时直接收起（不亮失败色也不亮完成色、不通知，那是你自己按的停止）。正常回合那条 `SessionEnd` 会被状态机的**终态回声**抑制（不重复处理、不压掉完成色）；
 - `Stop` 带 `last_assistant_message`（助手回复全文），已优先取作通知正文；桌面应用模式下 `cwd` 是它自己的会话目录（`…\Documents\Qoder\<日期>\<会话id>`），项目名推导会自动跳过会话 id / 日期这类目录段；
+- **额度用尽 / 鉴权失效不发任何 hook**（2026-11-16 本机实测，Qoder CN 0.5.12，账户额度耗尽）：模型请求被服务端拒绝时 hooks 停在上一条 `UserPromptSubmit`，**没有 `Stop`、没有 `SessionEnd`**，会话会一直停在「思考中」。引擎会在 transcript 末尾写一条 `model="<synthetic>"`、`isApiErrorMessage=true` 的助手消息（实测原文：`inference.remoteChat.stream failed (403): {"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}`）。daemon 每秒增量尾读**当前回合**的 transcript，把它合成 `run_failed`（通知提示「额度或套餐不足」并带 pricing 链接），与 Codex 的 `usage_limit_exceeded` 同口径。只认当前回合：错误早于会话 `started_at`、之后又有 `user` 记录（新提示或工具结果）或正常助手回复、`aborted:true` 的合成消息都不算；transcript 路径优先取 hook 的 `transcript_path`，缺失时按精确 session id 在 `~/.qoder/projects/<项目>/<id>.jsonl` 与 `~/.qoder-cn/projects/...` 下查找；读不到或格式变化时保留最后已知状态（非官方格式，只读不写）。
+- **回合结束后还会跑「记忆」后台代理，工具 hook 会晚到且没有终态**（2026-11-18 本机实测，Qoder CN 0.5.14）：内置 `qoder-memory` 插件注册的是 **async `Stop` hook**，主回合 `Stop` 之后约 1 分钟起跑一个 **memory-fork 回合**，用 `Read / Write / Edit / Glob` 读写 `~/.qoder-cn/memory/*.md` 与 `~/.qoder-cn/projects/<项目>/memory/`。这些工具调用**按父会话 id 触发我们注册的 `PreToolUse` / `PostToolUse`**，但那个 fork 回合**没有 `Stop`、没有 `SessionEnd`**——放行进状态机就会给刚完成的会话凭空建出一行「执行工具 → 思考中」，而且没有任何事件能收掉它（用户可见症状：**「Qoder 完成后过几分钟又自动变成思考中」**，实测 16:00:29 `Stop` → 16:01:33 起 memory-fork 的 `Read/Write/Edit` 全部打到我们的 hook，之后再无终态）。adapter 侧按**路径**过滤：工具事件里的文件落在 `~/.qoder` / `~/.qoder-cn` 里就判为 agent 内部维护，整条丢弃（判据与实测记录见 `claude_style::touches_qoder_home`）。用户的工程不会在这两个目录里；代价上限是「有人让 Qoder 改 `~/.qoder` 里的文件时，这一轮少显示执行工具相位」；
 - ⚠️ **国内版桌面应用启动时会整份重写 `~/.qoder-cn/settings.json`**（连 CN IDE 自己的插件键都一起冲掉），我们写的 hooks 会被清掉。UI 侧已把「配置开着但 hook 不在」显示成开关关闭，点一下即重新写入（见 §0 与排查清单）。
 
 **实测状态**：
@@ -730,15 +741,16 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 2. **事件到了吗**：GUI「事件流」页看有没有新事件。有事件但没通知 → 是规则问题（免打扰时段、聚合窗口、子代理事件不通知、渠道开关、静音）；
 3. **hook 被调起了吗**：设 `BARK_DEBUG=1` 后重启 agent，hook 会在 stderr 打印上报结果（含失败原因，不含 token 明文）；
 4. **端口/token 改过吗**：设置页「服务信息」会提示「需重启生效」；
-5. **应用侧要不要信任/重启**：见各 agent 的「需要你做」一列——TraeCode / CodeBuddy / Codex 需要信任、Qoder / Qoder CN 需要重启、**ZCode 需要新建会话**；
+5. **应用侧要不要信任/重启**：见各 agent 的「需要你做」一列——TraeCode / CodeBuddy / Codex 需要信任、Qoder / Qoder CN 未生效时需重启、**ZCode 需要新建会话**；
 6. **ZCode 专项**：① 它读的是**用户级** `~/.zcode/cli/config.json`，写在项目里的 `hooks` 会被整体忽略；② 看看 `~/.zcode/cli/log/zcode-<日期>.jsonl`——`config.file.invalid`/`Config file failed to load` 说明那份 JSON 不被接受（**最常见的原因是文件带了 UTF-8 BOM**），`hook.run.failed` 说明我们的条目被调起但失败了。
 
 **流光不亮但通知正常**：多半是心跳类事件没注册（见 TraeCode / Qoder / CN 的 activity 说明），或者该 agent 是监控型且心跳没发出去。
 
 **回合结束后流光一直停在思考色、「运行中会话」列表里那条不消失**：说明这次回合结束的信号没被我们收到。已知情形：
 - Qoder / Qoder CN **用户主动中断**时只有 `SessionEnd`、没有 `Stop`（见 §4，已注册处理 → `run_aborted`）；
+- Qoder / Qoder CN **额度用尽、鉴权失效**时一个 hook 都不发（见 §4）：daemon 每秒尾读当前回合 transcript，按合成 API 错误消息合成 `run_failed`；
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
-- **定期核验**：每 5 分钟主动请求各来源检测。Codex 重读当前回合的有限 JSONL 尾部；WorkBuddy、TraeWork、Kimi Work、豆包工作唤醒已有监控线程；ZCode 与 TRAE Code 日志观察器继续按秒读取。
+- **定期核验**：每 5 分钟主动请求各来源检测。Codex 重读当前回合的有限 JSONL 尾部；Qoder 的 transcript 观察器每秒增量读取（主动核验时重读有限尾部）；CodeBuddy 按 `transcript_path` 读 CLI/IDE 会话记录，只认显式 `status=completed` 且没有失败/中断标记、其后没有非元数据记录（IDE 的正文文件每秒重读，候选稳定 5 秒才收档）；WorkBuddy、TraeWork、Kimi Work、豆包工作唤醒已有监控线程；ZCode 与 TRAE Code 日志观察器继续按秒读取。
 - **证据不足时保留**：没有终态事件、数据库不可读、日志静默或暂不支持核验，都不再推断失败/中止。进程仍存在也不能证明某个具体回合仍在执行。
 - **立即核验**：托盘菜单 →「检测运行状态」，核验结果经原事件管道更新会话和光效，不再无条件熄灭。`BARK_STALE_AFTER_MS` 已移除。
 

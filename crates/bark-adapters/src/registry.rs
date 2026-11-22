@@ -62,13 +62,21 @@ pub struct WatchRuntime {
     pub errors: HashMap<String, String>,
 }
 
-/// 汇总所有 agent 的状态（UI 面板数据源）
-pub fn statuses(cfg: &BarkConfig, exe_path: &str, watch: &WatchRuntime) -> Vec<AgentStatus> {
+/// 汇总所有 agent 的状态（UI 面板数据源）。
+///
+/// `lang`：面板上直接展示的 trust_hint / unavailable_reason 按界面语言取词。
+pub fn statuses(
+    cfg: &BarkConfig,
+    exe_path: &str,
+    watch: &WatchRuntime,
+    lang: bark_core::Lang,
+) -> Vec<AgentStatus> {
     let mut out = Vec::new();
     let ctx = RegisterCtx {
         exe_path: exe_path.to_string(),
         port: 0,
         token: String::new(),
+        lang,
     };
 
     for adapter in hook_adapters() {
@@ -86,7 +94,7 @@ pub fn statuses(cfg: &BarkConfig, exe_path: &str, watch: &WatchRuntime) -> Vec<A
             installed: adapter.is_installed(),
             registered,
             enabled: cfg.agent_enabled(id),
-            trust_hint: adapter.trust_hint(),
+            trust_hint: adapter.trust_hint(lang),
             // 只列**实际会写入**的配置（父目录不存在时 register 会跳过）：
             // 合并型 adapter（如 Qoder 的国际版 + 国内版两个路径）只装了一个版本时，
             // 卡片上不该出现另一个不存在的路径
@@ -113,11 +121,14 @@ pub fn statuses(cfg: &BarkConfig, exe_path: &str, watch: &WatchRuntime) -> Vec<A
             // 只有真的跑起来了才算「已接入」，避免显示「监控中」却什么都不产出
             registered: running,
             enabled: cfg.agent_enabled(id),
-            trust_hint: Some("非官方方案：轮询本地会话库，应用升级可能导致失效"),
+            trust_hint: Some(match lang {
+                bark_core::Lang::Zh => "非官方方案：轮询本地会话库，应用升级可能导致失效",
+                bark_core::Lang::En => "Unofficial: polls the local session database; app upgrades may break it",
+            }),
             config_paths: Vec::new(),
             verify: None,
             last_error: if !available {
-                adapter.unavailable_reason()
+                adapter.unavailable_reason(lang)
             } else {
                 watch.errors.get(id).cloned()
             },

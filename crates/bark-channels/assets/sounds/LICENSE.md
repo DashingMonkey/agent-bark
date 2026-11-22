@@ -5,7 +5,7 @@
 
 | 文件 | 来源 | 许可 |
 | --- | --- | --- |
-| chime / deep | 「UI Sound Effects (Button Clicks, User Feedback, Notifications)」— Robin Lamb，opengameart.org/content/ui-sound-effects-button-clicks-user-feedback-notifications | CC0 |
+| deep | 「UI Sound Effects (Button Clicks, User Feedback, Notifications)」— Robin Lamb，opengameart.org/content/ui-sound-effects-button-clicks-user-feedback-notifications | CC0 |
 | confirm / success / drop / pluck / glass / error | Kenney「Interface Sounds」，kenney.nl/assets/interface-sounds | CC0 |
 
 来源包内含原始许可文件（Kenney 包的 License.txt / OpenGameArt 页面的 CC0 标记）。

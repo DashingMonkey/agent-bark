@@ -167,6 +167,7 @@ mod tests {
             agent: "dsh".into(),
             kind: EventKind::RunCompleted,
             session_id: "s".into(),
+            transcript_path: None,
             cwd: cwd.into(),
             project: project.map(str::to_string),
             message: String::new(),
@@ -189,7 +190,12 @@ mod tests {
     #[test]
     fn missing_project_is_derived_from_cwd() {
         // 插件型 adapter 只送 cwd：补出项目名，通知首行不再是一整条路径
-        let mut ev = event(r"D:\workspace\gitee\agent-bark", None);
+        // 末段解析靠平台分隔符：反斜杠字面量在 unix 上不是分隔符，按平台给路径
+        #[cfg(windows)]
+        let cwd = r"D:\workspace\gitee\agent-bark";
+        #[cfg(not(windows))]
+        let cwd = "/tmp/workspace/gitee/agent-bark";
+        let mut ev = event(cwd, None);
         fill_project(&mut ev);
         assert_eq!(ev.project.as_deref(), Some("agent-bark"));
     }

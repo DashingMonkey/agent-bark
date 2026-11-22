@@ -30,8 +30,6 @@ function setup(place = async () => true) {
       removeAttribute(name) { delete this.attributes[name]; },
       addEventListener(name, fn) { this.events[name] = fn; },
       querySelector(selector) { return children.find((child) => `.${child.className}` === selector); },
-      getBoundingClientRect: () => ({ top: 10, bottom: 42 }),
-      closest: () => ({ getBoundingClientRect: () => ({ top: 5, bottom: 197 }) }),
     };
   }
   const body = element();
@@ -49,10 +47,14 @@ function setup(place = async () => true) {
     require: (id) => { assert.equal(id, "./session-time"); return timeModule; }, console: { warn() {} },
   });
   api.initRowTip({ place, close: async () => { closes++; } });
-  const row = element();
-  row.dataset = { tipHeading: "Codex", tip: "passport-firmware-alpha", startedAt: String(now - 5000) };
+  const data = {
+    key: "codex|s1", heading: "Codex", body: "passport-firmware-alpha", startedAt: now - 5000,
+    card: { x: 0, y: 0, width: 280, height: 100 },
+    screen: { x: 0, y: 0, width: 1920, height: 1080 },
+    rowTop: 10,
+  };
   return {
-    api, row, box: body.children[0], closes: () => closes,
+    api, data, box: body.children[0], closes: () => closes,
     now: () => now,
     intervalCount: () => [...timers.values()].filter((timer) => timer.interval).length,
     visibility(hidden) { document.hidden = hidden; document.events.visibilitychange(); },
@@ -71,21 +73,21 @@ function setup(place = async () => true) {
 test("leaving before the delay never requests native popup geometry", async () => {
   let placed = 0;
   const ui = setup(async () => { placed++; return true; });
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   ui.api.hideRowTip();
   await ui.advance(300);
   assert.equal(placed, 0);
   assert.equal(ui.box.classList.contains("show"), false);
 });
 
-test("late native resize completion cannot resurrect a dismissed tooltip", async () => {
+test("late native positioning completion cannot resurrect a dismissed tooltip", async () => {
   let finish;
   let isCurrent;
-  const ui = setup((_box, _row, current) => {
+  const ui = setup((_box, _data, current) => {
     isCurrent = current;
     return new Promise((resolve) => { finish = resolve; });
   });
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
   assert.equal(isCurrent(), true);
   ui.api.hideRowTip();
@@ -93,12 +95,11 @@ test("late native resize completion cannot resurrect a dismissed tooltip", async
   finish(true);
   await ui.advance(0);
   assert.equal(ui.box.classList.contains("show"), false);
-  assert.equal(ui.row.attributes["aria-describedby"], undefined);
 });
 
-test("moving across the gap into the details keeps them visible", async () => {
+test("moving across the gap into the details keeps them visible (DOM hover)", async () => {
   const ui = setup();
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
   ui.api.scheduleTipHide();
   await ui.advance(100);
@@ -110,24 +111,39 @@ test("moving across the gap into the details keeps them visible", async () => {
   assert.equal(ui.box.classList.contains("show"), false);
 });
 
-test("snapshot refresh updates visible details, removed/scrolled-away rows dismiss them", async () => {
+test("macOS forwarded hover enter/leave keeps then dismisses the details", async () => {
   const ui = setup();
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
-  ui.row.dataset.tip = "updated-project";
-  ui.api.refreshRowTip();
+  ui.api.scheduleTipHide();
+  await ui.advance(100);
+  ui.api.tipHover(true);
+  await ui.advance(200);
+  assert.equal(ui.box.classList.contains("show"), true);
+  ui.api.tipHover(false);
+  await ui.advance(160);
+  assert.equal(ui.box.classList.contains("show"), false);
+});
+
+test("same-row refresh updates visible details in place", async () => {
+  const ui = setup();
+  ui.api.scheduleRowTip(ui.data);
+  await ui.advance(220);
+  ui.api.scheduleRowTip({ ...ui.data, body: "updated-project" });
   await ui.advance(0);
   assert.equal(ui.box.querySelector(".tip-body").textContent, "updated-project");
   assert.equal(ui.box.classList.contains("show"), true);
-  ui.row.getBoundingClientRect = () => ({ top: -40, bottom: -8 });
   ui.api.refreshRowTip();
+  await ui.advance(0);
+  assert.equal(ui.box.classList.contains("show"), true);
+  ui.api.hideRowTip();
   assert.equal(ui.box.classList.contains("show"), false);
 });
 
 test("blocked or failed native positioning never displays a clipped tooltip", async () => {
   for (const place of [async () => false, async () => { throw Error("window destroyed"); }]) {
     const ui = setup(place);
-    ui.api.scheduleRowTip(ui.row);
+    ui.api.scheduleRowTip(ui.data);
     await ui.advance(220);
     assert.equal(ui.box.classList.contains("show"), false);
     assert.ok(ui.closes() >= 1);
@@ -138,7 +154,7 @@ test("hover duration ticks without snapshots or native resize and catches up on 
   let placements = 0;
   const ui = setup(async () => { placements++; return true; });
   const duration = ui.box.querySelector(".tip-duration");
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
   assert.equal(duration.textContent, "已运行 5秒");
   assert.equal(ui.intervalCount(), 1);
@@ -150,7 +166,7 @@ test("hover duration ticks without snapshots or native resize and catches up on 
   ui.api.hideRowTip();
   assert.equal(ui.intervalCount(), 0);
   await ui.advance(90000);
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
   assert.equal(duration.textContent, "已运行 2分40秒");
   assert.equal(ui.intervalCount(), 1);
@@ -158,18 +174,16 @@ test("hover duration ticks without snapshots or native resize and catches up on 
 
 test("new turns reset hover duration and terminal rows stop it", async () => {
   const ui = setup();
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
-  ui.row.dataset.startedAt = String(ui.now());
-  ui.api.refreshRowTip();
+  ui.api.scheduleRowTip({ ...ui.data, startedAt: ui.now() });
   await ui.advance(0);
   const duration = ui.box.querySelector(".tip-duration");
   assert.equal(duration.textContent, "已运行 0秒");
   await ui.advance(1000);
   assert.equal(duration.textContent, "已运行 1秒");
-  for (const value of ["", "invalid"]) {
-    ui.row.dataset.startedAt = value;
-    ui.api.refreshRowTip();
+  for (const value of [0, NaN]) {
+    ui.api.scheduleRowTip({ ...ui.data, startedAt: value });
     await ui.advance(0);
     assert.equal(duration.hidden, true);
     assert.equal(duration.textContent, "");
@@ -179,7 +193,7 @@ test("new turns reset hover duration and terminal rows stop it", async () => {
 
 test("a hidden hover panel suspends its timer and recalculates when visible", async () => {
   const ui = setup();
-  ui.api.scheduleRowTip(ui.row);
+  ui.api.scheduleRowTip(ui.data);
   await ui.advance(220);
   ui.visibility(true);
   assert.equal(ui.intervalCount(), 0);

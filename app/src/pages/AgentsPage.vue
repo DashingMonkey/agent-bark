@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { api, agentIcon, type AgentStatus, type Diagnostics } from "../api";
+import { locale } from "../i18n";
+
+const { t } = useI18n();
 
 const statuses = ref<AgentStatus[]>([]);
 const diag = ref<Diagnostics | null>(null);
@@ -38,7 +42,7 @@ async function refresh(silent = false) {
   } catch (e) {
     if (gen !== refreshGen) return;
     statuses.value = [];
-    loadError.value = `扫描失败：${e}`;
+    loadError.value = t("agents.scanFailed", { error: String(e) });
   } finally {
     if (!silent) loading.value = false;
   }
@@ -57,21 +61,21 @@ async function toggle(s: AgentStatus, enabled: boolean) {
     }
     await refresh(true);
   } catch (e) {
-    messages.value[s.kind] = `操作失败：${e}`;
+    messages.value[s.kind] = t("agents.actionFailed", { error: String(e) });
     await refresh(true);
   } finally {
     busy.value = null;
   }
 }
 
-function statusBadge(s: AgentStatus): { text: string; cls: string } {
-  if (!s.installed) return { text: "未安装", cls: "badge" };
-  if (s.mode === "planned") return { text: "开发中", cls: "badge" };
-  if (s.verify?.state === "config_unreadable") return { text: "配置损坏", cls: "badge err" };
-  if (s.verify?.state === "stale_path") return { text: "hook 失效", cls: "badge err" };
-  if (s.registered) return { text: s.mode === "watch" ? "监控中" : "已接入", cls: "badge ok" };
-  if (s.enabled) return { text: s.mode === "watch" ? "监控未运行" : "hook 已丢失", cls: "badge warn" };
-  return { text: "已安装", cls: "badge on" };
+function statusBadge(s: AgentStatus): { textKey: string; cls: string } {
+  if (!s.installed) return { textKey: "agents.status.notInstalled", cls: "badge" };
+  if (s.mode === "planned") return { textKey: "agents.status.inDevelopment", cls: "badge" };
+  if (s.verify?.state === "config_unreadable") return { textKey: "agents.status.configBroken", cls: "badge err" };
+  if (s.verify?.state === "stale_path") return { textKey: "agents.status.hookStale", cls: "badge err" };
+  if (s.registered) return { textKey: s.mode === "watch" ? "agents.status.monitoring" : "agents.status.connected", cls: "badge ok" };
+  if (s.enabled) return { textKey: s.mode === "watch" ? "agents.status.watchNotRunning" : "agents.status.hookLost", cls: "badge warn" };
+  return { textKey: "agents.status.installed", cls: "badge on" };
 }
 
 /// 开关的显示状态 = **实际接上了**（配置里开着 + 校验通过）。
@@ -87,10 +91,10 @@ function isOn(s: AgentStatus): boolean {
 function problem(s: AgentStatus): string | null {
   if (s.last_error) return s.last_error;
   if (s.verify?.state === "config_unreadable") {
-    return `配置文件无法解析：${s.verify.path} —— ${s.verify.reason}`;
+    return t("agents.problem.configUnreadable", { path: s.verify.path, reason: s.verify.reason });
   }
   if (s.verify?.state === "stale_path") {
-    return `hook 指向的程序已不存在（可能重装/移动过）：${s.verify.path}。重新勾选即可修复。`;
+    return t("agents.problem.hookStale", { path: s.verify.path });
   }
   return null;
 }
@@ -100,9 +104,7 @@ function actionHint(s: AgentStatus): string | null {
   if (!s.installed || s.mode === "planned" || !s.enabled || s.registered) return null;
   // 上面 problem() 已经给出处理方式，这里不抢
   if (s.verify?.state === "config_unreadable" || s.verify?.state === "stale_path") return null;
-  return s.mode === "watch"
-    ? "监控未在运行（会话库不可用或轮询启动失败）：点右侧开关重新开启即可重试"
-    : "配置文件里已经没有我们的 hook（可能被目标应用重写或清空过）：点右侧开关重新写入即可";
+  return s.mode === "watch" ? t("agents.actionHint.watch") : t("agents.actionHint.hook");
 }
 
 // ---- 排序与分组 ----
@@ -140,8 +142,8 @@ const groups = computed(() => {
   const detected = statuses.value.filter((s) => s.installed).sort(byName);
   const missing = statuses.value.filter((s) => !s.installed).sort(byName);
   return [
-    { key: "detected", title: "已检测到", items: detected },
-    { key: "missing", title: "未检测到", items: missing },
+    { key: "detected", titleKey: "agents.group.detected", items: detected },
+    { key: "missing", titleKey: "agents.group.missing", items: missing },
   ].filter((g) => g.items.length > 0);
 });
 
@@ -202,19 +204,21 @@ async function bulkToggle() {
         delete messages.value[s.kind];
       }
     } catch (e) {
-      messages.value[s.kind] = `操作失败：${e}`;
+      messages.value[s.kind] = t("agents.actionFailed", { error: String(e) });
       failed.push(s.display_name);
     }
   }
   bulkBusy.value = false;
   await refresh(true);
 
-  const verb = target ? "开启" : "关闭";
+  const action = target ? t("agents.verbEnable") : t("agents.verbDisable");
   const ok = targets.length - failed.length;
   bulkFailed.value = failed.length > 0;
+  // 枚举名列表的连接符随语言：中文顿号、英文逗号
+  const names = failed.join(locale() === "en" ? ", " : "、");
   bulkMsg.value = failed.length
-    ? `已${verb} ${ok} 个 agent，${failed.length} 个失败（${failed.join("、")}）——原因见对应卡片`
-    : `已${verb} ${ok} 个 agent`;
+    ? t("agents.bulkFailed", { action, n: ok, failed: failed.length, names })
+    : t("agents.bulkDone", { action, n: ok });
 }
 
 onMounted(refresh);
@@ -222,10 +226,10 @@ onMounted(refresh);
 
 <template>
   <div>
-    <div class="between mb-14">
-      <h1 class="page-title">Agents 接入</h1>
-      <div class="row">
-        <button class="ghost" :disabled="loading || bulkBusy || !!busy" @click="refresh()">重新扫描</button>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("agents.title") }}</h1></div>
+      <div class="page-actions">
+        <button class="ghost" :disabled="loading || bulkBusy || !!busy" @click="refresh()">{{ $t("agents.rescan") }}</button>
         <!-- 一键总开关：开 = 全部开启（顺带修复 hook 失效的接入），关 = 全部关闭。
              显示态与 agent 开关同口径：只要还有没接上的就显示为关，翻开即全部开启。
              任意 setAgentEnabled 在途（单个 busy / 批量 bulkBusy）时整个开关区禁用：
@@ -233,8 +237,8 @@ onMounted(refresh);
         <label
           v-tooltip="
             toggleable.length
-              ? '一键开关所有已检测到的 agent（未安装与暂不支持接入的自动跳过）；开启时会顺带修复 hook 失效的接入'
-              : '本机暂无可接入的 agent'
+              ? $t('agents.bulkTip')
+              : $t('agents.bulkTipEmpty')
           "
           class="switch"
         >
@@ -242,7 +246,7 @@ onMounted(refresh);
             type="checkbox"
             :checked="toggleable.length > 0 && !bulkTarget"
             :disabled="loading || bulkBusy || !!busy || !toggleable.length"
-            aria-label="一键开关所有 agent"
+            :aria-label="$t('agents.bulkToggleLabel')"
             @change="bulkToggle"
           />
           <span class="track"></span>
@@ -250,111 +254,113 @@ onMounted(refresh);
       </div>
     </div>
 
-    <div v-if="bulkMsg" :class="[bulkFailed ? 'warn-box' : 'ok-box', 'mb-12']">{{ bulkMsg }}</div>
+    <div class="stack">
+      <div v-if="bulkMsg" :class="[bulkFailed ? 'warn-box' : 'ok-box']">{{ bulkMsg }}</div>
 
-    <div v-if="diag?.startup_warnings?.length" class="warn-box mb-12">
-      启动自检发现问题：
-      <div v-for="(w, i) in diag.startup_warnings" :key="i" class="mt-4">· {{ w }}</div>
-    </div>
+      <div v-if="diag?.startup_warnings?.length" class="warn-box">
+        {{ $t("agents.startupWarnings") }}
+        <div v-for="(w, i) in diag.startup_warnings" :key="i" class="mt-4">· {{ w }}</div>
+      </div>
 
-    <div v-if="diag?.config_error" class="warn-box mb-12">
-      配置读取失败：{{ diag.config_error }}<br />
-      文件：{{ diag.config_path }}（当前使用默认配置运行，修复文件后重启应用即可）
-    </div>
+      <div v-if="diag?.config_error" class="warn-box">
+        {{ $t("agents.configError", { error: diag.config_error }) }}<br />
+        {{ $t("agents.configErrorFile", { path: diag.config_path }) }}
+      </div>
 
-    <div v-if="loading" class="empty">扫描中…</div>
+      <div v-if="loading" class="empty">{{ $t("agents.scanning") }}</div>
 
-    <div v-else-if="loadError" class="empty">
-      {{ loadError }}
-      <div class="mt-12"><button class="ghost" @click="refresh()">重新扫描</button></div>
-    </div>
+      <div v-else-if="loadError" class="empty">
+        {{ loadError }}
+        <div class="mt-12"><button class="ghost" @click="refresh()">{{ $t("agents.rescan") }}</button></div>
+      </div>
 
-    <div v-else-if="!statuses.length" class="empty">未检测到支持的 agent</div>
+      <div v-else-if="!statuses.length" class="empty">{{ $t("agents.noneFound") }}</div>
 
-    <div v-else>
-      <template v-for="g in groups" :key="g.key">
-        <!-- 未检测到组：标题整行可点，展开/收起（chevron 指向随状态翻转） -->
-        <div
-          v-if="g.key === 'missing'"
-          class="group-title group-toggle"
-          role="button"
-          tabindex="0"
-          :aria-expanded="missingOpen"
-          @click="toggleMissing"
-          @keydown.enter.prevent="toggleMissing"
-          @keydown.space.prevent="toggleMissing"
-        >
-          <svg class="chev" :class="{ open: missingOpen }" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M4.25 6.5 8 10.25 11.75 6.5" />
-          </svg>
-          {{ g.title }}（{{ g.items.length }}）
-        </div>
-        <div v-else class="group-title">{{ g.title }}（{{ g.items.length }}）</div>
-
-        <template v-if="g.key !== 'missing' || missingOpen">
+      <template v-else>
+        <template v-for="g in groups" :key="g.key">
+          <!-- 未检测到组：标题整行可点，展开/收起（chevron 指向随状态翻转） -->
           <div
-            v-for="s in g.items"
-            :key="s.kind"
-            class="card"
-            :class="{ disabled: !s.installed || s.mode === 'planned' }"
+            v-if="g.key === 'missing'"
+            class="group-title group-toggle"
+            role="button"
+            tabindex="0"
+            :aria-expanded="missingOpen"
+            @click="toggleMissing"
+            @keydown.enter.prevent="toggleMissing"
+            @keydown.space.prevent="toggleMissing"
           >
-            <div class="between">
-              <div class="col grow">
-                <div class="row">
-                  <span class="agent-icon" v-html="agentIcon(s.kind)"></span>
-                  <span class="agent-name">{{ s.display_name }}</span>
-                  <span :class="statusBadge(s).cls">{{ statusBadge(s).text }}</span>
-                  <span v-if="s.mode === 'watch' && s.installed" class="badge warn">监控型</span>
-                </div>
-                <!-- 多路径（如 DeepseekHarness/OpenCode 的配置+插件）各占一行：
-                     用 · 拼一行时路径会在中途折断，哪段是哪个文件读不出来 -->
-                <span v-if="s.config_paths.length" class="agent-path">
-                  <span v-for="(p, i) in s.config_paths" :key="i">{{ p }}</span>
-                </span>
-              </div>
-  
-              <!-- 接入说明改为悬停显示的感叹号，不再常驻占一版面 -->
-              <span
-                v-if="s.trust_hint"
-                v-tooltip="s.trust_hint"
-                class="help-mark"
-                role="img"
-                :aria-label="s.trust_hint"
-              >
-                <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <circle cx="8" cy="8" r="6.1" />
-                  <path d="M8 4.9v4" />
-                  <circle class="dot" cx="8" cy="11.1" r="0.9" />
-                </svg>
-              </span>
-  
-              <label
-                v-tooltip="
-                  !s.installed
-                    ? '未安装'
-                    : s.mode === 'planned'
-                      ? '开发中'
-                      : isOn(s)
-                        ? '已接入，点击关闭'
-                        : '未接入，点击写入配置'
-                "
-                class="switch"
-              >
-                <input
-                  type="checkbox"
-                  :checked="isOn(s)"
-                  :disabled="!s.installed || s.mode === 'planned' || !!busy || bulkBusy"
-                  :aria-label="`${s.display_name} 接入开关`"
-                  @change="toggle(s, ($event.target as HTMLInputElement).checked)"
-                />
-                <span class="track"></span>
-              </label>
-            </div>
-  
-            <div v-if="messages[s.kind]" class="warn-box mt-8">{{ messages[s.kind] }}</div>
-            <div v-else-if="problem(s)" class="warn-box mt-8">{{ problem(s) }}</div>
-            <div v-else-if="actionHint(s)" class="hint mt-8">{{ actionHint(s) }}</div>
+            <svg class="chev" :class="{ open: missingOpen }" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4.25 6.5 8 10.25 11.75 6.5" />
+            </svg>
+            {{ $t(g.titleKey, { n: g.items.length }) }}
           </div>
+          <div v-else class="group-title">{{ $t(g.titleKey, { n: g.items.length }) }}</div>
+
+          <template v-if="g.key !== 'missing' || missingOpen">
+            <div
+              v-for="s in g.items"
+              :key="s.kind"
+              class="card"
+              :class="{ disabled: !s.installed || s.mode === 'planned' }"
+            >
+              <div class="between">
+                <div class="col grow">
+                  <div class="row">
+                    <span class="agent-icon" v-html="agentIcon(s.kind)"></span>
+                    <span class="agent-name">{{ s.display_name }}</span>
+                    <span :class="statusBadge(s).cls">{{ $t(statusBadge(s).textKey) }}</span>
+                    <span v-if="s.mode === 'watch' && s.installed" class="badge warn">{{ $t("agents.watchBadge") }}</span>
+                  </div>
+                  <!-- 多路径（如 DeepseekHarness/OpenCode 的配置+插件）各占一行：
+                       用 · 拼一行时路径会在中途折断，哪段是哪个文件读不出来 -->
+                  <span v-if="s.config_paths.length" class="agent-path">
+                    <span v-for="(p, i) in s.config_paths" :key="i">{{ p }}</span>
+                  </span>
+                </div>
+
+                <!-- 接入说明改为悬停显示的感叹号，不再常驻占一版面 -->
+                <span
+                  v-if="s.trust_hint"
+                  v-tooltip="s.trust_hint"
+                  class="help-mark"
+                  role="img"
+                  :aria-label="s.trust_hint"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <circle cx="8" cy="8" r="6.1" />
+                    <path d="M8 4.9v4" />
+                    <circle class="dot" cx="8" cy="11.1" r="0.9" />
+                  </svg>
+                </span>
+
+                <label
+                  v-tooltip="
+                    !s.installed
+                      ? $t('agents.status.notInstalled')
+                      : s.mode === 'planned'
+                        ? $t('agents.status.inDevelopment')
+                        : isOn(s)
+                          ? $t('agents.switchTip.connected')
+                          : $t('agents.switchTip.disconnected')
+                  "
+                  class="switch"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isOn(s)"
+                    :disabled="!s.installed || s.mode === 'planned' || !!busy || bulkBusy"
+                    :aria-label="$t('agents.switchAria', { name: s.display_name })"
+                    @change="toggle(s, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span class="track"></span>
+                </label>
+              </div>
+
+              <div v-if="messages[s.kind]" class="warn-box mt-8">{{ messages[s.kind] }}</div>
+              <div v-else-if="problem(s)" class="warn-box mt-8">{{ problem(s) }}</div>
+              <div v-else-if="actionHint(s)" class="hint mt-8">{{ actionHint(s) }}</div>
+            </div>
+          </template>
         </template>
       </template>
     </div>

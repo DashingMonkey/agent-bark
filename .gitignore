@@ -31,8 +31,6 @@ desktop.ini
 # Local
 *.bak
 *.tmp
-# 本地快速打包脚本（个人用，不入库；发版用 build.bat）
-build-quick.bat
 .env
 .env.local
 

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"
 
@@ -38,6 +38,8 @@ toml = "1"
 toml_edit = "0.25"
 dirs = "7"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# DSH 会话日志是 zstd 压缩的 JSONL（usage_collect.rs 解压读用量）
+zstd = "0.13"
 # TraeWork 会话库 SQLCipher 4 页面级解密（crates/bark-adapters/src/traework_db.rs）
 aes = "0.8"
 cbc = "0.1"
@@ -47,6 +49,8 @@ pbkdf2 = "0.12"
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+# 读取操作系统语言（界面语言 auto 档的解析源，见 bark-core/src/i18n.rs）
+sys-locale = "0.3"
 sysinfo = "0.39"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = "2"

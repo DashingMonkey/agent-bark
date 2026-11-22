@@ -369,9 +369,16 @@ impl DshAdapter {
     }
 
     fn register_for_startup_at(home: &Path, ctx: &RegisterCtx) -> anyhow::Result<Option<&'static str>> {
-        Ok(Self::register_at(home, ctx)?.then_some(
-            "DeepSeek Harness 插件或接入配置已更新；若 dsh 正在运行，请重启 dsh 以加载新版插件，否则等待状态可能无法及时更新。",
-        ))
+        // notice 是启动后直接整句展示给用户的提醒（state.rs 的 StartupWarning），
+        // 按界面语言取词；register_at 的错误链保持中文（诊断信息）
+        Ok(Self::register_at(home, ctx)?.then_some(match ctx.lang {
+            bark_core::Lang::Zh => {
+                "DeepSeek Harness 插件或接入配置已更新；若 dsh 正在运行，请重启 dsh 以加载新版插件，否则等待状态可能无法及时更新。"
+            }
+            bark_core::Lang::En => {
+                "DeepSeek Harness plugin or integration config has been updated; if dsh is running, restart it to load the new plugin, otherwise waiting states may not update in time."
+            }
+        }))
     }
 
     fn unregister_at(home: &Path, ctx: &InstallCtx) -> anyhow::Result<()> {
@@ -519,12 +526,26 @@ impl HookAdapter for DshAdapter {
         None
     }
 
-    fn trust_hint(&self) -> Option<&'static str> {
-        Some("接入或重新勾选后需要**重启 dsh**（实测运行中的 dsh 不会挂载 patch 新增条目，社区插件同样要求重启）。若重启后仍无通知：运行 dsh web --dump-config 确认 agent-bark 条目在列（不在列说明 patch 没挂上）。DSH 处于 Developer Preview，事件结构可能随版本变动")
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let (zh, en) = (
+            "接入或重新勾选后需要**重启 dsh**（实测运行中的 dsh 不会挂载 patch 新增条目，社区插件同样要求重启）。若重启后仍无通知：运行 dsh web --dump-config 确认 agent-bark 条目在列（不在列说明 patch 没挂上）。DSH 处于 Developer Preview，事件结构可能随版本变动",
+            "You must **restart dsh** after enabling or re-checking the integration (a running dsh does not pick up newly added patch entries; community plugins require the same). If notifications still do not arrive after restarting: run `dsh web --dump-config` and confirm the agent-bark entry is listed (if not, the patch was not applied). DSH is in Developer Preview; event schemas may change between versions",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh,
+            bark_core::Lang::En => en,
+        })
     }
 
-    fn unregister_hint(&self) -> Option<&'static str> {
-        Some("已移除 patch 条目与插件文件；正在运行的 dsh 进程里插件仍在内存中，会继续发送事件直到重启 dsh。重启前 daemon 已按开关忽略 DeepSeek Harness 的通知")
+    fn unregister_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let (zh, en) = (
+            "已移除 patch 条目与插件文件；正在运行的 dsh 进程里插件仍在内存中，会继续发送事件直到重启 dsh。重启前 daemon 已按开关忽略 DeepSeek Harness 的通知",
+            "Patch entries and the plugin file have been removed; the plugin is still in memory inside the running dsh process and will keep sending events until dsh is restarted. Until then the daemon ignores DeepSeek Harness notifications per the switch",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh,
+            bark_core::Lang::En => en,
+        })
     }
 }
 
@@ -1835,6 +1856,7 @@ mod tests {
             exe_path: String::new(),
             port: 1234,
             token: "tok".into(),
+            lang: bark_core::Lang::Zh,
         }
     }
 
@@ -2313,6 +2335,18 @@ mod tests {
         std::fs::write(&plugin, "// previous plugin version\n").unwrap();
         let notice = DshAdapter::register_for_startup_at(&home, &context).unwrap().unwrap();
         assert!(notice.contains("重启 dsh"));
+        // 英文界面取英文文案（notice 直接整句展示，跟随界面语言）。
+        // 再把插件文件写回旧版：register 是幂等的，文件没变时第二次调用不再返回 notice。
+        std::fs::write(&plugin, "// previous plugin version\n").unwrap();
+        let en_ctx = RegisterCtx {
+            exe_path: context.exe_path.clone(),
+            port: context.port,
+            token: context.token.clone(),
+            lang: bark_core::Lang::En,
+        };
+        let en_notice = DshAdapter::register_for_startup_at(&home, &en_ctx).unwrap().unwrap();
+        assert!(en_notice.contains("restart"), "英文 notice: {en_notice}");
+        assert!(!en_notice.contains("重启"), "英文界面不得出现中文文案: {en_notice}");
         assert_eq!(std::fs::read_to_string(&plugin).unwrap(), plugin_js(context.port, &context.token));
         assert!(DshAdapter::register_for_startup_at(&home, &context).unwrap().is_none());
 

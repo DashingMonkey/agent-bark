@@ -36,6 +36,23 @@
 //!   线程安全的，所有建窗/销毁/移动都经 `run_on_main_thread` 派发。
 //! - **每显示器一个窗口**：全屏覆盖窗无法跨屏，多屏场景只能一屏一个，全部收同一份状态。
 
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(GlowPanel {
+        config: {
+            can_become_key_window: false,
+            can_become_main_window: false,
+            is_floating_panel: true
+        }
+    })
+}
+// macOS：长驻条带窗（glow-N）转 NSPanel（与悬浮窗同理，见 widget.rs 顶部注释）——
+// 「点壁纸显示桌面」/调度中心「显示桌面」不再推走流光，光效回到桌面时保持可见。
+// 面板不成为 key、点击穿透由 set_ignore_cursor_events 继续（对 NSPanel 同样有效）。
+// 全屏特效窗（glow-burst-N）不转换：它的销毁路径在面板上会抛 NSException（见 create）。
+
+
+
 use bark_core::{EventKind, GlowConfig, GlowEffect, MonitorTarget, NormalizedEvent};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1014,11 +1031,40 @@ fn resend_latest(app: &AppHandle, label: &str) {
 /// 不动位置尺寸、不抢焦点；中间那一瞬的「非置顶」不可见（窗口内容一帧都没变）。
 /// 期间任务栏、开始菜单、通知中心**照常可用**——本层点击穿透且不可聚焦。
 fn raise(app: &AppHandle) {
-    for label in all_glow_labels(app) {
-        if let Some(w) = app.get_webview_window(&label) {
-            let _ = w.set_always_on_top(false);
-            let _ = w.set_always_on_top(true);
+    // macOS：不存在「任务栏盖住底部光带」的问题（那是 Windows 任务栏的指纹）。
+    // 这里改为**同步重申**面板层级——不能走 tao 的 set_always_on_top：它把层级
+    // 压回 Floating(3) 会覆盖建窗时设的 1000，且其异步 GCD 派发块里抛出的
+    // NSException 无法在调用侧捕获（Rust 直接 abort）。重申 1000 时若有异常，
+    // 用 [`objc_catch`] 兜住记日志，不把进程带崩。
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_nspanel::ManagerExt as _;
+        for label in all_glow_labels(app) {
+            if let Ok(panel) = app.get_webview_panel(&label) {
+                objc_catch("raise", || panel.as_panel().setLevel(1000));
+            }
         }
+        return;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        for label in all_glow_labels(app) {
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.set_always_on_top(false);
+                let _ = w.set_always_on_top(true);
+            }
+        }
+    }
+}
+
+/// macOS：捕获 NSException 记日志，而不是让 Rust 以「cannot catch foreign
+/// exceptions」abort 整个进程。定位 NSPanel 转换后窗口操作抛异常用。
+#[cfg(target_os = "macos")]
+fn objc_catch(name: &str, op: impl FnOnce()) {
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(op)) {
+        Ok(()) => {}
+        Err(Some(e)) => tracing::error!("流光[{name}] ObjC 异常: {}", e.to_string()),
+        Err(None) => tracing::error!("流光[{name}] 未知 ObjC 异常"),
     }
 }
 
@@ -1050,10 +1096,28 @@ pub fn destroy_all(app: &AppHandle) {
     destroy_burst_windows(app);
 }
 
+/// macOS：把面板转换过的窗口还原成普通窗口再返回（tauri-nspanel 的 `to_window`
+/// 会把类换回原 NSWindow），让后续 destroy 走普通窗口的销毁路径。未转换/转换
+/// 记录不存在的窗口原样返回。
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_window(w: tauri::WebviewWindow) -> tauri::WebviewWindow {
+    use tauri_nspanel::ManagerExt as _;
+    if let Ok(panel) = w.app_handle().get_webview_panel(w.label()) {
+        if let Some(restored) = panel.to_window() {
+            return restored;
+        }
+    }
+    w
+}
+
 /// 只销毁灯带窗口
 fn destroy_edge_windows(app: &AppHandle) {
     for label in edge_labels(app) {
         if let Some(w) = app.get_webview_window(&label) {
+            // macOS：条带窗是 NSPanel——先还原成普通窗口再销毁（见 create 的
+            // 转换注释：面板上的异步销毁路径会抛 NSException）
+            #[cfg(target_os = "macos")]
+            let w = restore_window(w);
             let _ = w.destroy();
         }
     }
@@ -1207,8 +1271,13 @@ fn create(
     // 过去——连点预览第二下「毫无反应」的根因正是这段真空期。
     let load_app = app.clone();
     let load_label = label.to_string();
+    // 窗口标题用户看不到，顺手跟随界面语言（与 widget / tray 的标题同一口径）
+    let lang = app.state::<Arc<AppState>>().lang();
     let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App("glow.html".into()))
-        .title("agent-bark 边缘流光")
+        .title(match lang {
+            bark_core::Lang::Zh => "AgentBark 屏幕光效",
+            bark_core::Lang::En => "AgentBark Screen Glow",
+        })
         .transparent(true)
         .decorations(false)
         .shadow(false)
@@ -1252,6 +1321,30 @@ fn create(
     // 声明「别裁我的角」（Windows 专有；其它平台没有 DWM 这套，什么都不做）
     #[cfg(windows)]
     no_round_corners(&win);
+    // macOS：**只转换长驻条带窗**（glow-N）为 NSPanel——与悬浮窗同理，「点壁纸
+    // 显示桌面」/调度中心「显示桌面」不推走 utility/auxiliary 面板，光效回到桌面
+    // 时保持可见。全屏特效窗（glow-burst-N）**绝不转换**：它按秒生灭，「播完即毁」
+    // 的销毁走 tauri 的异步派发（proxy.send_event → 事件循环里真正 close），在
+    // object_setClass 换类后的窗口上这条路径会抛 NSException——Rust 无法捕获，
+    // 直接 abort 整个进程（2026-11-14 实测：每次特效后 ~4s 闪退，即 3.8s 销毁
+    // 定时器的指纹）。特效窗只活几秒，「显示桌面」推不推走它无感知。
+    #[cfg(target_os = "macos")]
+    if !label.starts_with(BURST_PREFIX) {
+        use tauri_nspanel::{ManagerExt as _, WebviewWindowExt as _};
+        if let Err(e) = win.to_panel::<GlowPanel>() {
+            tracing::warn!(label = %label, "流光 NSPanel 转换失败（继续以普通窗口运行）: {e}");
+        } else if let Ok(panel) = app.get_webview_panel(&label) {
+            panel.as_panel().setLevel(1000);
+            // 与悬浮窗同理：Stationary + Auxiliary 才能在「显示桌面」时存活
+            panel.set_collection_behavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenNone
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenDisallowsTiling,
+            );
+        }
+    }
     tracing::info!(label = %label, "流光窗口已创建");
     Ok(())
 }
@@ -1290,6 +1383,8 @@ pub struct MonitorInfo {
 pub fn list_monitors(app: &AppHandle) -> Vec<MonitorInfo> {
     // 主显示器只认位置：Monitor 没有暴露可比较的句柄，而两块屏不可能同坐标
     let primary_pos = app.primary_monitor().ok().flatten().map(|m| *m.position());
+    // 显示器友好名进 UI 下拉，按界面语言取词（语言缓存见 bark-core::i18n）
+    let lang = app.state::<Arc<AppState>>().lang();
     let monitors = match app.available_monitors() {
         Ok(ms) => ms,
         Err(e) => {
@@ -1305,7 +1400,7 @@ pub fn list_monitors(app: &AppHandle) -> Vec<MonitorInfo> {
             let pos = m.position();
             MonitorInfo {
                 index,
-                name: friendly_name(m.name(), index),
+                name: friendly_name(m.name(), index, lang),
                 width: size.width,
                 height: size.height,
                 scale_factor: m.scale_factor(),
@@ -1317,18 +1412,22 @@ pub fn list_monitors(app: &AppHandle) -> Vec<MonitorInfo> {
         .collect()
 }
 
-/// 设备名 → 人话：Windows 的 `\\.\DISPLAY3` 取尾部数字变成「显示器3」，
-/// 其它平台（macOS 的 "Built-in Retina Display"、Linux 的 "eDP-1"）能读就读原名。
-/// 完全没有名字时用下标兜底，保证下拉里不出现空白项。
-fn friendly_name(raw: Option<&String>, index: usize) -> String {
+/// 设备名 → 人话：Windows 的 `\\.\DISPLAY3` 取尾部数字变成「显示器3」（英文界面
+/// 为 "Display 3"），其它平台（macOS 的 "Built-in Retina Display"、Linux 的 "eDP-1"）
+/// 能读就读原名。完全没有名字时用下标兜底，保证下拉里不出现空白项。
+fn friendly_name(raw: Option<&String>, index: usize, lang: bark_core::Lang) -> String {
+    let prefix = match lang {
+        bark_core::Lang::Zh => "显示器",
+        bark_core::Lang::En => "Display ",
+    };
     let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-        return format!("显示器{}", index + 1);
+        return format!("{prefix}{}", index + 1);
     };
     let tail: String = raw.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
     if tail.is_empty() {
         raw.to_string()
     } else {
-        format!("显示器{}", tail.chars().rev().collect::<String>())
+        format!("{prefix}{}", tail.chars().rev().collect::<String>())
     }
 }
 
@@ -1680,14 +1779,21 @@ mod tests {
 
     #[test]
     fn friendly_name_handles_device_paths_and_unnamed() {
-        let n = |s: &str, i: usize| friendly_name(Some(&s.to_string()), i);
-        assert_eq!(n(r"\\.\DISPLAY1", 0), "显示器1");
-        assert_eq!(n(r"\\.\DISPLAY3", 2), "显示器3");
-        // 非 Windows 的可读名原样保留
-        assert_eq!(n("Built-in Retina Display", 0), "Built-in Retina Display");
+        let n = |s: &str, i: usize, lang| friendly_name(Some(&s.to_string()), i, lang);
+        // 中文界面：zh 原文照搬
+        assert_eq!(n(r"\\.\DISPLAY1", 0, bark_core::Lang::Zh), "显示器1");
+        assert_eq!(n(r"\\.\DISPLAY3", 2, bark_core::Lang::Zh), "显示器3");
+        // 非 Windows 的可读名原样保留（两种语言一致）
+        assert_eq!(n("Built-in Retina Display", 0, bark_core::Lang::Zh), "Built-in Retina Display");
+        assert_eq!(n("Built-in Retina Display", 0, bark_core::Lang::En), "Built-in Retina Display");
         // 没有名字/名字是空白：用下标兜底，下拉里不能出现空项
-        assert_eq!(friendly_name(None, 1), "显示器2");
-        assert_eq!(n("   ", 0), "显示器1");
+        assert_eq!(friendly_name(None, 1, bark_core::Lang::Zh), "显示器2");
+        assert_eq!(n("   ", 0, bark_core::Lang::Zh), "显示器1");
+        // 英文界面：同一套取词逻辑，前缀换英文
+        assert_eq!(n(r"\\.\DISPLAY1", 0, bark_core::Lang::En), "Display 1");
+        assert_eq!(n(r"\\.\DISPLAY3", 2, bark_core::Lang::En), "Display 3");
+        assert_eq!(friendly_name(None, 1, bark_core::Lang::En), "Display 2");
+        assert_eq!(n("   ", 0, bark_core::Lang::En), "Display 1");
     }
 
     #[test]

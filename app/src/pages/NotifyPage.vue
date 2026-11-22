@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onDeactivated, onMounted, onUnmounted, ref } from "vue";
+import { computed, onDeactivated, onMounted, onUnmounted, ref } from "vue";
+import { useI18n } from "vue-i18n";
 import {
   api,
   BURST_EFFECTS,
@@ -7,11 +8,14 @@ import {
   monitorLabel,
   SOUND_EFFECTS,
   type BarkConfig,
+  type Diagnostics,
   type MonitorInfo,
   type StateEffects,
   type StateSound,
 } from "../api";
 import { toast } from "../toast";
+
+const { t } = useI18n();
 
 const config = ref<BarkConfig | null>(null);
 const monitors = ref<MonitorInfo[]>([]);
@@ -19,6 +23,10 @@ const monitorError = ref("");
 const loadingMonitors = ref(false);
 const loadError = ref("");
 const errorMsg = ref("");
+/// 音量滑杆的实时值：`:value` 单向绑定 + `change` 才落盘，拖动过程中数字不会停在旧值
+const volumeDraft = ref<number | null>(null);
+/// 最近一次「该响却没响」的原因（进页面时取一次；超过 5 分钟的不展示）
+const lastSkip = ref<Diagnostics["last_sound_skip"]>(null);
 
 /**
  * 全页即时落盘：页面没有「保存」按钮，任何控件改一下就保存声音与光效分区。
@@ -28,12 +36,11 @@ const errorMsg = ref("");
  */
 async function persist(): Promise<boolean> {
   if (!config.value) return false;
-  sanitizeSoundPlays(config.value);
   try {
     await api.saveConfig({ notify: config.value.notify, glow: config.value.glow });
     return true;
   } catch (e) {
-    toast(`保存失败：${e}`, "error");
+    toast(t("common.saveFailed", { error: String(e) }), "error");
     return false;
   }
 }
@@ -62,19 +69,29 @@ async function commitStateEffect(
   if (!(await persist())) row[state] = before;
 }
 
+/**
+ * 音量滑杆：`input` 只更新草稿（拖动过程中数字跟手），`change`（松手）才落盘。
+ * 不能直接用 v-model——commitNotify 发现「新旧相等」会直接返回、不写盘。
+ */
+function commitVolume(el: HTMLInputElement) {
+  const v = Number(el.value);
+  volumeDraft.value = v;
+  void commitNotify("volume", v).then(() => (volumeDraft.value = null));
+}
+
 /** 提交声音里某个状态的一项设置：先改内存再落盘，失败回滚 */
 async function commitSound(key: (typeof SOUND_ROWS)[number], patch: Partial<StateSound>) {
   const cfg = config.value;
   if (!cfg) return;
   const row = cfg.notify[key];
-  const before = { effect: row.effect, plays: row.plays };
+  const before = { effect: row.effect, custom_path: row.custom_path };
   const next = { ...before, ...patch };
-  if (next.effect === before.effect && next.plays === before.plays) return;
+  if (next.effect === before.effect && next.custom_path === before.custom_path) return;
   row.effect = next.effect;
-  row.plays = next.plays;
+  row.custom_path = next.custom_path;
   if (!(await persist())) {
     row.effect = before.effect;
-    row.plays = before.plays;
+    row.custom_path = before.custom_path;
   }
 }
 
@@ -87,17 +104,6 @@ async function commitNotify<K extends keyof BarkConfig["notify"]>(key: K, value:
   if (!(await persist())) cfg.notify[key] = before;
 }
 
-/**
- * 播放次数：解析并夹回 1~10 再提交（数字框可能被清空成 NaN 或手填越界值，
- * 直接提交会让后端 serde 拒收整份配置）；输入框当场归位到夹好的值。
- */
-function commitPlays(key: (typeof SOUND_ROWS)[number], el: HTMLInputElement) {
-  const p = Math.round(Number(el.value));
-  const clamped = Number.isFinite(p) ? Math.min(10, Math.max(1, p)) : 1;
-  el.value = String(clamped);
-  commitSound(key, { plays: clamped });
-}
-
 async function load() {
   loadError.value = "";
   try {
@@ -105,7 +111,13 @@ async function load() {
     normalizeSoundEffects(config.value);
     normalizeGlowEffects(config.value);
   } catch (e) {
-    loadError.value = `加载配置失败：${e}`;
+    loadError.value = t("common.loadConfigFailed", { error: String(e) });
+  }
+  // 诊断单独跑：拿不到不影响页面（例如后端还没就绪）
+  try {
+    lastSkip.value = (await api.diagnostics()).last_sound_skip;
+  } catch {
+    lastSkip.value = null;
   }
   // 显示器枚举单独跑：它失败不该让整个页面变成错误态，只在「生效显示器」那一行提示
   await loadMonitors();
@@ -117,12 +129,12 @@ async function loadMonitors() {
   try {
     monitors.value = await api.listMonitors();
     if (!monitors.value.length) {
-      monitorError.value = "未检测到任何显示器，流光将回退到主显示器";
+      monitorError.value = t("notify.noMonitors");
     }
     normalizeMonitorTarget();
   } catch (e) {
     monitors.value = [];
-    monitorError.value = `检测显示器失败：${e}`;
+    monitorError.value = t("notify.detectMonitorsFailed", { error: String(e) });
   } finally {
     loadingMonitors.value = false;
   }
@@ -151,27 +163,20 @@ function normalizeMonitorTarget() {
   const primary = monitors.value.find((m) => m.is_primary) ?? monitors.value[0];
   cfg.glow.monitors = String(primary.index);
   if (raw !== "primary" && raw !== "") {
-    errorMsg.value = `原先生效的显示器（${raw}）已不存在，已自动改为「${monitorLabel(primary)}」`;
-  }
-}
-
-/**
- * 保存前把播放次数夹回 1~10：数字输入框可能被清空（NaN）或手填越界值，
- * 直接提交会让后端 serde 拒收整份配置。
- */
-function sanitizeSoundPlays(cfg: BarkConfig) {
-  for (const key of SOUND_ROWS) {
-    const s = cfg.notify[key];
-    const p = Math.round(Number(s.plays));
-    s.plays = Number.isFinite(p) ? Math.min(10, Math.max(1, p)) : 1;
+    errorMsg.value = t("notify.monitorSwitched", { old: raw, new: monitorLabel(primary) });
   }
 }
 
 /** 音效目录更新后，配置里可能残留已下架的 id：下拉会显示空白，这里归回「不响」 */
 function normalizeSoundEffects(cfg: BarkConfig) {
-  const known = new Set(SOUND_EFFECTS.map((s) => s.id));
+  // "custom" 不在内置目录里但合法；已下线的 chime 迁移到同源素材 confirm
+  // （后端 play_sound 里也有同一层别名，两侧口径一致，不能让 UI 说「不响」而后端还在响）；
+  // 其余未知 id 回落「不响」
+  const known = new Set([...SOUND_EFFECTS.map((s) => s.id), "custom"]);
   for (const key of SOUND_ROWS) {
-    if (!known.has(cfg.notify[key].effect)) cfg.notify[key].effect = "";
+    const cur = cfg.notify[key].effect;
+    if (cur === "chime") cfg.notify[key].effect = "confirm";
+    else if (!known.has(cur)) cfg.notify[key].effect = "";
   }
 }
 
@@ -204,7 +209,7 @@ async function previewGlow(state: string) {
   try {
     await api.glowPreview(state);
   } catch (e) {
-    errorMsg.value = `预览失败：${e}`;
+    errorMsg.value = t("notify.previewFailed", { error: String(e) });
   } finally {
     previewing.value = "";
   }
@@ -219,7 +224,7 @@ async function stopNow() {
   try {
     await api.glowOff();
   } catch (e) {
-    errorMsg.value = `熄灭失败：${e}`;
+    errorMsg.value = t("notify.stopFailed", { error: String(e) });
   } finally {
     stopping.value = false;
   }
@@ -230,26 +235,56 @@ async function stopNow() {
 /** 「声音」与「屏幕光效」两区的四行：与流光四色状态同语义（思考 / 等待 / 完成 / 失败） */
 const SOUND_ROWS = ["thinking", "waiting", "completed", "failed"] as const;
 
-const SOUND_ROW_LABELS: Record<(typeof SOUND_ROWS)[number], string> = {
-  thinking: "思考",
-  waiting: "等待",
-  completed: "完成",
-  failed: "失败",
+/** 状态名指向词表 `notify.state.*`：常量只建一次，存 key 不存译文，切语言跟着更新 */
+const SOUND_ROW_LABEL_KEYS: Record<(typeof SOUND_ROWS)[number], string> = {
+  thinking: "notify.state.thinking",
+  waiting: "notify.state.waiting",
+  completed: "notify.state.completed",
+  failed: "notify.state.failed",
 };
+
+/// 进页面时取到的那条记录，只有 5 分钟内的才展示
+const recentSkip = computed(() => {
+  const s = lastSkip.value;
+  return s && Date.now() - s.at < 5 * 60_000 ? s : null;
+});
 
 const testing = ref("");
 const soundTestError = ref("");
+
+/** 自定义音效：原生对话框选文件后写进该状态的 custom_path（即时落盘）；取消不动配置 */
+async function pickSound(key: (typeof SOUND_ROWS)[number]) {
+  soundTestError.value = "";
+  try {
+    const path = await api.pickSoundFile();
+    if (path) await commitSound(key, { custom_path: path });
+  } catch (e) {
+    // 对话框被系统拒绝（窗口校验失败 / 平台不支持）时给一句可见的话，
+    // 不能让 rejection 只落到 console、用户以为按钮坏了
+    soundTestError.value = t("notify.pickFailed", { error: String(e) });
+  }
+}
+
+/** 按钮上只显示文件名，全路径收进悬停提示 */
+function fileName(path: string): string {
+  return path.split(/[\/]/).pop() ?? "";
+}
 
 async function testSound(key: (typeof SOUND_ROWS)[number]) {
   const cfg = config.value;
   if (!cfg) return;
   testing.value = key;
   soundTestError.value = "";
+  const started = Date.now();
   try {
-    await api.testSound(cfg.notify[key].effect, cfg.notify[key].plays);
+    await api.testSound(cfg.notify[key].effect, cfg.notify[key].custom_path || null);
   } catch (e) {
-    soundTestError.value = `播放失败：${e}`;
+    soundTestError.value = t("notify.playFailed", { error: String(e) });
   } finally {
+    // 命令把音频交给后台就返回了，按钮不能只闪一帧：至少留 600ms 让「播放中…」看得见。
+    // 顺带挡住连点——两次测试叠在一起就听不出是哪个音效了。
+    const rest = 600 - (Date.now() - started);
+    if (rest > 0) await new Promise((r) => setTimeout(r, rest));
     testing.value = "";
   }
 }
@@ -269,237 +304,305 @@ onUnmounted(glowOffSafely);
 
 <template>
   <div v-if="config">
-    <h1 class="page-title">通知</h1>
-    <div v-if="errorMsg" class="warn-box mb-14">{{ errorMsg }}</div>
+    <div class="page-head">
+      <div class="page-head-left"><h1 class="page-title">{{ $t("notify.title") }}</h1></div>
+    </div>
+    <div class="stack">
+      <div v-if="errorMsg" class="warn-box">{{ errorMsg }}</div>
 
-    <!-- 屏幕光效：整组一张卡。页面没有「保存」按钮，所有修改即时落盘生效；
-         总开关放在分组标题右侧 -->
-    <div class="card">
-      <div class="between">
-        <span class="agent-name">屏幕光效</span>
-        <div class="row">
-          <span class="hint">{{ config.glow.enabled ? "运行中" : "已停止" }}</span>
-          <label class="switch">
-            <input
-              type="checkbox"
-              :checked="config.glow.enabled"
-              @change="commitGlow('enabled', ($event.target as HTMLInputElement).checked)"
-            />
-            <span class="track"></span>
-          </label>
-        </div>
-      </div>
-
-      <!-- 生效显示器：小节标题右边直接跟下拉框和重新检测，一行排完；
-           标题占固定 96px 标签列，与下方各行控件同列对齐 -->
-      <div class="row mt-12">
-        <span class="section-label field-label">生效显示器</span>
-        <select
-          :value="config.glow.monitors"
-          class="grow select-wide"
-          @change="commitGlow('monitors', ($event.target as HTMLSelectElement).value)"
-        >
-          <button><selectedcontent></selectedcontent></button>
-          <option value="all">全部显示器{{ monitors.length > 1 ? `（${monitors.length} 块）` : "" }}</option>
-          <option v-for="m in monitors" :key="m.index" :value="String(m.index)">
-            {{ monitorLabel(m) }}{{ m.is_primary ? "（主显示器）" : "" }}
-          </option>
-        </select>
-        <button class="ghost" :disabled="loadingMonitors" @click="loadMonitors">
-          {{ loadingMonitors ? "检测中…" : "重新检测" }}
-        </button>
-      </div>
-      <div v-if="monitorError" class="warn-box mt-8">{{ monitorError }}</div>
-
-      <!-- 边缘光效 / 全屏特效：内嵌子面板双列（macOS / Win11 设置的分组套路）。
-           四态竖排（与「声音」区同款），每行选**该状态**的类型，「无」= 该状态
-           不亮边缘 / 不放全屏；列开关关着时整列下拉禁用 -->
-      <div class="glow-grid">
-        <div class="glow-panel">
-          <div class="between">
-            <span class="panel-title">边缘光效</span>
+      <!-- 屏幕光效：整组一张卡。页面没有「保存」按钮，所有修改即时落盘生效；
+           总开关放在分组标题右侧 -->
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">{{ $t("notify.glowTitle") }}</span>
+          <div class="row">
+            <span class="hint">{{ config.glow.enabled ? $t("notify.glowRunning") : $t("notify.glowStopped") }}</span>
             <label class="switch">
               <input
                 type="checkbox"
-                :checked="config.glow.edge"
-                @change="commitGlow('edge', ($event.target as HTMLInputElement).checked)"
+                :checked="config.glow.enabled"
+                @change="commitGlow('enabled', ($event.target as HTMLInputElement).checked)"
               />
               <span class="track"></span>
             </label>
           </div>
-          <div class="glow-rows">
-            <div v-for="key in SOUND_ROWS" :key="key" class="row">
-              <span class="hint field-label">{{ SOUND_ROW_LABELS[key] }}</span>
-              <select
-                class="grow"
-                :value="config.glow.edge_effects[key]"
-                :disabled="!config.glow.edge"
-                @change="commitStateEffect('edge_effects', key, ($event.target as HTMLSelectElement).value)"
-              >
-                <button><selectedcontent></selectedcontent></button>
-                <option v-for="e in EDGE_EFFECTS" :key="e.id" :value="e.id">{{ e.label }}</option>
-              </select>
+        </div>
+
+        <div class="form-rows">
+          <!-- 生效显示器：小节标题右边直接跟下拉框和重新检测，一行排完；
+               标题占固定 96px 标签列，与下方各行控件同列对齐 -->
+          <div class="row">
+            <span class="section-label field-label">{{ $t("notify.monitors") }}</span>
+            <select
+              :value="config.glow.monitors"
+              class="grow select-wide"
+              @change="commitGlow('monitors', ($event.target as HTMLSelectElement).value)"
+            >
+              <button><selectedcontent></selectedcontent></button>
+              <option value="all">{{ $t("notify.allMonitors") }}{{ monitors.length > 1 ? $t("notify.monitorCount", { n: monitors.length }) : "" }}</option>
+              <option v-for="m in monitors" :key="m.index" :value="String(m.index)">
+                {{ monitorLabel(m) }}{{ m.is_primary ? $t("notify.primaryMonitor") : "" }}
+              </option>
+            </select>
+            <button class="ghost" :disabled="loadingMonitors" @click="loadMonitors">
+              {{ loadingMonitors ? $t("notify.detecting") : $t("notify.redetect") }}
+            </button>
+          </div>
+          <div v-if="monitorError" class="warn-box">{{ monitorError }}</div>
+
+          <!-- 边缘光效 / 全屏特效：内嵌子面板双列（macOS / Win11 设置的分组套路）。
+               四态竖排（与「声音」区同款），每行选**该状态**的类型，「无」= 该状态
+               不亮边缘 / 不放全屏；列开关关着时整列下拉禁用 -->
+          <div class="glow-grid">
+            <div class="glow-panel">
+              <div class="card-head">
+                <span class="card-title">{{ $t("notify.edgeEffects") }}</span>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    :checked="config.glow.edge"
+                    @change="commitGlow('edge', ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span class="track"></span>
+                </label>
+              </div>
+              <div class="glow-rows">
+                <div v-for="key in SOUND_ROWS" :key="key" class="row">
+                  <span class="hint field-label">{{ $t(SOUND_ROW_LABEL_KEYS[key]) }}</span>
+                  <select
+                    class="grow"
+                    :value="config.glow.edge_effects[key]"
+                    :disabled="!config.glow.edge"
+                    @change="commitStateEffect('edge_effects', key, ($event.target as HTMLSelectElement).value)"
+                  >
+                    <button><selectedcontent></selectedcontent></button>
+                    <option v-for="e in EDGE_EFFECTS" :key="e.id" :value="e.id">{{ $t(e.labelKey) }}</option>
+                  </select>
+                </div>
+                <!-- 位置：按钮式单选（radio-button 分段控件）。「顶部」（默认，只亮
+                     顶部一条横线，覆盖窗缩成顶部条带，避免被系统/游戏软件判定为全屏）
+                     /「四周」（旧行为）。原生 radio 同 name 互斥 + 方向键切换，外观做成
+                     并排按钮；边缘开关关着时整组禁用，与上方四行下拉同口径。
+                     旧值（如历史配置里的 "bottom"）后端 edge_sides() 归一成顶部，
+                     这里按「不是 all 即顶部」回显，改选任一项都会写回合法值 -->
+                <div class="row">
+                  <span class="hint field-label">{{ $t("notify.position") }}</span>
+                  <div class="radio-group" role="radiogroup" :aria-label="$t('notify.edgePositionLabel')">
+                    <label class="radio-btn">
+                      <input
+                        type="radio"
+                        name="glow-position"
+                        value="top"
+                        :checked="config.glow.edge_position !== 'all'"
+                        :disabled="!config.glow.edge"
+                        @change="commitGlow('edge_position', 'top')"
+                      />
+                      <span>{{ $t("notify.positionTop") }}</span>
+                    </label>
+                    <label class="radio-btn">
+                      <input
+                        type="radio"
+                        name="glow-position"
+                        value="all"
+                        :checked="config.glow.edge_position === 'all'"
+                        :disabled="!config.glow.edge"
+                        @change="commitGlow('edge_position', 'all')"
+                      />
+                      <span>{{ $t("notify.positionAll") }}</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
             </div>
-            <!-- 位置：按钮式单选（radio-button 分段控件）。「顶部」（默认，只亮
-                 顶部一条横线，覆盖窗缩成顶部条带，避免被系统/游戏软件判定为全屏）
-                 /「四周」（旧行为）。原生 radio 同 name 互斥 + 方向键切换，外观做成
-                 并排按钮；边缘开关关着时整组禁用，与上方四行下拉同口径。
-                 旧值（如历史配置里的 "bottom"）后端 edge_sides() 归一成顶部，
-                 这里按「不是 all 即顶部」回显，改选任一项都会写回合法值 -->
-            <div class="row">
-              <span class="hint field-label">位置</span>
-              <div class="radio-group" role="radiogroup" aria-label="边缘光效位置">
-                <label class="radio-btn">
+
+            <div class="glow-panel">
+              <div class="card-head">
+                <span class="card-title">{{ $t("notify.fullscreenEffects") }}</span>
+                <label class="switch">
                   <input
-                    type="radio"
-                    name="glow-position"
-                    value="top"
-                    :checked="config.glow.edge_position !== 'all'"
-                    :disabled="!config.glow.edge"
-                    @change="commitGlow('edge_position', 'top')"
+                    type="checkbox"
+                    :checked="config.glow.fullscreen"
+                    @change="commitGlow('fullscreen', ($event.target as HTMLInputElement).checked)"
                   />
-                  <span>顶部</span>
+                  <span class="track"></span>
                 </label>
-                <label class="radio-btn">
-                  <input
-                    type="radio"
-                    name="glow-position"
-                    value="all"
-                    :checked="config.glow.edge_position === 'all'"
-                    :disabled="!config.glow.edge"
-                    @change="commitGlow('edge_position', 'all')"
-                  />
-                  <span>四周</span>
-                </label>
+              </div>
+              <div class="glow-rows">
+                <div v-for="key in SOUND_ROWS" :key="key" class="row">
+                  <span class="hint field-label">{{ $t(SOUND_ROW_LABEL_KEYS[key]) }}</span>
+                  <select
+                    class="grow"
+                    :value="config.glow.burst_effects[key]"
+                    :disabled="!config.glow.fullscreen"
+                    @change="commitStateEffect('burst_effects', key, ($event.target as HTMLSelectElement).value)"
+                  >
+                    <button><selectedcontent></selectedcontent></button>
+                    <option v-for="e in BURST_EFFECTS" :key="e.id" :value="e.id">{{ $t(e.labelKey) }}</option>
+                  </select>
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <div class="glow-panel">
-          <div class="between">
-            <span class="panel-title">全屏特效</span>
-            <label class="switch">
-              <input
-                type="checkbox"
-                :checked="config.glow.fullscreen"
-                @change="commitGlow('fullscreen', ($event.target as HTMLInputElement).checked)"
-              />
-              <span class="track"></span>
-            </label>
-          </div>
-          <div class="glow-rows">
-            <div v-for="key in SOUND_ROWS" :key="key" class="row">
-              <span class="hint field-label">{{ SOUND_ROW_LABELS[key] }}</span>
-              <select
-                class="grow"
-                :value="config.glow.burst_effects[key]"
-                :disabled="!config.glow.fullscreen"
-                @change="commitStateEffect('burst_effects', key, ($event.target as HTMLSelectElement).value)"
-              >
-                <button><selectedcontent></selectedcontent></button>
-                <option v-for="e in BURST_EFFECTS" :key="e.id" :value="e.id">{{ e.label }}</option>
-              </select>
+          <!-- 预览：按钮边缘用对应状态色；「预览」与「熄灭」两组互斥 disable——
+               两个操作都作用在同一套光效上，并发会互相打架 -->
+          <div class="preview-block">
+            <span class="section-label">{{ $t("notify.preview") }}</span>
+            <div class="row">
+              <button class="ghost state-thinking" :disabled="!!previewing || stopping" @click="previewGlow('running')">{{ $t("notify.state.thinking") }}</button>
+              <button class="ghost state-waiting" :disabled="!!previewing || stopping" @click="previewGlow('waiting')">{{ $t("notify.state.waiting") }}</button>
+              <button class="ghost state-completed" :disabled="!!previewing || stopping" @click="previewGlow('completed')">{{ $t("notify.state.completed") }}</button>
+              <button class="ghost state-failed" :disabled="!!previewing || stopping" @click="previewGlow('failed')">{{ $t("notify.state.failed") }}</button>
+              <button class="ghost" :disabled="stopping || !!previewing" @click="stopNow">{{ $t("notify.turnOff") }}</button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- 预览：按钮边缘用对应状态色；「预览」与「熄灭」两组互斥 disable——
-           两个操作都作用在同一套光效上，并发会互相打架 -->
-      <div class="mt-16">
-        <span class="section-label">预览</span>
-        <div class="row mt-8">
-          <button class="ghost state-thinking" :disabled="!!previewing || stopping" @click="previewGlow('running')">思考</button>
-          <button class="ghost state-waiting" :disabled="!!previewing || stopping" @click="previewGlow('waiting')">等待</button>
-          <button class="ghost state-completed" :disabled="!!previewing || stopping" @click="previewGlow('completed')">完成</button>
-          <button class="ghost state-failed" :disabled="!!previewing || stopping" @click="previewGlow('failed')">失败</button>
-          <button class="ghost" :disabled="stopping || !!previewing" @click="stopNow">熄灭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 声音：总开关放分组标题右侧（与屏幕光效同构），关了全部不响；
-         每种状态一个音效下拉 + 播放次数 + 测试按钮；修改即时生效 -->
-    <div class="card">
-      <div class="between">
-        <span class="agent-name">声音</span>
-        <div class="row">
-          <span class="hint">{{ config.notify.enabled ? "已启用" : "已关闭" }}</span>
-          <label class="switch">
-            <input
-              type="checkbox"
-              :checked="config.notify.enabled"
-              @change="commitNotify('enabled', ($event.target as HTMLInputElement).checked)"
-            />
-            <span class="track"></span>
-          </label>
-        </div>
-      </div>
-      <div class="mt-12 col">
-        <div v-for="key in SOUND_ROWS" :key="key" class="row">
-          <span class="hint field-label">{{ SOUND_ROW_LABELS[key] }}</span>
-          <select
-            :value="config.notify[key].effect"
-            class="select-wide"
-            :disabled="!config.notify.enabled"
-            @change="commitSound(key, { effect: ($event.target as HTMLSelectElement).value })"
-          >
-            <button><selectedcontent></selectedcontent></button>
-            <option value="">不响</option>
-            <option v-for="s in SOUND_EFFECTS" :key="s.id" :value="s.id">{{ s.label }}</option>
-          </select>
-          <div class="input-group input-tiny">
-            <input
-              type="number"
-              min="1"
-              max="10"
-              :value="config.notify[key].plays"
-              :disabled="!config.notify.enabled"
-              @change="commitPlays(key, $event.target as HTMLInputElement)"
-            />
-            <span class="input-unit">次</span>
+      <!-- 声音：总开关放分组标题右侧（与屏幕光效同构），关了全部不响；
+           每种状态一个音效下拉 + 播放次数 + 测试按钮；修改即时生效 -->
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">{{ $t("notify.soundTitle") }}</span>
+          <div class="row">
+            <span class="hint">{{ config.notify.enabled ? $t("notify.soundEnabled") : $t("notify.soundDisabled") }}</span>
+            <label class="switch">
+              <input
+                type="checkbox"
+                :checked="config.notify.enabled"
+                @change="commitNotify('enabled', ($event.target as HTMLInputElement).checked)"
+              />
+              <span class="track"></span>
+            </label>
           </div>
-          <button
-            class="ghost"
-            :disabled="!config.notify.enabled || !config.notify[key].effect || testing === key"
-            @click="testSound(key)"
-          >
-            {{ testing === key ? "播放中…" : "测试" }}
-          </button>
         </div>
-        <div v-if="soundTestError" class="warn-box">{{ soundTestError }}</div>
-        <span class="hint">默认全部不响；总开关关闭、托盘「静音」与免打扰时段内同样不响。播放次数范围 1~10。</span>
+        <div class="form-rows">
+          <!-- 音量：与系统音量相乘，独立于系统音量才能「听清提示音但不吵」 -->
+          <div class="row">
+            <span class="hint field-label">{{ $t("notify.volume") }}</span>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              class="grow"
+              :value="volumeDraft ?? config.notify.volume"
+              :disabled="!config.notify.enabled"
+              @input="volumeDraft = Number(($event.target as HTMLInputElement).value)"
+              @change="commitVolume($event.target as HTMLInputElement)"
+            />
+            <span class="hint volume-val">{{ volumeDraft ?? config.notify.volume }}%</span>
+          </div>
+
+          <div v-for="key in SOUND_ROWS" :key="key" class="row">
+            <span class="hint field-label">{{ $t(SOUND_ROW_LABEL_KEYS[key]) }}</span>
+            <!-- 定宽中区：不选自定义时下拉铺满；选自定义时下拉缩短、
+                 让位给文件按钮，总宽不变 → 测试按钮位置不动 -->
+            <div class="sound-mid">
+              <select
+                :value="config.notify[key].effect"
+                :class="{ narrow: config.notify[key].effect === 'custom' }"
+                :disabled="!config.notify.enabled"
+                @change="commitSound(key, { effect: ($event.target as HTMLSelectElement).value })"
+              >
+                <button><selectedcontent></selectedcontent></button>
+                <option value="">{{ $t("notify.silent") }}</option>
+                <option v-for="s in SOUND_EFFECTS" :key="s.id" :value="s.id">{{ $t(s.labelKey) }}</option>
+                <option value="custom">{{ $t("notify.custom") }}</option>
+              </select>
+              <button
+                v-if="config.notify[key].effect === 'custom'"
+                class="ghost sound-file"
+                v-tooltip="config.notify[key].custom_path || $t('notify.chooseFile')"
+                :disabled="!config.notify.enabled"
+                @click="pickSound(key)"
+              >
+                <span>{{ fileName(config.notify[key].custom_path) || $t("notify.chooseFile") }}</span>
+              </button>
+            </div>
+            <button
+              class="ghost"
+              :disabled="!config.notify.enabled || !config.notify[key].effect || (config.notify[key].effect === 'custom' && !config.notify[key].custom_path) || testing === key"
+              @click="testSound(key)"
+            >
+              {{ testing === key ? $t("notify.playing") : $t("common.test") }}
+            </button>
+          </div>
+          <!-- 连续提示：多会话几乎同时终态时，窗口内只响第一声，
+               避免叠成一片「糊」；想听出「完成了几次」可以选「每次都响」 -->
+          <div class="row">
+            <span class="hint field-label">{{ $t("notify.throttle") }}</span>
+            <select
+              class="throttle-select"
+              :value="String(config.notify.throttle_ms)"
+              :disabled="!config.notify.enabled"
+              @change="commitNotify('throttle_ms', Number(($event.target as HTMLSelectElement).value))"
+            >
+              <button><selectedcontent></selectedcontent></button>
+              <option value="0">{{ $t("notify.throttleOff") }}</option>
+              <option value="250">{{ $t("notify.throttle250") }}</option>
+              <option value="500">{{ $t("notify.throttle500") }}</option>
+              <option
+                v-if="![0, 250, 500].includes(config.notify.throttle_ms)"
+                :value="String(config.notify.throttle_ms)"
+              >
+                {{ config.notify.throttle_ms }} ms
+              </option>
+            </select>
+          </div>
+          <div v-if="soundTestError" class="warn-box">{{ soundTestError }}</div>
+          <!-- 「上一次为什么没响」：判定层给出的原因，只留 5 分钟内的，
+               免得一条旧记录（比如子代理事件）长期挂在页面上 -->
+          <p v-if="recentSkip" class="hint skip-note">
+            {{ $t("notify.lastSkip", { reason: $t(`notify.skip.${recentSkip.reason}`) }) }}
+          </p>
+        </div>
       </div>
     </div>
   </div>
 
   <div v-else-if="loadError" class="empty">
     {{ loadError }}
-    <div class="mt-12"><button class="ghost" @click="load">重试</button></div>
+    <div class="mt-12"><button class="ghost" @click="load">{{ $t("common.retry") }}</button></div>
   </div>
-  <div v-else class="empty">加载配置中…</div>
+  <div v-else class="empty">{{ $t("common.loadingConfig") }}</div>
 </template>
 
 <style scoped>
 /* ---- 「屏幕光效」双子面板（macOS / Win11 设置的 inset grouped panel 套路）----
    每组一块比卡片亮/暗一档的圆角面板，组与组物理分开，比「标题 + 发丝线」的
-   分组（VS Code 设置的做法）区分更强 */
-.glow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+   分组（VS Code 设置的做法）区分更强；间距交给外层 .form-rows */
+.glow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .glow-panel {
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px 14px 14px;
 }
 /* 浅色下面板底用极浅灰而不是 panel-2（#e9e9ee 一摞灰太深、压过卡片），
    对齐 macOS 浅色分组的 #f5f5f7 观感 */
 :root[data-theme="light"] .glow-panel { background: #f5f5f8; }
-.panel-title { font-size: 13px; font-weight: 600; }
-.glow-rows { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+/* 面板内卡头比整页卡头略紧（面板自身内边距已小一档） */
+.glow-panel .card-head { margin-bottom: 10px; }
+.glow-rows { display: flex; flex-direction: column; gap: 8px; }
 /* 状态名 4 个字：标签列收窄到 52px（全局 field-label 的 96px 是给整页对齐用的） */
 .glow-rows .field-label { width: 52px; }
 /* 面板内的下拉用卡片底色：面板已是 panel-2，控件再同底就糊成一块（Fluent / macOS 通用做法） */
 .glow-panel select { background-color: var(--panel); }
 :root[data-theme="light"] .glow-panel select { background-color: #fff; }
+/* 预览小节：标题与按钮行 8px 间距 */
+.preview-block { display: flex; flex-direction: column; gap: 8px; }
+/* 声音行定宽中区（302px = 旧 220 下拉 + 10 间距 + 72 播放次数）：
+   自定义态下拉缩短、文件按钮补足剩余，总宽恒定 → 测试按钮 x 与旧版一致、两态不跳 */
+.sound-mid { display: flex; align-items: center; gap: 8px; width: 302px; flex-shrink: 0; }
+.sound-mid select { width: 100%; min-width: 0; }
+.sound-mid select.narrow { width: 110px; flex-shrink: 0; }
+.sound-file { flex: 1; min-width: 0; padding: 0 10px; }
+.sound-file span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; }
+/* 音量百分比：定宽 + 等宽数字，拖动滑杆时数字不左右跳 */
+.volume-val { width: 40px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
+/* 「上一次为什么没响」：小字、贴左，不与表单行抢注意力 */
+.skip-note { margin: 2px 0 0; }
+/* 「连续提示」下拉：不铺满整行（与状态行的中区同起点即可） */
+.throttle-select { width: 180px; flex-shrink: 0; }
 </style>

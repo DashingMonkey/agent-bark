@@ -321,16 +321,20 @@ fn is_ask_user_question(raw: &Value) -> bool {
     raw.get("tool_name").and_then(|v| v.as_str()) == Some("AskUserQuestion")
 }
 
-/// 会话 id 是否 ZCode 的会话级 id（**单版本口径**，2026-10-21 收敛）。
+/// 会话 id 是否 ZCode 的会话级 id（**按前缀放行**：`session_` 与 `sess_` 两代都认）。
 ///
-/// 现行版本（3.16.2 实测）主会话是 `session_<32hex>`（日志、artifacts、SQLite
-/// 同源）；子代理**不换前缀**，仍是 [`is_subagent_session_id`] 认定的
-/// `sess_subagent_agent_<uuid>`（bundle 里 `sess_` 前缀与 `subagent_agent_` 标记
-/// 是两个独立常量，前缀更名只施加于主会话）。旧代 `sess_<uuid>` 主会话**不再
-/// 支持**：ZCode 全量自动更新，没有停在旧版的用户（2026-10-20 的两代兼容
-/// 旋即收敛；若真出现旧版日志，行为是保留最后已知状态，不推断终态）。
+/// `session_<32hex>`（3.16.2 起新建的会话）与 `sess_<uuid>`（旧代格式，**至今仍在用**）
+/// 并存；子代理另有 [`is_subagent_session_id`] 认定的 `sess_subagent_agent_<uuid>`
+/// （bundle 里 `sess_` 前缀与 `subagent_agent_` 标记是两个独立常量，前缀更名只施加于
+/// 主会话）。
+///
+/// 2026-11-10 实测（3.17.2）：新建会话依旧写 `sess_<uuid>`，与
+/// `~/.zcode/cli/rollout/model-io-<sessionId>.jsonl` 同源。原「单版本口径」把这类行
+/// 整行丢弃——回合失败（`turn.failed` 1113 余额不足）与运行时卸载（`unloaded`）两条
+/// 终态证据全部消失，会话永久卡「思考中」。教训：**前缀白名单只放不收**，id 只用来和
+/// 会话表对行，收窄没有任何收益。
 fn is_session_id(s: &str) -> bool {
-    s.starts_with("session_") || is_subagent_session_id(s)
+    s.starts_with("session_") || s.starts_with("sess_")
 }
 
 /// 子代理会话命名判定（2026-10-21 实测，3.16.2）：`sess_subagent_agent_<uuid>`。
@@ -770,14 +774,28 @@ impl HookAdapter for ZcodeAdapter {
     /// 用户级 hooks 不需要任何信任/审核动作；唯一门槛是**新建会话**
     /// （ZCode 在 session 启动时对 hook 配置拍快照）。
     /// 另外如实告知：手动中断要读它自己的日志才能发现（非官方机制）。
-    fn trust_hint(&self) -> Option<&'static str> {
-        Some("ZCode 在会话启动时快照 Hook 配置：写入后请新建会话（或重启 ZCode）才生效；手动中断与回合失败由读取其本地日志推断（非官方方案，应用升级可能失效）")
+    fn trust_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let (zh, en) = (
+            "ZCode 在会话启动时快照 Hook 配置：写入后请新建会话（或重启 ZCode）才生效；手动中断与回合失败由读取其本地日志推断（非官方方案，应用升级可能失效）",
+            "ZCode snapshots the hook config when a session starts: write a new session (or restart ZCode) for it to take effect; manual aborts and turn failures are inferred from its local logs (unofficial, may break on app upgrades)",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh,
+            bark_core::Lang::En => en,
+        })
     }
 
     /// 关闭后已打开的会话仍持有旧配置快照，下一条 hook 还会被调起
     /// （daemon 侧按「已关闭」忽略其事件）。
-    fn unregister_hint(&self) -> Option<&'static str> {
-        Some("已停止接入；ZCode 已打开的会话要新建会话后才彻底停止触发（其间事件已被忽略）")
+    fn unregister_hint(&self, lang: bark_core::Lang) -> Option<&'static str> {
+        let (zh, en) = (
+            "已停止接入；ZCode 已打开的会话要新建会话后才彻底停止触发（其间事件已被忽略）",
+            "Integration stopped; sessions already open in ZCode keep triggering until a new session is started (events are ignored in the meantime)",
+        );
+        Some(match lang {
+            bark_core::Lang::Zh => zh,
+            bark_core::Lang::En => en,
+        })
     }
 }
 
@@ -1327,6 +1345,7 @@ mod tests {
             exe_path: r"C:\Users\u\AppData\Local\Programs\AgentBark\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         }
     }
 
@@ -1463,6 +1482,7 @@ mod tests {
             exe_path: r"D:\new path\AgentBark.exe".into(),
             port: 1,
             token: "t".into(),
+            lang: bark_core::Lang::Zh,
         };
         assert!(matches!(a.verify(&moved), VerifyReport::StalePath { .. }));
         a.register(&moved).unwrap();
@@ -1680,7 +1700,12 @@ mod tests {
         let a = adapter(&dir);
 
         // 会话开始 / 心跳
-        let ev = a.normalize("SessionStart", &json!({ "session_id": "s", "cwd": r"D:\proj" })).unwrap();
+        // project 名取 cwd 的最后一段，路径分隔符必须按平台给——反斜杠写法在 unix 上不是分隔符
+        #[cfg(windows)]
+        let cwd = r"D:\proj";
+        #[cfg(not(windows))]
+        let cwd = "/tmp/proj";
+        let ev = a.normalize("SessionStart", &json!({ "session_id": "s", "cwd": cwd })).unwrap();
         assert_eq!(ev.kind, EventKind::SessionStart);
         assert_eq!(ev.agent, "zcode");
         assert_eq!(ev.project.as_deref(), Some("proj"));
@@ -1700,7 +1725,7 @@ mod tests {
                 .normalize(event, &json!({ "session_id": "s", "tool_name": "AskUserQuestion" }))
                 .unwrap();
             assert_eq!(ev.kind, EventKind::InputRequired, "{event} 上的提问不是「需要确认」");
-            assert_eq!(ev.kind.default_title(), "等待输入");
+            assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "等待输入");
         }
 
         // 工具收尾：PostToolUse 一律 ToolFinished（相位回落思考中）。
@@ -1718,7 +1743,7 @@ mod tests {
             .normalize("PermissionRequest", &json!({ "session_id": "s", "tool_name": "Bash" }))
             .unwrap();
         assert_eq!(ev.kind, EventKind::PermissionRequired);
-        assert_eq!(ev.kind.default_title(), "需要确认");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "需要确认");
 
         // 工具失败 / 回合完成
         // 工具失败是「工具级」失败（agent 会自行重试），归一成 ToolFailed：
@@ -1727,7 +1752,7 @@ mod tests {
             .normalize("PostToolUseFailure", &json!({ "session_id": "s", "error": "boom", "is_interrupt": false }))
             .unwrap();
         assert_eq!(ev.kind, EventKind::ToolFailed);
-        assert_eq!(ev.kind.default_title(), "工具失败");
+        assert_eq!(ev.kind.default_title(bark_core::Lang::Zh), "工具失败");
         assert_eq!(ev.message, "boom");
         assert!(!ev.kind.should_notify(), "工具失败 agent 会自行重试，不该弹「任务失败」");
 
@@ -1838,6 +1863,12 @@ mod tests {
     const REAL_QUOTA_FAILED_LINE: &str = r#"{"timestamp":"2026-10-20T09:32:53.414Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","spanId":"dfe5e8ea-2da3-4d","parentSpanId":"4c8b8b30-970d-44","sessionId":"session_efeb21c1eed37f380221a9b8c2980036","turnId":"turn_fed133c3-ceac-4fa7-b919-12128314a93a","status":"failed","context":{"queryId":"01a158a4-95d5-72c4-a93d-e0d97aa22852","turnNumber":1,"turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn execution failed","code":"UNKNOWN_ERROR","type":"unknown_error","context":{"errorPayloadRole":"wrapper"},"cause":{"name":"AiSdkModelAdapterError","message":"exceed quota limit","code":"model_request_failed","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3","errorPhase":"stream","exceptionKind":"provider_business","providerCode":"1005","responseStatus":200,"providerId":"account:zai-start-plan","providerKind":"anthropic","reason":"invalid_request","requestId":"23749f0c-8dfc-4f66-a61c-a4542c0134ee","retryable":false,"source":"provider","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","transport":"sse"},"cause":{"name":"ProviderBusinessError","message":"exceed quota limit","code":"PROVIDER_BUSINESS_ERROR"}}}}"#;
     /// 实测原样（2026-10-20）：新代格式的普通会话行——无终态信号，但算存活心跳
     const NEW_PLAIN_LINE: &str = r#"{"timestamp":"2026-10-20T09:19:52.866Z","level":"info","event":"tool.call.started","module":"core.tool.executor","message":"Tool call started","traceId":"643c0cb1-692a-4139-849f-51fdb9a47061","spanId":"cfd4198e-333a-42","parentSpanId":"221b100b-8ac0-44","sessionId":"session_efeb21c1eed37f380221a9b8c2980036","turnId":"turn_0659842f-9b1a-4c65-9e5c-2c1a7384272f","toolCallId":"call_40d9fe7bd41942c8b35dae83","status":"started","context":{"queryId":"01a1589c-14f0-7d46-b985-99e6fd63844d","turnNumber":0,"providerId":"account:zai-start-plan","modelId":"GLM-5.3","iteration":0,"querySource":"main_turn","toolName":"Bash"}}"#;
+    /// 实测原样（2026-11-10，ZCode 3.17.2 桌面端）：**新建会话**同样是旧代
+    /// `sess_<uuid>`，余额不足（providerCode 1113 / HTTP 429）的回合致命失败。
+    /// 仅略去 cause.context 里冗长的 responseBodySummary / responseHeaders 原文。
+    /// 这行曾被「单版本口径」整行丢弃：用户发完消息、ZCode 弹「余额不足或无可用资源包」，
+    /// 而 agent-bark 一直停在「思考中」——没有任何终态能收掉那一行。
+    const REAL_QUOTA_FAILED_LEGACY_SID_LINE: &str = r#"{"timestamp":"2026-11-10T13:40:11.737Z","level":"error","event":"turn.failed","module":"core.runtime","message":"Turn failed","traceId":"990891bb-a02d-47f2-bfe2-4998968cee41","spanId":"913e585d-5e67-40","parentSpanId":"84fcf60f-34fb-4a","sessionId":"sess_83289b13-4fe7-4e55-aed1-60cb88802907","turnId":"turn_4e99f5be-cc42-4a5b-9a51-db7470d79f7e","status":"failed","context":{"queryId":"01a1c5af-e095-7a5c-9d89-092296197cad","turnNumber":0,"telemetry.inputOrigin":"desktop","turnPhase":"processing_input"},"error":{"name":"Error","message":"Turn execution failed","code":"UNKNOWN_ERROR","type":"unknown_error","context":{"errorPayloadRole":"wrapper"},"cause":{"name":"AiSdkModelAdapterError","message":"[1113][余额不足或无可用资源包,请充值。][20261110214011857b3004bc1b47fe]","code":"model_request_failed","context":{"attempt":1,"maxAttempts":11,"modelId":"GLM-5.3","errorPhase":"stream","exceptionKind":"provider_business","providerCode":"1113","providerRequestId":"20261110214011857b3004bc1b47fe","responseStatus":429,"providerId":"bigmodel-api","providerKind":"anthropic","reason":"unknown","requestId":"0c30c15d-3979-4af1-8c47-4b37fee5d3b5","retryable":false,"source":"provider","statusCode":429,"traceId":"990891bb-a02d-47f2-bfe2-4998968cee41","transport":"sse","unrecognizedCodeStreak":1},"cause":{"name":"ProviderBusinessError","message":"[1113][余额不足或无可用资源包,请充值。][20261110214011857b3004bc1b47fe]","code":"PROVIDER_BUSINESS_ERROR"}}}}"#;
 
     /// 普通会话行（实测形态：tool.call.started）——无终态信号，但算存活心跳
     const PARENT_SID: &str = "session_4b98fe9a84ec4cf98872b8ec9fb1fdb2";
@@ -1951,11 +1982,28 @@ mod tests {
             .unwrap();
         assert!(ev.is_subagent);
 
-        // 旧代 sess_<uuid> 主会话：整行拒绝（单版本口径，见 is_session_id 文档）
+        // 两代会话 id 都算会话级记录；非会话 id 照旧过滤
         assert!(is_session_id(NEW_SID));
         assert!(is_session_id("sess_subagent_agent_005ac652"), "子代理行仍要算会话级记录");
-        assert!(!is_session_id("sess_672cbc8c-d92e-4cde-ae86-2bd0448d2719"), "旧代主会话不再支持");
+        assert!(
+            is_session_id("sess_83289b13-4fe7-4e55-aed1-60cb88802907"),
+            "旧代 sess_<uuid> 主会话必须认（2026-11-10 实测新建会话仍在用）"
+        );
         assert!(!is_session_id("other"), "非会话 id 仍要被过滤");
+
+        // 反面教材复现：旧代 id 的回合失败不得再被整行丢弃
+        let sig = parse_log_signal(REAL_QUOTA_FAILED_LEGACY_SID_LINE)
+            .expect("旧代 sess_<uuid> 的 turn.failed 必须合成失败信号");
+        match &sig {
+            LogSignal::Failed { session_id, message, .. } => {
+                assert_eq!(session_id, "sess_83289b13-4fe7-4e55-aed1-60cb88802907");
+                assert_eq!(
+                    message,
+                    "[1113][余额不足或无可用资源包,请充值。][20261110214011857b3004bc1b47fe]"
+                );
+            }
+            other => panic!("应判为致命失败: {other:?}"),
+        }
     }
 
     #[test]

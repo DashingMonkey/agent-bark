@@ -144,6 +144,15 @@ impl AgentKind {
         }
     }
 
+    /// 按界面语言的展示名。绝大多数都是品牌名（语言无关），唯一需要翻译的是
+    /// 豆包工作；日志等语言无关场景继续用 [`Self::display_name`]。
+    pub fn display_name_lang(&self, lang: crate::i18n::Lang) -> &'static str {
+        match (self, lang) {
+            (AgentKind::DoubaoWork, crate::i18n::Lang::En) => "Doubao Work",
+            _ => self.display_name(),
+        }
+    }
+
     pub fn mode(&self) -> AdapterMode {
         match self {
             AgentKind::TraeWork | AgentKind::WorkBuddy | AgentKind::KimiWork | AgentKind::DoubaoWork => {

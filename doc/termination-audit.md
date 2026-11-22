@@ -8,8 +8,8 @@
 | --- | --- | --- |
 | Claude Code | Stop 完成、StopFailure 失败、SessionEnd 释放 | 仓库协议记录与归一化测试；Esc 不触发 Stop，缺少即时取消事件，保留最后已知状态，等待后续明确事件或本地手动移除 |
 | TraeCode | Stop 完成；renderer.log DoneHandler canceled → 终止 | 本机取消日志样本和尾读/状态机测试；日志格式变化时保留最后已知状态 |
-| CodeBuddy | Stop 完成、StopFailure 失败、SessionEnd 释放 | 代码映射及测试；未验证本版每次按停止都发 SessionEnd |
-| Qoder（含 CN） | Stop 完成、SessionEnd → 终止 | 仓库已有本机停止样本及归一化测试；正常 Stop 后的 SessionEnd 由回声规则抑制 |
+| CodeBuddy | Stop 完成、StopFailure 失败、SessionEnd 释放；漏收 Stop 时读 `transcript_path` 的显式 `status=completed` 补完成 | 代码映射及测试；未验证本版每次按停止都发 SessionEnd。2026-11-20 新增 transcript 兜底（CLI JSONL 与 IDE `index.json`，本机未安装 CodeBuddy，未现场实测）：只认最后一条助手回答的显式完成状态，且没有 `error` / `isApiErrorMessage` / `aborted` / `skipRun` 标记；工具、推理、用户记录或任何非元数据记录在后，`incomplete`、无 status、无时间戳都不收档。IDE 以 `messages/<id>.json` 为准（每秒重读，body 后落盘也能补到），内联副本只在 body 缺失时兜底；候选稳定 5 秒才投递 |
+| Qoder（含 CN） | Stop 完成、SessionEnd → 终止；transcript 的合成 API 错误（`isApiErrorMessage`）→ 失败；`~/.qoder[-cn]` 内部维护工具（qoder-memory 的 memory-fork 回合）不入状态机 | 仓库已有本机停止样本及归一化测试；正常 Stop 后的 SessionEnd 由回声规则抑制。2026-11-16 本机额度用尽样本：失败时没有任何 hook，daemon 尾读当前回合 transcript 合成 `run_failed`；只认当前回合、`aborted` 与重试成功的正常回复不算，读取失败保留状态。2026-11-18 本机实测：Stop 之后 memory-fork 用 Read/Write/Edit 读写 `~/.qoder-cn/memory`，按父会话 id 触发我们的工具 hook 却无终态，adapter 按路径丢弃（否则留下永远收不掉的「思考中」行） |
 | Codex | Stop 完成、Interrupt/SessionEnd → 终止；transcript 的 task_complete（无 error）→ 完成、有 error → 失败，turn_aborted → 终止；提问工具 → 等待确认，实际回答 → 解除等待 | 2026-10-29 更新：按会话/回合 ID 核验 SQLite 索引与 JSONL，过滤内部输入建议及迟到事件。异步 accepted 不等于回答；等待期间仍记录工具活动/失败。读取失败保留状态，可在本地移除；不以静默判定结束，hooks 仍需信任 |
 | ZCode | Stop 完成；本地 turn.failed/status=cancelled 等日志 → 终止；failed → 失败 | 已有本机样本、日志解析测试；中断 Hook 进程常被宿主取消，依赖日志补充 |
 | OpenCode | MessageAbortedError → 终止；session.idle → 完成 | 本轮修正取消后的 idle 抑制范围：持续到新 busy 回合，覆盖迟到 idle 和快速重开；执行生成 JS 的行为测试通过，未现场操作宿主 |

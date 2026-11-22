@@ -53,17 +53,23 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    pub fn default_title(&self) -> &'static str {
-        match self {
-            EventKind::SessionStart => "会话开始",
-            EventKind::Activity => "运行中",
-            EventKind::ToolFailed => "工具失败",
-            EventKind::ToolFinished => "工具完成",
-            EventKind::PermissionRequired => "需要确认",
-            EventKind::InputRequired => "等待输入",
-            EventKind::RunCompleted => "任务完成",
-            EventKind::RunFailed => "任务失败",
-            EventKind::RunAborted => "已终止",
+    /// 事件默认标题（推送通知标题用；前端事件流另有自己的文案）。
+    /// 按界面语言取词，见 crate::i18n。
+    pub fn default_title(&self, lang: crate::i18n::Lang) -> &'static str {
+        let (zh, en) = match self {
+            EventKind::SessionStart => ("会话开始", "Session Started"),
+            EventKind::Activity => ("运行中", "Running"),
+            EventKind::ToolFailed => ("工具失败", "Tool Failed"),
+            EventKind::ToolFinished => ("工具完成", "Tool Finished"),
+            EventKind::PermissionRequired => ("需要确认", "Confirmation Required"),
+            EventKind::InputRequired => ("等待输入", "Input Required"),
+            EventKind::RunCompleted => ("任务完成", "Task Completed"),
+            EventKind::RunFailed => ("任务失败", "Task Failed"),
+            EventKind::RunAborted => ("已终止", "Aborted"),
+        };
+        match lang {
+            crate::i18n::Lang::Zh => zh,
+            crate::i18n::Lang::En => en,
         }
     }
 
@@ -129,6 +135,15 @@ pub struct NormalizedEvent {
     pub kind: EventKind,
     #[serde(default)]
     pub session_id: String,
+    /// agent 自己声明的**本地会话日志路径**（hook stdin 的 `transcript_path`，官方
+    /// hooks 参考里的公共输入字段）。目前只有 Qoder 的终态核验会用它：该 agent 在
+    /// 模型请求被拒绝（额度用尽 / 鉴权失效）时**不发任何 hook**，只在 transcript 末尾
+    /// 追加一条 `isApiErrorMessage` 的合成助手消息（见 app/src-tauri/src/qoder_watch.rs）。
+    ///
+    /// 其他 agent 即使带同名字段也不参与任何判定：这是一条**位置提示**，不是状态信号；
+    /// 缺省时 Qoder 的核验按精确 session id 自己找，找不到就保留最后已知状态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     #[serde(default)]
     pub cwd: String,
     /// 从 cwd 推导的项目名
@@ -216,6 +231,11 @@ impl NormalizedEvent {
             .to_string();
         let message = truncate_chars(&extract_message(raw), MAX_MESSAGE_CHARS);
         let project = project_name_from_cwd(&cwd);
+        // 会话日志位置只做提示，不参与状态判定：Qoder 的额度/鉴权失败核验用它精确
+        // 定位 transcript；缺省时核验按 session id 自己找（见 qoder_watch）。
+        // camelCase 是部分入口的命名习惯（同 sessionId / toolName），一并兜住。
+        let transcript_path =
+            first_str(raw, &["transcript_path", "transcriptPath"]).map(str::to_owned);
         NormalizedEvent {
             run: None,
             completion_deferred: false,
@@ -223,6 +243,7 @@ impl NormalizedEvent {
             agent: agent.to_string(),
             kind,
             session_id,
+            transcript_path,
             cwd,
             project,
             message,
@@ -240,8 +261,8 @@ impl NormalizedEvent {
         }
     }
 
-    pub fn notify_title(&self) -> String {
-        format!("{} · {}", self.kind.default_title(), agent_display(&self.agent))
+    pub fn notify_title(&self, lang: crate::i18n::Lang) -> String {
+        format!("{} · {}", self.kind.default_title(lang), agent_display(&self.agent, lang))
     }
 
     pub fn notify_body(&self) -> String {
@@ -360,9 +381,9 @@ fn is_scratch_name(name: &str) -> bool {
     hex_id || uuid || date
 }
 
-fn agent_display(id: &str) -> String {
+fn agent_display(id: &str, lang: crate::i18n::Lang) -> String {
     crate::agent::AgentKind::from_id(id)
-        .map(|k| k.display_name().to_string())
+        .map(|k| k.display_name_lang(lang).to_string())
         .unwrap_or_else(|| id.to_string())
 }
 
@@ -443,6 +464,17 @@ mod tests {
         assert!(!subagent_flag(json!({"subagent": false, "agent_id": "abc"})));
     }
 
+    /// project 名取路径末段，靠 `Path::file_name` 按平台分隔符工作——
+    /// 测试里的反斜杠字面量在 unix 上不是分隔符，必须先换成平台原生形态
+    #[cfg(windows)]
+    fn plat(p: &str) -> &str {
+        p
+    }
+    #[cfg(not(windows))]
+    fn plat(p: &str) -> String {
+        p.replace('\\', "/")
+    }
+
     /// 跨 agent 的 payload 命名差异靠别名兜底（2026-09 广度扩展）。
     /// 没有别名兜底的话，这些 agent 的会话 id 为空 → 被管道的「幻影会话」门
     /// 全部丢弃，等于整条接入失效。
@@ -452,7 +484,7 @@ mod tests {
         let ev = NormalizedEvent::from_raw(
             "cursor",
             EventKind::Activity,
-            &json!({ "conversation_id": "c1", "workspace_roots": [r"D:\W\proj"] }),
+            &json!({ "conversation_id": "c1", "workspace_roots": [plat(r"D:\W\proj")] }),
         );
         assert_eq!(ev.session_id, "c1");
         assert_eq!(ev.project.as_deref(), Some("proj"));
@@ -461,7 +493,7 @@ mod tests {
         let ev = NormalizedEvent::from_raw(
             "grok",
             EventKind::Activity,
-            &json!({ "sessionId": "g1", "workspaceRoot": r"D:\W\grok", "toolName": "Bash" }),
+            &json!({ "sessionId": "g1", "workspaceRoot": plat(r"D:\W\grok"), "toolName": "Bash" }),
         );
         assert_eq!(ev.session_id, "g1");
         assert_eq!(ev.tool_name.as_deref(), Some("Bash"));
@@ -470,7 +502,7 @@ mod tests {
         let ev = NormalizedEvent::from_raw(
             "antigravity",
             EventKind::Activity,
-            &json!({ "conversationId": "a1", "workspacePaths": [r"D:\W\ag"], "toolCall": {"name": "edit_file"} }),
+            &json!({ "conversationId": "a1", "workspacePaths": [plat(r"D:\W\ag")], "toolCall": {"name": "edit_file"} }),
         );
         assert_eq!(ev.session_id, "a1");
         assert_eq!(ev.tool_name.as_deref(), Some("edit_file"));
@@ -487,22 +519,45 @@ mod tests {
         let ev = NormalizedEvent::from_raw(
             "claude-code",
             EventKind::Activity,
-            &json!({ "session_id": "s1", "cwd": r"D:\W\cc", "tool_name": "Read" }),
+            &json!({ "session_id": "s1", "cwd": plat(r"D:\W\cc"), "tool_name": "Read" }),
         );
         assert_eq!(ev.session_id, "s1");
         assert_eq!(ev.tool_name.as_deref(), Some("Read"));
+    }
+
+    /// Qoder hooks 的公共输入字段 `transcript_path`：只是位置提示，缺失/空白不得凭空造值。
+    /// 它不能变成状态信号——额度失败的判定在 qoder_watch，按当前回合过滤。
+    #[test]
+    fn transcript_path_is_captured_as_a_location_hint_only() {
+        let ev = NormalizedEvent::from_raw(
+            "qoder",
+            EventKind::Activity,
+            &json!({ "session_id": "s1", "transcript_path": "C:/q/.qoder-cn/projects/p/s1.jsonl" }),
+        );
+        assert_eq!(ev.transcript_path.as_deref(), Some("C:/q/.qoder-cn/projects/p/s1.jsonl"));
+        let ev = NormalizedEvent::from_raw("qoder", EventKind::Activity, &json!({ "session_id": "s1" }));
+        assert!(ev.transcript_path.is_none());
+        let ev = NormalizedEvent::from_raw("qoder", EventKind::Activity, &json!({ "transcript_path": "  " }));
+        assert!(ev.transcript_path.is_none(), "空白路径等同缺失");
+        // camelCase 入口（同 sessionId / toolName）也认。
+        let ev = NormalizedEvent::from_raw(
+            "qoder",
+            EventKind::Activity,
+            &json!({ "sessionId": "s1", "transcriptPath": "C:/q/x.jsonl" }),
+        );
+        assert_eq!(ev.transcript_path.as_deref(), Some("C:/q/x.jsonl"));
     }
 
     #[test]
     fn project_name_skips_session_id_and_date_segments() {
         // 普通项目目录：仍然取末段
         assert_eq!(
-            project_name_from_cwd(r"D:\Workspace\中融新大").as_deref(),
+            project_name_from_cwd(&plat(r"D:\Workspace\中融新大")).as_deref(),
             Some("中融新大")
         );
         // Qoder 桌面应用的会话工作区：跳过 <会话id> 与 <日期>，落到 "Qoder"
         assert_eq!(
-            project_name_from_cwd(r"C:\Users\x\Documents\Qoder\2026-09-10\4c7d79ff").as_deref(),
+            project_name_from_cwd(&plat(r"C:\Users\x\Documents\Qoder\2026-09-10\4c7d79ff")).as_deref(),
             Some("Qoder")
         );
         // UUID 形态的会话目录同理

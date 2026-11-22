@@ -11,3 +11,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rodio = "0.23"
