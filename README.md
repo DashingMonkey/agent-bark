@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://github.com/DashingMonkey/agent-bark/releases"><img src="https://img.shields.io/badge/下载-发布版本-6f6fff?style=flat-square" alt="下载发布版本" /></a>
-  <a href="https://github.com/DashingMonkey/agent-bark/releases"><img src="https://img.shields.io/badge/version-0.1.8-6f6fff?style=flat-square" alt="版本 0.1.8" /></a>
+  <a href="https://github.com/DashingMonkey/agent-bark/releases"><img src="https://img.shields.io/badge/version-0.1.9-6f6fff?style=flat-square" alt="版本 0.1.9" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3b9b69?style=flat-square" alt="MIT 许可证" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078d4?style=flat-square" alt="Windows" />
 </p>
@@ -28,6 +28,7 @@
 
 ## 功能特性
 
+- **Token 用量统计**：本机采集各 Agent 的请求与 Token 消耗，按今天 / 近 7 天 / 近 30 天 / 近一年查看缓存命中率、输入输出构成与分 Agent 排行。
 - **多 Agent 接入**：通过 Hook、插件或本地监控接入编程助手，在界面中统一扫描和开关接入。
 - **事件流与状态跟踪**：集中查看思考、工具调用、等待确认、等待输入、完成、失败和已终止等状态，支持筛选和本地移除显示。
 - **桌面悬浮窗**：显示多个项目和会话，支持父子任务层级、拖动移动、固定位置，以及拖到屏幕顶部/左右边缘后贴边隐藏。
@@ -55,11 +56,17 @@
 3. 在 Agent 中发起任务，到「事件流」确认状态；在「悬浮窗」启用桌面卡片，拖到顶部或左右边缘即可贴边隐藏。
 4. 在「通知」设置光效与声音；需要手机或其他应用提醒时，进入「第三方通知」配置 Bark 或 Webhook。
 
-首次使用见[快速开始文档](doc/getting-started.md)，悬浮窗、托盘和提醒规则见[使用指南](doc/usage.md)。
+「Token 用量」页会随接入自动记录本机消耗，无需额外配置。首次使用见[快速开始文档](doc/getting-started.md)，悬浮窗、托盘和提醒规则见[使用指南](doc/usage.md)。
 
 ## 界面预览
 
 以下图片使用真实界面与模拟数据，支持点击查看大图。
+
+### Token 用量
+
+| 浅色 | 深色 |
+| :---: | :---: |
+| [![浅色 Token 用量](doc/images/usage-light.png)](doc/images/usage-light.png) | [![深色 Token 用量](doc/images/usage-dark.png)](doc/images/usage-dark.png) |
 
 ### 悬浮窗与会话详情
 
