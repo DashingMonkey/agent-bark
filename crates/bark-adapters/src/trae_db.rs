@@ -1,11 +1,14 @@
-//! TraeWork（TRAE SOLO CN）会话库解密：SQLCipher 4 页面级解密。
+//! TRAE 会话库解密：SQLCipher 4 页面级解密。
 //!
-//! `%APPDATA%\TRAE SOLO CN\ModularData\ai-agent\database.db` 是 SQLCipher 4 加密库
-//! （AES-256-CBC + HMAC-SHA512，page=4096，reserve=80 即 16B IV + 64B HMAC）。
+//! 2026-11 起 TraeCode 与 TraeWork 合并为同一个应用，会话库统一落在
+//! `%APPDATA%\Trae CN\ModularData\ai-agent\database.db`（合并前的 TraeWork 是
+//! `TRAE SOLO CN` 下的同名路径，库结构与密钥完全一致）。
+//! 该库是 SQLCipher 4 加密库（AES-256-CBC + HMAC-SHA512，page=4096，
+//! reserve=80 即 16B IV + 64B HMAC）。
 //!
 //! 密钥不是随机的：与 Trae CN 同源的固定派生链（ai_agent.dll 内硬编码常量，
 //! 2026-09 于 TraeWork CN 0.1.69 的 265MB ai_agent.dll 实测常量在位、
-//! 本机库 HMAC 校验通过）：
+//! 本机库 HMAC 校验通过；2026-11 在合并后的 Trae CN 1.107.1 库上复核仍通过）：
 //!
 //! 1. 配置键 `mics_sj10gy` 的 32 字节加密数据，与 "rust"/"cpp"/"electron"
 //!    三表循环 XOR 解出固定明文密码（三个计数器各自按表长循环，联合周期是
@@ -25,7 +28,7 @@
 //! （排除 RESTART checkpoint 后残留的陈旧尾帧）+ 页级 HMAC（撕裂尾帧到此为止），
 //! 只应用到最后一个提交帧（不完整事务丢弃），库大小取最后提交帧的 dbsize。
 //!
-//! ⚠️ 非官方机制：TraeWork 升级可能更换常量（见 `verify_page1` 的报错提示），
+//! ⚠️ 非官方机制：TRAE 升级可能更换常量（见 `verify_page1` 的报错提示），
 //! 届时用 `tools/traework-probe.mjs strings` 重新核对常量后更新本文件
 //! （该工具的 `decrypt`/`dump`/`sql` 子命令也用于重新校准 schema）。
 
@@ -118,7 +121,7 @@ pub fn verify_page(page: &[u8], pgno: u32, mac_key: &[u8]) -> bool {
     mac.verify_truncated_left(&page[PAGE_SZ - HMAC_SZ..PAGE_SZ]).is_ok()
 }
 
-/// 页 1 的 HMAC 校验（密钥对不对只看这一页——「TraeWork 换了密钥算法」的探测点）。
+/// 页 1 的 HMAC 校验（密钥对不对只看这一页——「TRAE 换了密钥算法」的探测点）。
 pub fn verify_page1(page1: &[u8], enc_key: &[u8]) -> bool {
     if page1.len() < PAGE_SZ {
         return false;
@@ -137,7 +140,7 @@ pub fn verify_db(src: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("读取会话库首页失败: {e}"))?;
     if !verify_page1(&page1, derive_key()) {
         anyhow::bail!(
-            "TraeWork 会话库密钥校验失败：TraeWork 可能升级了密钥算法，\
+            "TRAE 会话库密钥校验失败：TRAE 可能升级了密钥算法，\
              需重新逆向 ai_agent.dll 常量（tools/traework-probe.mjs strings）"
         );
     }
@@ -177,11 +180,25 @@ const WAL_HDR_SZ: usize = 32;
 const WAL_FRAME_HDR_SZ: usize = 24;
 
 /// `<db>` 对应的 `-wal` 路径（SQLite 命名约定：库名后缀拼接）。
-/// 轮询指纹（watch.rs）也要靠它盯住 WAL 的变化。
+/// 库状态指纹也要靠它盯住 WAL 的变化。
 pub fn wal_path(src: &Path) -> PathBuf {
     let mut os = src.as_os_str().to_os_string();
     os.push("-wal");
     PathBuf::from(os)
+}
+
+/// 库文件状态指纹：主库与 `-wal` 各自的（大小，修改时间）。
+///
+/// 采集端用它做「没变就不解密」的门控。**必须包含 -wal**：宿主是 WAL 模式，
+/// 新提交先落 `database.db-wal`、checkpoint 后才进主库——2026-09 实测 -wal
+/// 常驻 4-5MB（上千帧）是常态，期间主库指纹纹丝不动；只盯主库会让最新会话
+/// 整场不可见（当时两次提问全程无光效的直接原因）。
+pub type DbFingerprint = ((u64, Option<std::time::SystemTime>), (u64, Option<std::time::SystemTime>));
+
+pub fn fingerprint(db: &Path) -> Option<DbFingerprint> {
+    let stat = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()));
+    let main = stat(db)?;
+    Some((main, stat(&wal_path(db)).unwrap_or((0, None))))
 }
 
 /// WAL 校验和（SQLite `walChecksumBytes`）：数据按 8 字节一对 u32 累加
@@ -346,7 +363,7 @@ pub fn decrypt_db(src: &Path) -> anyhow::Result<Vec<u8>> {
         let pgno = (i + 1) as u32;
         anyhow::ensure!(
             verify_page(page, pgno, &mac_key),
-            "TraeWork 会话库第 {pgno} 页 HMAC 校验失败（撕裂快照 / 混合世代页，或密钥算法已随版本更换，\
+            "TRAE 会话库第 {pgno} 页 HMAC 校验失败（撕裂快照 / 混合世代页，或密钥算法已随版本更换，\
              后者需重新核对 ai_agent.dll 常量：tools/traework-probe.mjs strings）。本轮放弃，下一轮自愈"
         );
         decrypt_page(key, page, pgno as u64, &mut out);
@@ -358,13 +375,13 @@ pub fn decrypt_db(src: &Path) -> anyhow::Result<Vec<u8>> {
         Ok(bytes) => {
             if let Err(e) = overlay_wal(&mut out, &bytes, key, &mac_key) {
                 tracing::warn!(
-                    "TraeWork 会话库 -wal 叠加失败，本轮退回主库视角（下一轮自愈）：{e:#}"
+                    "TRAE 会话库 -wal 叠加失败，本轮退回主库视角（下一轮自愈）：{e:#}"
                 );
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!(
-            "TraeWork 会话库 -wal 读取失败，本轮退回主库视角（下一轮自愈）：{e}"
+            "TRAE 会话库 -wal 读取失败，本轮退回主库视角（下一轮自愈）：{e}"
         ),
     }
     Ok(out)
@@ -550,7 +567,7 @@ mod tests {
             verify_page1(&enc[..PAGE_SZ], key),
             verify_page(&enc[..PAGE_SZ], 1, &mac_key)
         );
-        // 密钥探测点：错误密钥恒 false（「TraeWork 换了密钥算法」时的报错来源）
+        // 密钥探测点：错误密钥恒 false（「TRAE 换了密钥算法」时的报错来源）
         assert!(!verify_page1(&enc[..PAGE_SZ], &[1u8; 32]));
     }
 

@@ -290,9 +290,13 @@ fn first_str<'a>(raw: &'a Value, keys: &[&str]) -> Option<&'a str> {
 /// 2. 否则看 `agent_id` / `agent_type`：Claude Code 系 hook 只在「hook 在子代理内部
 ///    触发」时给出 agent_id，agent_id + agent_type 同现于 SubagentStart/SubagentStop，
 ///    故二者任一非空即判子代理（依据 https://code.claude.com/docs/en/hooks ）；
-/// 3. 误判代价不对称：漏判子代理会刷屏，误判主事件只会少一条推送通知
-///    （事件仍进历史与前端事件流），故宁可偏向判 true。
-///    若将来实测到某 agent 的主事件也带这些字段，需回看此处。
+///    **已知例外**：TRAE 的每条 hook 载荷都带这两个字段（恒为 `solo_agent`，2026-11-23 实测），
+///    它的适配器改为只认显式布尔字段（见 bark-adapters 的 `explicit_subagent_flag`）。
+///    口径的覆盖点在各 adapter 的 normalize 里，本函数不按 agent 分叉；
+/// 3. 误判代价不对称：漏判子代理会刷屏，误判主事件会少一条推送通知（事件仍进历史与前端
+///    事件流），故宁可偏向判 true。但误判的代价不止通知：`is_subagent` 同时拦着**音效 /
+///    屏幕流光 / 通知聚合**（state.rs、sound_policy、glow 都按它短路），所以一旦某个 agent
+///    的主事件带上这些字段，必须像 TRAE 那样在适配器里覆盖，不能只当「少一条推送」。
 fn detect_subagent(raw: &Value) -> bool {
     for key in ["is_subagent", "subagent"] {
         if let Some(b) = raw.get(key).and_then(|v| v.as_bool()) {
@@ -429,6 +433,8 @@ mod tests {
     fn agent_scope_fields_mark_subagent() {
         // Claude Code 系 hook 只在「hook 在子代理内部触发」时给出 agent_id；
         // agent_id / agent_type 任一非空即视为子代理作用域事件。
+        // 反例：TRAE 每条载荷都带这两个字段，由适配器覆盖（见 bark-adapters 的
+        // `explicit_subagent_flag`）——本函数保持通用启发式，不按 agent 分叉。
         assert!(subagent_flag(json!({"agent_id": "abc123"})));
         assert!(subagent_flag(json!({"agent_type": "coder"})));
         assert!(subagent_flag(json!({"agent_id": "abc", "agent_type": "coder"})));

@@ -1,6 +1,7 @@
 //! Token 用量采集器：**独立通道**，不进通知事件管道（理由见 usage_store.rs 头注）。
 //!
-//! 节奏：文件尾读 / db 增量 5s 一轮；DSH 解压贵，30s 一轮；zstd 文件（DSH /
+//! 节奏：文件尾读 / db 增量 5s 一轮；DSH 解压贵，30s 一轮；TRAE 要解密整库，
+//! 30s 一轮且主库/-wal 指纹没变就跳过；zstd 文件（DSH /
 //! Codex 归档 rollout）都按 mtime/size 门控，没变不解压；5min 兜底把两个 db
 //! 游标归零全量重扫（主键幂等，重扫不重复累计），补「状态晚收敛 / 时钟回拨」
 //! 漏掉的行。开关关闭时 sync() 停线程，全部节奏停摆。
@@ -46,6 +47,7 @@ pub const USAGE_SOURCE_AGENTS: &[&str] = &[
     "kimi-work",
     "opencode",
     "qwen-code",
+    "trae-code",
     "workbuddy",
     "zcode",
 ];
@@ -53,8 +55,6 @@ pub const USAGE_SOURCE_AGENTS: &[&str] = &[
 /// 已安装但没有本地用量采集器的 agent：用量页脚注用。
 /// 新增采集器时同步移除这里；与 usage_sources.rs 头注的「不猜口径」清单一致。
 pub const NO_USAGE_SOURCE_AGENTS: &[&str] = &[
-    "trae-code",
-    "trae-work",
     "cursor",
     "antigravity",
     "doubao-work",
@@ -92,12 +92,19 @@ pub(crate) struct Cursors {
     pub(crate) oc_ts: HashMap<PathBuf, i64>,
     /// CodeBuddy 扩展日志：每文件的 `Model prepared:` 锚点（agent_id → (model, 毫秒)）
     pub(crate) cb_prepared: HashMap<PathBuf, HashMap<String, (String, Option<i64>)>>,
+    /// TRAE 会话库：`server_history_info.created_at` 游标（秒）
+    pub(crate) trae_ts: i64,
+    /// TRAE 会话库：主库 + `-wal` 的 (size, mtime) 指纹，没变就不解密
+    pub(crate) trae_fp: Option<bark_adapters::trae_db::DbFingerprint>,
+    /// TRAE 采集最近一次错误（同一错误只记一次日志）
+    pub(crate) trae_err: Option<String>,
 }
 
 fn run(state: Arc<AppState>, stop: Arc<AtomicBool>) {
     let mut c = Cursors::default();
     let mut next_fast = Instant::now();
     let mut next_dsh = Instant::now();
+    let mut next_trae = Instant::now();
     let mut next_sweep = Instant::now() + SWEEP;
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -108,6 +115,10 @@ fn run(state: Arc<AppState>, stop: Arc<AtomicBool>) {
         if now >= next_dsh {
             poll_dsh(&state.usage, &mut c);
             next_dsh = now + POLL_DSH;
+        }
+        if now >= next_trae {
+            crate::usage_trae::collect(&state.usage, &mut c);
+            next_trae = now + crate::usage_trae::POLL;
         }
         if now >= next_sweep {
             c.zcode_ts = 0;

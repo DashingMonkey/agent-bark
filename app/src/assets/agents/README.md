@@ -8,8 +8,8 @@
 | 本目录文件 | 上游图标 | 用于 |
 | --- | --- | --- |
 | claude-code.svg | claudecode-color | Claude Code |
-| trae-code.svg | trae-color（主色改为 #6DEC93，官网样式：黑底方块衬底 + 绿标居中） | TraeCode |
-| trae-work.svg | trae-color（主色改为 #000000） | TraeWork |
+| trae.svg | trae-color（单色，currentColor；原 TraeWork 的黑白标） | TRAE（当前使用） |
+| trae-code.svg | trae-color（主色 #6DEC93，黑底方块衬底 + 绿标居中；官网现用样式） | TRAE 备选图标，暂未启用（官网若换回黑绿标时切它） |
 | codebuddy.svg | codebuddy-color | CodeBuddy |
 | qoder.svg | qoder-color | Qoder |
 | codex.svg | codex-color | Codex |

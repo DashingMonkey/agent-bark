@@ -16,7 +16,7 @@ pub mod kimi_code;
 pub mod kimiwork;
 pub mod opencode;
 pub mod registry;
-pub mod traework_db;
+pub mod trae_db;
 pub mod watch;
 mod workbuddy;
 pub mod zcode;

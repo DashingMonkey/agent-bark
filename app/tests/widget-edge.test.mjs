@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
+import { loadApi } from "./api-loader.mjs";
 
 function compile(name, extra = "") {
   return ts.transpileModule(readFileSync(new URL(`../src/${name}.ts`, import.meta.url), "utf8") + extra, {
@@ -167,7 +168,11 @@ function setup(init = {}, options = {}) {
       api, eventLabel: (kind) => kind, phaseLabel: (phase) => phase, placeholderName: (id) => `session …${id}`,
       SESSION_INDENT_MAX: 2,
       agentName: (name) => name, agentIcon: () => "", isSubagentSession: (s) => !!s.parent,
+      // 有血缘才算子代理（与 src/api.ts 的同名判据一致）
+      isSubagentEvent: (ev) => ev.is_subagent === true && typeof ev.parent_session_id === "string" && ev.parent_session_id !== "",
       sessionRows: (sessions) => sessions.map((session) => ({ session, depth: 0 })),
+      // 个别用例要真实 api：占位父行只有真 sessionRows 才造得出来（默认桩是拍平的）
+      ...(options.apiOverrides ?? {}),
     },
     "./i18n": {
       initI18n: async () => {}, t: (key) => key, locale: () => "zh", onLocaleChanged: () => noop,
@@ -594,4 +599,55 @@ test("macOS fallback: docking works on position comparison when moved events and
   assert.equal(ui.result.snapshot().dockSide, "right");
   assert.equal(ui.native.size.width, 6);
   assert.deepEqual(ui.saves.at(-1), [1640, 300, "right", null]);
+});
+
+// ---- 会话行合成（widget.ts 的 currentRows）：占位父行 / 孤儿驻留行 ----
+
+const realApi = loadApi();
+
+/** 列表容器：appEl → cardEl → listEl（见 widget.ts 的 append 顺序） */
+function rowElements(ui) {
+  return ui.node("app").children[0].children[0].children;
+}
+
+test("a vanished parent keeps the name it had instead of its session tail", async () => {
+  // 回归：占位行的合成名曾被写进 lastSeenRow，还原时读回来的就是它自己——主会话在子代理
+  // 还跑着的那段时间一直显示 `会话 …尾号`。占位父行只有真实 sessionRows 才造得出来。
+  const session = (id, extra = {}) => ({
+    agent: "dsh", session_id: id, project: "ws", cwd: "D:\\ws", phase: "thinking",
+    prompt: null, last_tool: null, turn_count: 1, tool_calls: 1, started_at: 1000, last_activity: 2000,
+    ...extra,
+  });
+  const child = session("C", { parent: "P", started_at: 2000, phase: "tool_running" });
+  const ui = setup({}, {
+    initialSessions: [session("P"), child],
+    apiOverrides: { sessionRows: realApi.sessionRows, isSubagentEvent: realApi.isSubagentEvent },
+  });
+  await ui.advance(0);
+  assert.equal(rowElements(ui).length, 2);
+  ui.sessions([child]); // 父行被摘掉，子代理还在跑 → sessionRows 合成占位父行
+  await ui.advance(0);
+  const [parent, kid] = rowElements(ui);
+  assert.ok(parent.innerHTML.includes("dsh"), "占位父行还原成上一帧见到的 agent 名");
+  assert.ok(!parent.innerHTML.includes("session …P"), "不能摆一串 id 尾号");
+  assert.ok(!parent.className.includes("placeholder"), "有子在跑的占位行按真实行渲染");
+  assert.ok(kid.className.includes("sub"), "子代理行仍带子代理标记");
+});
+
+test("a subagent completion with no parent row gets one, so it never floats alone", async () => {
+  // 回归：父行连列表都不在（daemon 刚重启 / 父回合已摘档）时，驻留行孤零零落在末尾，
+  // 卡片上只剩「子代理 · 任务完成」，看着像子代理没有主会话。
+  const ui = setup({}, { apiOverrides: { isSubagentEvent: realApi.isSubagentEvent } });
+  await ui.advance(0);
+  ui.event({
+    id: "e1", agent: "dsh", type: "run_completed", session_id: "C",
+    project: "ws", is_subagent: true, parent_session_id: "P", timestamp: 1,
+  });
+  await ui.advance(300);
+  const rows = rowElements(ui);
+  assert.equal(rows.length, 2, "补出父行 + 驻留行");
+  assert.ok(!rows[0].className.includes("sub"), "补出来的父行是顶格主行");
+  assert.ok(rows[0].innerHTML.includes("dsh"));
+  assert.ok(rows[1].className.includes("sub"), "驻留行挂在父行下面");
+  assert.ok(rows[1].innerHTML.includes("run_completed"));
 });

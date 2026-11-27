@@ -309,7 +309,6 @@
     "idle": "Idle · No active sessions",
     "footerSessions": "1 session · scrollable | {n} sessions · scrollable",
     "footerAttention": "1 item needs attention | {n} items need attention",
-    "endedName": "{name} (ended)",
     "subagent": "Subagent {n}",
     "edgeHandleAria": "Move in to expand the widget; drag away from the edge to unhide",
     "pinnedAria": "Position pinned"

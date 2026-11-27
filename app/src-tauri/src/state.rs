@@ -2992,7 +2992,7 @@ mod tests {
             title: "t".into(),
             body: body.into(),
             event: EventKind::RunCompleted,
-            agent: "trae-work".into(),
+            agent: "workbuddy".into(),
             project: None,
         }
     }
@@ -3015,7 +3015,7 @@ mod tests {
     #[test]
     fn same_key_events_in_window_merge_into_one_notification() {
         let mut pending: HashMap<String, PendingNotify> = HashMap::new();
-        let key = "trae-work|run_completed|s1".to_string();
+        let key = "workbuddy|run_completed|s1".to_string();
         // 第一条：无 pending → 进聚合窗
         assert_eq!(notify_action(false, pending.contains_key(&key), false), NotifyAction::Enqueue);
         pending.insert(key.clone(), PendingNotify { notification: notification("done"), merged: 0, seq: 1 });
@@ -3052,7 +3052,7 @@ mod tests {
         assert_eq!(notify_action(true, true, true), NotifyAction::Merge, "有 pending 合并计数，不压制");
         assert_eq!(notify_action(true, false, false), NotifyAction::Enqueue, "窗外照常");
         // 只有监控型受 6s 窗压制
-        assert!(is_watch_agent("trae-work") && is_watch_agent("workbuddy"));
+        assert!(is_watch_agent("kimi-work") && is_watch_agent("workbuddy"));
         assert!(!is_watch_agent("claude-code") && !is_watch_agent("zcode"));
         assert!(!is_watch_agent("retired-agent"), "未知 id 按 hook 型对待");
     }

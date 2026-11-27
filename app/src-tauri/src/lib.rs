@@ -14,6 +14,7 @@ mod update;
 mod usage_collect;
 mod usage_sources;
 mod usage_store;
+mod usage_trae;
 mod widget;
 
 use bark_core::NormalizedEvent;

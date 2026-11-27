@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * TraeWork（TRAE SOLO CN）会话库取证探针
+ * TRAE 会话库取证探针（2026-11 起 TraeCode / TraeWork 合并为 Trae CN）
  *
- * 背景：`%APPDATA%\TRAE SOLO CN\ModularData\ai-agent\database.db` 为 SQLCipher 4 加密。
+ * 背景：`%APPDATA%\Trae CN\ModularData\ai-agent\database.db` 为 SQLCipher 4 加密。
  * Trae CN 的固定密钥方案（Oh-My-Trae/trae-db-decrypt + DirWang 逆向）未必适用于 SOLO CN，
  * 本工具用于：验证候选密钥、扫描 ai_agent.dll 密钥线索、页面级解密、dump 表结构。
  *
@@ -47,10 +47,10 @@ function usage() {
 }
 
 function defaultDb() {
-  return process.env.APPDATA + "\\TRAE SOLO CN\\ModularData\\ai-agent\\database.db";
+  return process.env.APPDATA + "\\Trae CN\\ModularData\\ai-agent\\database.db";
 }
 function defaultDll() {
-  return "D:\\Program Files\\TRAE SOLO CN\\resources\\app\\modules\\ai-agent\\ai_agent.dll";
+  return "D:\\Program Files\\Trae CN\\resources\\app\\modules\\ai-agent\\ai_agent.dll";
 }
 
 function parseArgs(argv) {

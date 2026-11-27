@@ -7,8 +7,9 @@ import { t as i18nT } from "./i18n";
 // mono 图标（opencode / generic）用 currentColor，跟随文字颜色；
 // 彩色图标自带品牌色，深浅主题下都可直接用。
 import iconClaudeCode from "./assets/agents/claude-code.svg?raw";
-import iconTraeCode from "./assets/agents/trae-code.svg?raw";
-import iconTraeWork from "./assets/agents/trae-work.svg?raw";
+import iconTrae from "./assets/agents/trae.svg?raw";
+// 备选：./assets/agents/trae-code.svg（官网现行的黑底绿标，当前未启用）——
+// 产品若换回黑绿标，把上一行改成导入它即可。
 import iconCodebuddy from "./assets/agents/codebuddy.svg?raw";
 import iconQoder from "./assets/agents/qoder.svg?raw";
 import iconCodex from "./assets/agents/codex.svg?raw";
@@ -29,8 +30,7 @@ import iconGeneric from "./assets/agents/generic.svg?raw";
 /** agent id → 品牌 SVG（内联标记）。未收录的 agent 回落到 generic 兜底图标 */
 const AGENT_ICONS: Record<string, string> = {
   "claude-code": iconClaudeCode,
-  "trae-code": iconTraeCode,
-  "trae-work": iconTraeWork,
+  "trae-code": iconTrae,
   codebuddy: iconCodebuddy,
   qoder: iconQoder,
   codex: iconCodex,
@@ -172,6 +172,26 @@ export function isSubagentSession(s: SessionStatus): boolean {
 }
 
 /**
+ * 事件侧「是不是子代理」：与 [`isSubagentSession`] 同口径——**有血缘才算**。
+ *
+ * `is_subagent` 只是粗粒度标记；事件不带 `parent_session_id` 就挂不到任何父行上，硬按
+ * 子代理渲染只会让卡片末尾多出一行缩进、带连接线却**上面没有主代理**的孤儿行。实测踩过：
+ * TraeCode 的 hook 载荷恒带 `agent_id`/`agent_type`（`solo_agent`），被后端通用启发式
+ * 判成子代理，主会话的完成行显示成「子代理 01 · 任务完成」。适配器侧已修正，这里再按
+ * 「无血缘即主会话」兜一层，与 daemon 的建档口径一致。
+ *
+ * 反向也成立：hook 型 adapter 的事件**本来就没有血缘**（`NormalizedEvent::from_raw` 恒置空，
+ * 只有 DSH 插件与 ZCode 看门狗的合成事件会填），所以它们真正的子代理终态事件同样按主会话行
+ * 渲染。这与 daemon 一致——`SessionStatus.parent` 也只看 `parent_session_id`，那些子代理会话
+ * 在快照里本来就没有父行，本来就按主会话行显示。
+ */
+export function isSubagentEvent(ev: NormalizedEvent): boolean {
+  return ev.is_subagent === true
+    && typeof ev.parent_session_id === "string"
+    && ev.parent_session_id !== "";
+}
+
+/**
  * 父会话 id 的**尾 6 位**（仅用于展示血缘小字）。匹配父子一律用完整 id
  * （[`SessionStatus.parent`] 与 `session_id` 直接比对），别拿截断值去认亲。
  */
@@ -197,6 +217,9 @@ export interface SessionRow {
    * 占位父行：快照里没有这个会话（已结束/被淘汰），是为了让还活着的子代理有地方可挂
    * 而**合成**的一行。没有状态、没有 prompt，只显示 `会话 …尾号`；前端按此弱化渲染，
    * 不要拿它当真实会话（它不会出现在 `store.sessions` 里）。
+   *
+   * 工作区（`project` / `cwd`）沿用子代理的（见 [`ghostSession`]）：父会话派生子代理时
+   * 沿用同一个 cwd，所以行内项目名与悬停工作区照常可读，不是猜出来的。
    */
   placeholder: boolean;
 }
@@ -221,7 +244,7 @@ export function placeholderName(sessionId: string): string {
  * 只显示 `会话 …尾号`；它的 `session_id` 就是缺的那个父 id，所以同一父的多个子代理会聚到
  * 同一行下。若**整条父链**都不在快照里，缩进失去参照物 → 该子树顶格平铺（`parentMissing`）。
  *
- * 两条硬约束（都是实测踩过的坑，见 .tmp-svg/check-session-rows.mjs 的用例）：
+ * 两条硬约束（都是实测踩过的坑，见 `app/tests/session-rows.test.mjs` 的用例）：
  * 1. 「缺不缺」一律拿 `byId` 判，**不能**用 `visited` 反推。子行的 `started_at` 更晚、
  *    倒序下常常排在父行前面，先处理子行时会误判「父不在」而合成占位行——占位行与真父行
  *    同 key（`agent|id`），真父行随后被 `visited` 静默吃掉，界面上只剩一条没有徽标、
@@ -332,7 +355,11 @@ function ghostSession(kid: SessionStatus, id: string, parent: string | undefined
   return {
     agent: kid.agent,
     session_id: id,
-    project: null,
+    // 工作区沿用子代理的：父会话派生子代理时继承同一个 cwd（DSH 在会话头里写死的），
+    // 所以这里不是猜测。留 null 的话占位行既没有行内项目名、悬停也没有工作区名，
+    // 读起来就成了一条**没有归属的临时会话**（用户实测点名：主的应该跟子的一样在
+    // dsh-git-panel 里）。
+    project: kid.project,
     cwd: kid.cwd,
     phase: kid.phase,
     prompt: null,
@@ -672,14 +699,13 @@ export const api = {
  *  Rust `AgentKind::display_name_lang` 同口径），见 [`agentName`] */
 export const AGENT_NAMES: Record<string, string> = {
   "claude-code": "Claude Code",
-  "trae-code": "TraeCode",
+  "trae-code": "TRAE",
   codebuddy: "CodeBuddy",
   qoder: "Qoder",
   codex: "Codex",
   zcode: "ZCode",
   opencode: "OpenCode",
   dsh: "DeepSeek Harness",
-  "trae-work": "TraeWork",
   workbuddy: "WorkBuddy",
 };
 

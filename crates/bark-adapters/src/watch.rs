@@ -1,4 +1,4 @@
-//! 监控型适配器：无官方 hook 的 agent（WorkBuddy / TraeWork）
+//! 监控型适配器：无官方 hook 的 agent（本文件为 WorkBuddy；Kimi Work / 豆包工作见各自模块）
 //! 通过轮询本地 SQLite 会话库的状态跃迁产出统一事件。非官方方案，
 //! 软件升级可能导致失效，UI 需显著标注。
 //!
@@ -164,11 +164,11 @@ fn remove_snapshot_dir(dir: &Path) {
     }
 }
 
-/// 「会话行从库里消失」的闭环事件（WorkBuddy / TraeWork 统一口径，§1.12a）。
+/// 「会话行从库里消失」的闭环事件（所有监控型 adapter 统一口径，§1.12a）。
 ///
 /// 归一成 **RunAborted**（中止）而不是 RunFailed（失败）：行消失意味着用户删了
 /// 会话，不是任务失败——RunFailed 会弹「任务失败」通知 + 亮失败色 + 失败音，
-/// 删除仅证明会话已移除。RunAborted 不通知、不亮失败色（TraeWork 一直如此）。
+/// 删除仅证明会话已移除。RunAborted 不通知、不亮失败色。
 pub(crate) fn emit_lost_row(
     stop: &AtomicBool,
     tx: &mpsc::Sender<NormalizedEvent>,
@@ -532,9 +532,9 @@ fn snapshot_rows(db: &Path, query: &str) -> anyhow::Result<Vec<(String, String, 
     result
 }
 
-/// 快照临时目录的两套前缀（§2.7a）：WorkBuddy 的 `agent-bark-watch-` 与 TraeWork 的
-/// `agent-bark-traework-`。只匹配前者会让 TraeWork 的**明文整库快照**永久残留在
-/// %TEMP%（此前就是如此）。
+/// 快照临时目录的两套前缀（§2.7a）：现行 `agent-bark-watch-`，以及已下线的
+/// TraeWork 监控留下的 `agent-bark-traework-`（旧版本把**明文整库快照**写在那里，
+/// 升级后仍需回收，否则会永久残留在 %TEMP%）。
 fn is_snapshot_dir_name(name: &str) -> bool {
     name.starts_with("agent-bark-watch-") || name.starts_with("agent-bark-traework-")
 }
@@ -542,7 +542,7 @@ fn is_snapshot_dir_name(name: &str) -> bool {
 /// 回收进程被强杀时残留的快照临时目录（正常路径在 snapshot / snapshot_rows 里已自清）。
 /// 只动修改时间超过 `min_age` 的同名前缀目录：再保守也不至于误删并发 watcher 正在
 /// 用的那份（测试传 `Duration::ZERO` 立即回收）。两套前缀都清（§2.7a），
-/// 且 TraeWork 的 spawn 与 WorkBuddy 的 spawn 都调用（§2.7b——此前只有后者调）。
+/// 其中 `agent-bark-traework-` 是旧版 TraeWork 监控的遗留目录（该 adapter 已下线）。
 pub fn cleanup_stale_snapshot_dirs(tmp: &Path, min_age: Duration) {
     let Ok(rd) = std::fs::read_dir(tmp) else { return };
     for entry in rd.flatten() {
@@ -606,479 +606,6 @@ fn snapshot_rows_in(db: &Path, query: &str, tmp_dir: &Path) -> anyhow::Result<Ve
         out.push(r.map_err(|e| anyhow::anyhow!("读取行失败: {e}"))?);
     }
     Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// TraeWork（TRAE SOLO CN）：轮询加密会话库（SQLCipher 4 页面级解密）
-// ---------------------------------------------------------------------------
-
-/// 状态机实测校准（2026-09，TraeWork CN 0.1.69，75MB / 19265 页库解密实测）：
-///
-/// - 库 `%APPDATA%\TRAE SOLO CN\ModularData\ai-agent\database.db` 是 SQLCipher 4
-///   加密；**密钥固定可派生**（与 Trae CN 同源常量链，见 traework_db.rs——
-///   社区旧结论「SOLO CN 密钥随机」已过时，本机 HMAC 实测通过）
-/// - 回合生命周期在 `chat_turn` 表（每回合一行）：`turn_status` 终态值域
-///   `completed` / `failed` / `canceled`；**`canceled` = 用户主动停止 → RunAborted**
-///   （hook 型方案都拿不到这么干净的中止信号）
-/// - 非终态 turn_status 一律视为运行中（未来值域扩展也兼容）
-/// - 回合进行中的活动信号：`chat_message` / `history_v2` / `chat_turn` 的
-///   max(id) 增长（实测 history_v2 回合内持续追加，约 13 行/回合），
-///   用它发心跳点亮流光——监控型拿不到 UserPromptSubmit/PreToolUse，只能这样模拟
-/// - 宿主是 SQLite WAL 模式：新提交先落 `database.db-wal`（实测常驻 4-5MB），
-///   快照必须叠加 WAL 帧（`traework_db::decrypt_db`）、轮询指纹必须盯 `-wal`
-///   （`db_fingerprint`）——否则 checkpoint 之前的新回合全程不可见
-/// - ⚠️ 非官方机制：TraeWork 升级可能改 schema / 密钥常量（探针工具见
-///   `tools/traework-probe.mjs`），失效时 is_available 会给出具体原因
-
-struct SeenTurn {
-    session_id: String,
-    status: String,
-    last_seen: u64,
-}
-
-struct SeenSess {
-    churn: i64,
-    last_seen: u64,
-    last_hb: u64,
-}
-
-/// TraeWork 会话级心跳判定（纯函数，便于测试）。
-///
-/// - **首轮**对 `open` 集内（有非终态回合、正在跑）的会话直接心跳：daemon 启动时
-///   正在跑的会话要立刻点亮流光——旧实现是 `hb = !first && (...)`，首轮整体压掉，
-///   daemon 启动时正在跑的会话最长 60s 不亮流光（§1.12b）；
-/// - 首轮对非 open 会话仍不心跳，终态更不重放（`turn_event` 的 `first` 语义不变，
-///   `first_round_never_emits_terminal` 继续成立）；
-/// - 非首轮：活动计数器变化（回合内行持续追加）或运行中会话到保活周期才发。
-fn sess_needs_heartbeat(
-    prev: Option<&SeenSess>,
-    churn: i64,
-    round: u64,
-    open: bool,
-    first: bool,
-    every: u64,
-) -> bool {
-    let changed = match prev {
-        None => !first,
-        Some(p) => p.churn != churn,
-    };
-    let keepalive = open
-        && prev
-            .map(|p| round.saturating_sub(p.last_hb) >= every)
-            .unwrap_or(false);
-    (prev.is_none() && open) || (!first && (changed || keepalive))
-}
-
-/// TraeWork 回合终态集合（binary 状态：其余一切值都算运行中）
-fn is_turn_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "canceled")
-}
-
-/// 回合状态跃迁 → 事件判定（纯函数，便于测试）。
-/// - `first`：首轮只播种，不重放历史终态（否则启动风暴）
-/// - `suppress`：撕裂快照/查询条件波动导致行短暂消失又重现（prev 为空）时
-///   压住重复的终态通知（tombstone 有效期内）
-/// - 终态只在 prev 为非终态时发：`completed`→完成、`failed`→失败、
-///   `canceled`→RunAborted（用户按的停止：不通知、无别的会话时收起光效）
-fn turn_event(prev: &str, status: &str, suppress: bool, first: bool) -> Option<EventKind> {
-    if first || (suppress && prev.is_empty()) || is_turn_terminal(prev) {
-        return None;
-    }
-    match status {
-        "completed" => Some(EventKind::RunCompleted),
-        "failed" => Some(EventKind::RunFailed),
-        "canceled" => Some(EventKind::RunAborted),
-        _ => None,
-    }
-}
-
-/// 清理回合状态表：行从快照中持续消失（约 1 分钟）才遗忘——
-/// 单轮撕裂快照丢行不会误判。运行中回合的行消失（会话被删除、没有终态跃迁）
-/// 返回给调用方主动闭环；终态条目压入 tombstone 防重现重复通知；超限淘汰最旧终态。
-fn prune_turns(
-    last: &mut HashMap<String, SeenTurn>,
-    tombstone: &mut HashMap<String, u64>,
-    round: u64,
-) -> Vec<String> {
-    let mut lost_running: Vec<String> = Vec::new();
-    let mut dropped: Vec<String> = Vec::new();
-    last.retain(|id, t| {
-        let keep = round.saturating_sub(t.last_seen) < MISSING_KEEP_ROUNDS;
-        if !keep {
-            if is_turn_terminal(&t.status) {
-                dropped.push(id.clone());
-            } else {
-                lost_running.push(t.session_id.clone());
-            }
-        }
-        keep
-    });
-    for id in dropped {
-        tombstone.insert(id, round);
-    }
-    if last.len() > TERMINAL_MAX {
-        let overflow = last
-            .values()
-            .filter(|t| is_turn_terminal(&t.status))
-            .count()
-            .saturating_sub(TERMINAL_MAX);
-        if overflow > 0 {
-            let mut terminal: Vec<(String, u64)> = last
-                .iter()
-                .filter(|(_, t)| is_turn_terminal(&t.status))
-                .map(|(k, t)| (k.clone(), t.last_seen))
-                .collect();
-            terminal.sort_by_key(|(_, seen)| *seen);
-            for (id, _) in terminal.into_iter().take(overflow) {
-                last.remove(&id);
-                tombstone.insert(id, round);
-            }
-        }
-    }
-    tombstone.retain(|_, at| round.saturating_sub(*at) < TOMBSTONE_TTL_ROUNDS);
-    // 终态事件按 session 收场；同一 session 仍有未过期的运行回合时，不能因旧回合
-    // 被删就把新任务一并中止。多个消失回合也只需收场一次。
-    lost_running.retain(|sid| !last.values().any(|t| t.session_id == *sid && !is_turn_terminal(&t.status)));
-    lost_running.sort();
-    lost_running.dedup();
-    lost_running
-}
-
-/// 一轮快照：回合行 + 会话元信息（标题/工作目录）+ 活动计数器
-#[derive(Clone, Default)]
-struct TwSnapshot {
-    /// (turn_id, session_id, turn_status)
-    turns: Vec<(String, String, String)>,
-    /// session_id → (session_title, cwd)
-    meta: HashMap<String, (String, String)>,
-    /// session_id → 活动计数器（各表 max(id) 之和，单调不减）
-    churn: HashMap<String, i64>,
-}
-
-pub struct TraeWorkWatch;
-
-impl TraeWorkWatch {
-    fn db_path() -> Option<PathBuf> {
-        std::env::var_os("APPDATA").map(|d| {
-            PathBuf::from(d)
-                .join("TRAE SOLO CN")
-                .join("ModularData")
-                .join("ai-agent")
-                .join("database.db")
-        })
-    }
-
-    /// 惰性可用性探测（结果缓存）：密钥 HMAC 校验 + 解密 + schema 查询一并跑通
-    /// 才算可用；失败原因（密钥换了 / schema 变了 / 库损坏）展示给用户。
-    /// 重试 3 次再定论：解密读的是整库文件，宿主恰好在写入时可能读到撕裂页。
-    fn probe() -> &'static std::sync::OnceLock<Result<(), String>> {
-        static PROBE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-        &PROBE
-    }
-
-    fn probe_with_retry(db: &Path) -> Result<(), String> {
-        let mut last_err = String::new();
-        for _ in 0..3 {
-            match snapshot(db) {
-                Ok(_) => return Ok(()),
-                Err(e) => last_err = format!("{e:#}"),
-            }
-        }
-        Err(last_err)
-    }
-
-    /// 表/列名于 2026-09 在 TraeWork CN 0.1.69 解密库上实测校准。
-    /// 升版后失效时重新核对：chat_turn / chat_session / session_project /
-    /// project / chat_message / history_v2（探针：tools/traework-probe.mjs）。
-    const Q_TURNS: &'static str =
-        "SELECT turn_id, session_id, COALESCE(turn_status, '') FROM chat_turn WHERE deleted_at = 0";
-    const Q_META: &'static str = "SELECT s.session_id, COALESCE(s.session_title, ''), \
-         COALESCE(p.absolute_path, '') \
-         FROM chat_session s \
-         LEFT JOIN session_project sp ON sp.session_id = s.session_id \
-         LEFT JOIN project p ON p.project_id = sp.project_id \
-         WHERE s.deleted_at = 0";
-    /// 活动计数器：三张随回合增长的表各自 max(id) 求和（单表 max 单调、和也单调）
-    const Q_CHURN: &'static str = "SELECT session_id, SUM(mx) FROM ( \
-         SELECT session_id, MAX(id) AS mx FROM chat_message WHERE deleted_at = 0 GROUP BY session_id \
-         UNION ALL SELECT session_id, MAX(id) FROM history_v2 WHERE deleted_at = 0 GROUP BY session_id \
-         UNION ALL SELECT session_id, MAX(id) FROM chat_turn WHERE deleted_at = 0 GROUP BY session_id \
-         ) GROUP BY session_id";
-
-    const POLL_SECS: u64 = 5;
-    /// 运行中回合的保活心跳间隔（轮）：12 × 5s = 60s，只刷新已有条目
-    const HEARTBEAT_EVERY_ROUNDS: u64 = 12;
-}
-
-impl WatchAdapter for TraeWorkWatch {
-    fn kind(&self) -> AgentKind {
-        AgentKind::TraeWork
-    }
-
-    fn is_installed(&self) -> bool {
-        Self::db_path().is_some_and(|p| p.exists())
-    }
-
-    fn is_available(&self) -> bool {
-        let Some(db) = Self::db_path() else { return false };
-        if !db.exists() {
-            return false;
-        }
-        Self::probe().get_or_init(|| Self::probe_with_retry(&db)).is_ok()
-    }
-
-    fn unavailable_reason(&self, lang: bark_core::Lang) -> Option<String> {
-        // 库缺失在进探测缓存**之前**按语言给出原因（缓存串必须与语言无关）
-        let db = match Self::db_path().filter(|p| p.exists()) {
-            Some(p) => p,
-            None => {
-                return Some(match lang {
-                    bark_core::Lang::Zh => {
-                        "未找到 TraeWork 会话库（未安装或从未使用过 SOLO 模式）".into()
-                    }
-                    bark_core::Lang::En => {
-                        "TraeWork session database not found (not installed or SOLO mode never used)"
-                            .into()
-                    }
-                });
-            }
-        };
-        let probe = Self::probe().get_or_init(|| Self::probe_with_retry(&db));
-        match probe {
-            Ok(()) => None,
-            Err(e) => Some(match lang {
-                bark_core::Lang::Zh => format!(
-                    "TraeWork 会话库暂不可用，暂停监控：{e}。\
-                     可用 tools/traework-probe.mjs 核对密钥常量与 schema（库文件：{}）",
-                    db.display()
-                ),
-                bark_core::Lang::En => format!(
-                    "TraeWork session database is unavailable; monitoring paused: {e}. \
-                     Use tools/traework-probe.mjs to verify the key constants and schema (database: {})",
-                    db.display()
-                ),
-            }),
-        }
-    }
-
-    fn spawn(
-        &self,
-        stop: Arc<AtomicBool>,
-        tx: mpsc::Sender<NormalizedEvent>,
-    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
-        let db = Self::db_path().ok_or_else(|| anyhow::anyhow!("APPDATA 未设置，无法定位会话库"))?;
-        if !db.exists() {
-            anyhow::bail!("TraeWork 会话库不存在: {}", db.display());
-        }
-        let kind = AgentKind::TraeWork;
-        // TraeWork 的快照目录同样要回收（§2.7b：此前只在 WorkBuddy 的 spawn 调用，
-        // 且旧清理只认 `agent-bark-watch-` 前缀 → TraeWork 的明文快照永久残留）
-        cleanup_stale_snapshot_dirs(&std::env::temp_dir(), STALE_SNAPSHOT_MIN_AGE);
-        Ok(std::thread::spawn(move || {
-            let mut turns: HashMap<String, SeenTurn> = HashMap::new();
-            let mut tombstone: HashMap<String, u64> = HashMap::new();
-            let mut sess: HashMap<String, SeenSess> = HashMap::new();
-            let mut first = true;
-            let mut round: u64 = 0;
-            let mut fail_count: u32 = 0;
-            // 解密结果复用：主库 + -wal 的指纹（大小+修改时间）没变就跳过重新解密，
-            // 空闲时零开销；活跃时每轮约 75MB AES（有 AES-NI，几十毫秒级）
-            let mut last_fp: Option<DbFingerprint> = None;
-            let mut last_snap: Option<TwSnapshot> = None;
-            loop {
-                let fp = db_fingerprint(&db);
-                let snap = match (&last_snap, fp) {
-                    (Some(prev), Some(f)) if last_fp == Some(f) => Ok(prev.clone()),
-                    _ => snapshot(&db),
-                };
-                match snap {
-                    Ok(snap) => {
-                        fail_count = 0;
-                        round += 1;
-                        last_fp = fp;
-                        last_snap = Some(snap.clone());
-
-                        // 本轮处于运行中（有非终态回合）的会话
-                        let open: std::collections::HashSet<&str> = snap
-                            .turns
-                            .iter()
-                            .filter(|(_, _, st)| !is_turn_terminal(st))
-                            .map(|(_, sid, _)| sid.as_str())
-                            .collect();
-
-                        // 1) 会话级心跳：活动计数器变化（回合内行持续追加）就发，
-                        //    运行中会话另加周期保活——两者都只点亮状态机，不通知
-                        for (sid, churn) in &snap.churn {
-                            let (title, cwd) = snap
-                                .meta
-                                .get(sid)
-                                .map(|(t, c)| (t.as_str(), c.as_str()))
-                                .unwrap_or(("", ""));
-                            let prev = sess.get(sid);
-                            let hb = sess_needs_heartbeat(
-                                prev,
-                                *churn,
-                                round,
-                                open.contains(sid.as_str()),
-                                first,
-                                Self::HEARTBEAT_EVERY_ROUNDS,
-                            );
-                            if hb {
-                                let send = if prev.is_some_and(|p| p.churn == *churn) { emit_keepalive } else { emit };
-                                send(
-                                    &stop,
-                                    &tx,
-                                    kind,
-                                    EventKind::Activity,
-                                    sid,
-                                    cwd,
-                                    title,
-                                    None,
-                                );
-                            }
-                            sess.insert(
-                                sid.clone(),
-                                SeenSess {
-                                    churn: *churn,
-                                    last_seen: round,
-                                    last_hb: if hb { round } else { prev.map(|p| p.last_hb).unwrap_or(0) },
-                                },
-                            );
-                        }
-
-                        // 2) 回合级终态跃迁
-                        for (turn_id, sid, status) in &snap.turns {
-                            let prev = turns.get(turn_id).map(|t| t.status.as_str()).unwrap_or("");
-                            let suppress = prev.is_empty() && tombstone.contains_key(turn_id);
-                            if let Some(ev) = turn_event(prev, status, suppress, first) {
-                                let (title, cwd) = snap
-                                    .meta
-                                    .get(sid)
-                                    .map(|(t, c)| (t.as_str(), c.as_str()))
-                                    .unwrap_or(("", ""));
-                                emit(
-                                    &stop,
-                                    &tx,
-                                    kind,
-                                    ev,
-                                    sid,
-                                    cwd,
-                                    &terminal_message(title, status),
-                                    None,
-                                );
-                            }
-                            turns.insert(turn_id.clone(), SeenTurn { session_id: sid.clone(), status: status.clone(), last_seen: round });
-                        }
-
-                        // 3) 回合行持续消失（会话被删）时主动闭环运行中条目：
-                        //    RunAborted（用户删的：不通知不亮色，清除残留显示）
-                        for id in prune_turns(&mut turns, &mut tombstone, round) {
-                            emit_lost_row(&stop, &tx, kind, &id, "TraeWork");
-                        }
-                        sess.retain(|_, s| round.saturating_sub(s.last_seen) < MISSING_KEEP_ROUNDS);
-                        first = false;
-                    }
-                    Err(e) => {
-                        fail_count += 1;
-                        if fail_count.is_multiple_of(SNAPSHOT_WARN_EVERY) {
-                            tracing::warn!(
-                                "TraeWork 会话库快照已连续失败 {fail_count} 次（最近错误：{e:#}）。\
-                                 若持续出现，说明密钥或 schema 已随 TraeWork 升级变化，监控实际处于失效状态。"
-                            );
-                        }
-                    }
-                }
-                if !sleep_interruptible(&stop, Self::POLL_SECS) {
-                    break;
-                }
-            }
-        }))
-    }
-}
-
-/// 轮询指纹：主库与 `-wal` 各自的（大小，修改时间）。
-///
-/// **必须包含 -wal**：宿主是 SQLite WAL 模式，新提交先落 `database.db-wal`、
-/// checkpoint 后才进主库——2026-09-24 实测 -wal 常驻 4-5MB（上千帧）是常态，
-/// 期间主库指纹纹丝不动。只看主库会让解密缓存永不重读，新回合全程不可见
-/// （当天两次提问均无光效的直接原因）；主库 + -wal 一起盯，WAL 每次追加都能触发重读。
-type DbFingerprint = ((u64, Option<std::time::SystemTime>), (u64, Option<std::time::SystemTime>));
-
-fn db_fingerprint(db: &Path) -> Option<DbFingerprint> {
-    let stat = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()));
-    let main = stat(db)?;
-    Some((main, stat(&crate::traework_db::wal_path(db)).unwrap_or((0, None))))
-}
-
-/// 一轮快照：整库读入内存 → SQLCipher 页面级解密（**含 `-wal` 帧叠加**，见
-/// `traework_db::decrypt_db` 的模块头注释）→ 明文库写临时文件 → 只读查询。
-/// 单轮撕裂/查询失败由调用方计数告警，下一轮自愈。
-fn snapshot(db: &Path) -> anyhow::Result<TwSnapshot> {
-    let tmp_dir = std::env::temp_dir().join(format!("agent-bark-traework-{}", uuid::Uuid::new_v4().simple()));
-    let result = snapshot_in(db, &tmp_dir);
-    // 明文整库用完即删；删失败必须留痕（§2.7c，见 remove_snapshot_dir）
-    remove_snapshot_dir(&tmp_dir);
-    result
-}
-
-fn snapshot_in(db: &Path, tmp_dir: &Path) -> anyhow::Result<TwSnapshot> {
-    std::fs::create_dir_all(tmp_dir).map_err(|e| anyhow::anyhow!("创建临时目录失败: {e}"))?;
-    let mut plain = crate::traework_db::decrypt_db(db)?;
-    let tmp_db = tmp_dir.join("plain.db");
-    std::fs::write(&tmp_db, &plain).map_err(|e| anyhow::anyhow!("写明文快照失败: {e}"))?;
-    // 整库明文会话（AI 对话内容）用完即覆写清零（§2.7d，尽力而为）
-    wipe_secret(&mut plain);
-    drop(plain);
-    let conn = rusqlite::Connection::open_with_flags(&tmp_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| anyhow::anyhow!("打开明文快照失败: {e}"))?;
-
-    let mut snap = TwSnapshot::default();
-    {
-        let mut stmt = conn
-            .prepare(TraeWorkWatch::Q_TURNS)
-            .map_err(|e| anyhow::anyhow!("SQL prepare 失败（schema 可能已变，需重新校准）: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            })
-            .map_err(|e| anyhow::anyhow!("查询失败: {e}"))?;
-        for r in rows {
-            snap.turns.push(r.map_err(|e| anyhow::anyhow!("读取行失败: {e}"))?);
-        }
-    }
-    {
-        let mut stmt = conn.prepare(TraeWorkWatch::Q_META).map_err(|e| anyhow::anyhow!("SQL prepare 失败: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                ))
-            })
-            .map_err(|e| anyhow::anyhow!("查询失败: {e}"))?;
-        for r in rows {
-            let (sid, title, cwd) = r.map_err(|e| anyhow::anyhow!("读取行失败: {e}"))?;
-            snap.meta.insert(sid, (title, cwd));
-        }
-    }
-    {
-        let mut stmt = conn.prepare(TraeWorkWatch::Q_CHURN).map_err(|e| anyhow::anyhow!("SQL prepare 失败: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0).unwrap_or_default(), row.get::<_, i64>(1).unwrap_or(0)))
-            })
-            .map_err(|e| anyhow::anyhow!("查询失败: {e}"))?;
-        for r in rows {
-            let (sid, churn) = r.map_err(|e| anyhow::anyhow!("读取行失败: {e}"))?;
-            snap.churn.insert(sid, churn);
-        }
-    }
-    Ok(snap)
 }
 
 #[cfg(test)]
@@ -1203,56 +730,11 @@ mod tests {
         assert_eq!(terminal_message("", "terminated"), "状态: terminated");
     }
 
-    // ---- TraeWork（TRAE SOLO CN）回合状态机 ----
-
-    #[test]
-    fn trae_work_turn_events_map_terminal_statuses() {
-        // 首轮只播种：不重放历史终态
-        assert_eq!(turn_event("", "completed", false, true), None);
-        assert_eq!(turn_event("", "failed", false, true), None);
-        // 非终态 → 终态（含「两轮之间跑完一生」：prev 为空也发）
-        assert_eq!(turn_event("running", "completed", false, false), Some(EventKind::RunCompleted));
-        assert_eq!(turn_event("", "completed", false, false), Some(EventKind::RunCompleted));
-        assert_eq!(turn_event("running", "failed", false, false), Some(EventKind::RunFailed));
-        // canceled = 用户主动停止 → RunAborted（不通知、无别的会话时收起光效）
-        assert_eq!(turn_event("running", "canceled", false, false), Some(EventKind::RunAborted));
-        // 终态不重复；未知非终态值只当运行中，不产事件；tombstone 压住重现
-        assert_eq!(turn_event("completed", "completed", false, false), None);
-        assert_eq!(turn_event("running", "thinking", false, false), None);
-        assert_eq!(turn_event("", "canceled", true, false), None);
-    }
-
-    #[test]
-    fn trae_work_prune_reports_lost_open_turns_and_tombstones_terminal() {
-        let mut last: HashMap<String, SeenTurn> = HashMap::new();
-        let mut tombstone: HashMap<String, u64> = HashMap::new();
-        last.insert("done".into(), SeenTurn { session_id: "done-session".into(), status: "completed".into(), last_seen: 1 });
-        last.insert("open".into(), SeenTurn { session_id: "open-session".into(), status: "running".into(), last_seen: 1 });
-
-        assert!(prune_turns(&mut last, &mut tombstone, 1 + MISSING_KEEP_ROUNDS - 1).is_empty());
-        let lost = prune_turns(&mut last, &mut tombstone, 1 + MISSING_KEEP_ROUNDS);
-        assert!(last.is_empty(), "消失的行不应继续占用内存");
-        assert_eq!(lost, vec!["open-session".to_string()], "运行中回合的行消失（会话被删）应上报闭环");
-        assert!(tombstone.contains_key("done"), "终态条目进 tombstone 防撕裂快照重现时重复通知");
-    }
-
-    #[test]
-    fn trae_work_prune_does_not_abort_a_new_turn_in_the_same_session() {
-        let round = 1 + MISSING_KEEP_ROUNDS;
-        let mut last = HashMap::from([
-            ("old".into(), SeenTurn { session_id: "s".into(), status: "running".into(), last_seen: 1 }),
-            ("new".into(), SeenTurn { session_id: "s".into(), status: "running".into(), last_seen: round }),
-        ]);
-        let mut tombstone = HashMap::new();
-        assert!(prune_turns(&mut last, &mut tombstone, round).is_empty());
-        assert!(last.contains_key("new"));
-    }
-
     // ---- §1.12 / §2.7 回归 --------------------------------------------------
 
     /// §1.12a：「会话行消失」的闭环必须是 RunAborted（中止）而不是 RunFailed（失败）。
     /// WorkBuddy 曾发 RunFailed——弹「任务失败 · WorkBuddy」+ 亮失败色 + 失败音，
-    /// 删除不代表任务失败；与 TraeWork 口径统一。
+    /// 删除不代表任务失败；所有监控型 adapter 同口径。
     #[test]
     fn lost_row_reports_run_aborted_not_failed() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -1263,72 +745,12 @@ mod tests {
         assert!(!ev.kind.should_notify(), "不该弹「任务失败」通知");
         assert_eq!(ev.session_id, "sess-lost");
         assert!(ev.message.contains("WorkBuddy"), "正文要说明来源: {}", ev.message);
-
-        emit_lost_row(&stop, &tx, AgentKind::TraeWork, "turn-lost", "TraeWork");
-        let ev = rx.try_recv().unwrap();
-        assert_eq!(ev.kind, EventKind::RunAborted, "两个监控型 adapter 同口径");
-        assert!(ev.message.contains("TraeWork"), "正文要带来源标签: {}", ev.message);
         // 停止标志置位后不再发（emit 的既有语义不得回归）
         stop.store(true, Ordering::Relaxed);
-        emit_lost_row(&stop, &tx, AgentKind::TraeWork, "x", "TraeWork");
+        emit_lost_row(&stop, &tx, AgentKind::WorkBuddy, "x", "WorkBuddy");
         assert!(rx.try_recv().is_err());
     }
 
-    /// §1.12b：TraeWork 首轮对 open 集内（正在跑）的会话直接心跳——
-    /// 旧实现 `hb = !first && (...)` 让 daemon 启动时正在跑的会话最长 60s 不亮流光。
-    #[test]
-    fn trae_work_first_round_heartbeats_open_sessions() {
-        let every = 12;
-        assert!(
-            sess_needs_heartbeat(None, 5, 1, true, true, every),
-            "首轮 open 会话必须立即心跳（点亮流光）"
-        );
-        // 首轮非 open（空闲/只有历史回合）：不心跳——心跳只给运行中会话
-        assert!(!sess_needs_heartbeat(None, 5, 1, false, true, every));
-        // 首轮已有 prev（理论上不存在）也不该重复心跳
-        let prev = SeenSess { churn: 5, last_seen: 1, last_hb: 0 };
-        assert!(!sess_needs_heartbeat(Some(&prev), 5, 1, true, true, every));
-    }
-
-    /// §1.12b 的对偶：首轮不重放终态语义不变（心跳判定不影响 turn_event 的 first 门）
-    #[test]
-    fn trae_work_first_round_still_never_emits_terminal() {
-        // 与 first_round_never_emits_terminal 同款断言，钉死「补首轮心跳」没有
-        // 顺手放开「首轮重放历史终态」——启动风暴不能回来
-        assert_eq!(turn_event("", "completed", false, true), None);
-        assert_eq!(turn_event("", "failed", false, true), None);
-        assert_eq!(turn_event("running", "canceled", false, true), None);
-    }
-
-    /// 非首轮的心跳节奏：活动计数器变化触发
-    #[test]
-    fn sess_heartbeat_fires_on_churn_change() {
-        let every = 12;
-        let same = SeenSess { churn: 5, last_seen: 20, last_hb: 10 };
-        // churn 变化（回合内行持续追加）→ 心跳（无论是否 open）
-        assert!(sess_needs_heartbeat(Some(&same), 6, 21, true, false, every));
-        assert!(sess_needs_heartbeat(Some(&same), 6, 21, false, false, every));
-        // 无变化、刚心跳过 → 不发
-        let fresh = SeenSess { churn: 5, last_seen: 20, last_hb: 20 };
-        assert!(!sess_needs_heartbeat(Some(&fresh), 5, 21, true, false, every));
-        // 非首轮的新会话（prev 为空）：changed = !first = true → 心跳
-        assert!(sess_needs_heartbeat(None, 0, 30, false, false, every));
-    }
-
-    /// 保活重发只给 open（运行中）会话：空闲会话不该周期性点亮
-    #[test]
-    fn sess_heartbeat_keepalive_only_for_open_sessions() {
-        let every = 12;
-        let aged = SeenSess { churn: 5, last_seen: 20, last_hb: 5 };
-        assert!(sess_needs_heartbeat(Some(&aged), 5, 17, true, false, every), "open + 到保活周期 → 重发");
-        assert!(!sess_needs_heartbeat(Some(&aged), 5, 17, false, false, every), "非 open 无保活");
-        // 未到保活周期不发
-        let fresh = SeenSess { churn: 5, last_seen: 20, last_hb: 16 };
-        assert!(!sess_needs_heartbeat(Some(&fresh), 5, 17, true, false, every));
-    }
-
-    /// §2.7a：残留快照目录清理必须同时覆盖 `agent-bark-watch-` 与
-    /// `agent-bark-traework-` 两套前缀，且绝不误删同前缀的无关目录
     #[test]
     fn stale_cleanup_covers_both_snapshot_prefixes() {
         let tmp = std::env::temp_dir().join(format!("ab-wtest-{}", uuid::Uuid::new_v4().simple()));
@@ -1389,47 +811,5 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         remove_snapshot_dir(&real);
         assert!(!real.exists());
-    }
-
-    /// WAL 回归（2026-09-24「两次提问无光效」事故）：指纹必须盯住 `-wal`——
-    /// WAL 增长而主库不动时也要触发重读，否则缓存快照永不更新
-    #[test]
-    fn db_fingerprint_tracks_wal_changes() {
-        let dir = std::env::temp_dir().join(format!("ab-fp-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("database.db");
-        std::fs::write(&db, b"main").unwrap();
-        let fp0 = db_fingerprint(&db).expect("主库存在就该有指纹");
-        assert_eq!(fp0.1, (0, None), "无 -wal 时指纹的 wal 侧为空");
-        let wal = crate::traework_db::wal_path(&db);
-        std::fs::write(&wal, b"wal-data").unwrap();
-        let fp1 = db_fingerprint(&db).unwrap();
-        assert_ne!(fp0, fp1, "-wal 新增必须改变指纹");
-        std::fs::write(&wal, b"wal-data-longer").unwrap();
-        let fp2 = db_fingerprint(&db).unwrap();
-        assert_ne!(fp1, fp2, "-wal 增长必须改变指纹");
-        assert_eq!(fp2.0, fp0.0, "主库没变时指纹的主库侧不动");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 端到端冒烟：解密**真实** TraeWork 库并查询（验证 rusqlite 能打开
-    /// reserve=80 的明文快照 + 本机密钥常量仍有效）。默认跳过，
-    /// 本机装了 TraeWork 时手动跑：`cargo test -p bark-adapters --lib -- --ignored`
-    #[test]
-    #[ignore]
-    fn trae_work_live_snapshot_smoke() {
-        let db = TraeWorkWatch::db_path().expect("APPDATA 未设置");
-        if !db.exists() {
-            eprintln!("跳过：本机没有 TraeWork 会话库（{}）", db.display());
-            return;
-        }
-        let snap = snapshot(&db).expect("解密 + 查询应成功");
-        eprintln!(
-            "turns={} sessions={} churn={}",
-            snap.turns.len(),
-            snap.meta.len(),
-            snap.churn.len()
-        );
-        assert!(!snap.turns.is_empty(), "应能读到 chat_turn 行");
     }
 }

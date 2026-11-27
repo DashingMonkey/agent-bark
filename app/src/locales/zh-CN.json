@@ -309,7 +309,6 @@
     "idle": "空闲 · 没有进行中的会话",
     "footerSessions": "{n} 个会话 · 可滚动",
     "footerAttention": "{n} 项待处理",
-    "endedName": "{name} 已结束",
     "subagent": "子代理 {n}",
     "edgeHandleAria": "移入展开悬浮窗，拖离边缘取消隐藏",
     "pinnedAria": "位置已固定"

@@ -1,10 +1,10 @@
-//! §2.19 / §4.4 公开 API 回归（traework_db）：
+//! §2.19 / §4.4 公开 API 回归（trae_db）：
 //! 逐页 HMAC 校验的拒绝面 + 解密 buffer 复用的对外行为不变。
 //!
-//! 正向的加解密夹具在 `traework_db.rs` 的单元测试里（`encrypt_fixture` 是测试
+//! 正向的加解密夹具在 `trae_db.rs` 的单元测试里（`encrypt_fixture` 是测试
 //! 侧夹具、不对外）；这里锁公开 API 的边界行为。
 
-use bark_adapters::traework_db::{decrypt_db, derive_key, verify_page, verify_page1, PAGE_SZ};
+use bark_adapters::trae_db::{decrypt_db, derive_key, verify_page, verify_page1, PAGE_SZ};
 
 #[test]
 fn verify_page_rejects_short_or_wrong_key_input() {

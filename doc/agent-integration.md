@@ -18,9 +18,9 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 
 | 类型 | 做法 | 使用者 |
 | --- | --- | --- |
-| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TraeCode、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
+| **Hook 型** | 写 agent 自己的 hooks 配置，事件点上 agent 执行 `"<AgentBark.exe>" hook --agent <id> --event <事件名>`，hook 进程读 stdin JSON 后上报 | Claude Code、TRAE、CodeBuddy、Qoder（含国内版 Qoder CN）、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Antigravity、Kimi Code（hooks 对 CLI / 桌面客户端 / VS Code 插件三个前端通用，共用同一份 config.toml） |
 | **插件型** | 生成插件文件并登记到宿主的插件配置里，插件内部直接 POST `/event` | OpenCode、DeepSeek Harness |
-| **监控型** | 轮询 agent 本地会话库（SQLite / JSONL，TraeWork 是解密后轮询），靠状态跃迁推断事件 | WorkBuddy、TraeWork、Kimi Work、豆包工作 |
+| **监控型** | 轮询 agent 本地会话库（SQLite / JSONL），靠状态跃迁推断事件 | WorkBuddy、Kimi Work、豆包工作 |
 
 **统一事件**（所有 agent 归一化到这 9 类；`activity` 与 `tool_finished` 只用于状态推导，不通知、不入历史）：
 
@@ -42,7 +42,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 
 > **为什么要单独一类 `tool_failed`**：`PostToolUseFailure` 是「这次工具调用没成功」，不是「回合失败」——实测 ZCode 编辑前没先读文件报错，下一秒重试就成功。以前映射成 `run_failed` 时，一次瞬时工具失败会亮失败色全屏特效 + 弹「任务失败」+ 把会话摘出运行中列表，全是噪音。现在它当心跳处理：会话留在表里、相位回落思考中、不通知、不亮失败色；真回合失败只由明确失败信号确认；Codex 异步提问未回答时保留等待相位，工具事件仍正常记录。
 
-> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 要从回合记录区分取消与完成、TraeWork 是 `chat_turn.turn_status=canceled`。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
+> **为什么要单独一类**：同一个动作（手动点停止）在不同 agent 上落到不同信号——Qoder 是 `SessionEnd`、DSH 是 `turn/end` 的 `aborted`、ZCode 只能读它的日志推断、WorkBuddy 要从回合记录区分取消与完成、TRAE 只能读 renderer.log。以前有的报「完成」（亮完成色，谎报跑完）有的报「失败」（亮失败色 + 弹「任务失败」，而那是用户自己按的），现在统一成 `run_aborted`：**不亮失败色、不亮完成色、不通知**，没有别的会话在跑时直接收起光效。
 
 **各 agent 的「手动中止」信号现状**（2026-09 核对，详情见各节）：
 
@@ -54,8 +54,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | CodeBuddy | `SessionEnd`（官方文档；未实测） | 同 Claude Code |
 | OpenCode | `session.error` 带 `MessageAbortedError`（社区插件实证，未实测） | 立即释放（run_aborted，其后的 idle 被压制） |
 | WorkBuddy | 回合 JSONL 的 assistant/incomplete + skipRun + `Interrupted by user`；运行中被归档也视为终止 | 下一轮轮询释放（约 5 秒） |
-| TraeWork | `chat_turn.turn_status=canceled`（实测） | 立即释放（run_aborted） |
-| TraeCode | **无官方事件**；补读本地 renderer.log 的 canceled 终态 | 秒级清除运行态；日志不可用时保留最后已知状态，可本地移除 |
+| TRAE | **无官方事件**；补读本地 renderer.log 的 canceled 终态 | 秒级清除运行态；日志不可用时保留最后已知状态，可本地移除 |
 | Codex | `Interrupt` / `SessionEnd`（当前 hooks 映射） | 收到信号后释放（需要已信任对应 hooks） |
 | Grok CLI | `StopCancelled`（官方事件，未实测） | **立即释放**——显式的用户取消信号，比 Claude 系干净 |
 | Kimi Code | `Interrupt`（官方事件，未实测） | **立即释放**（显式中断信号） |
@@ -110,7 +109,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 
 ---
 
-## 2. TRAE（原 TraeCode）
+## 2. TRAE（原 TraeCode / TraeWork）
 
 | 项 | 值 |
 | --- | --- |
@@ -128,6 +127,8 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 - **手动中止不发 Hook**：2026-10-14 本机日志确认只有 SessionStart / UserPromptSubmit，但 `renderer.log` 的 `[DoneHandler] Stream done event received` 带 `status: "canceled"` 和准确的 sessionId。GUI 每秒增量读取国内版/国际版最新启动目录下各窗口日志，合成 RunAborted（静默移除运行态，不报任务失败）。日志时间早于会话最新活动时忽略，管道消费时再次校验，防止旧中止清掉新回合。此补充机制依赖非官方日志格式，日志缺失或版本变化时保留最后已知状态；
 - `PreToolUse` 是阻塞型 hook，我们的子命令恒为放行（exit 0、不输出 stdout），不影响工具执行；
 - 心跳（activity）是「思考中 / 执行工具」实时状态的来源，缺了它流光只会亮等待 / 完成 / 失败色，不会亮思考色。
+- **每条 hook 载荷都带 `agent_id` / `agent_type`（实测恒为 `solo_agent`）**：2026-11-23 的 Agent Hooks 日志里 `SessionStart` / `UserPromptSubmit` / `Stop` / `Notification` 完全一致。通用的「`agent_id`/`agent_type` 非空即子代理」启发式（Claude Code 只在子代理内部才给这两个字段）会把主会话的**每一条**事件都判成子代理——通知被静默丢掉（音效与屏幕流光同样按 `is_subagent` 短路），悬浮窗还会把主会话的完成行标成「子代理 01」。适配器里按 ZCode 同款覆盖：TRAE 只认显式布尔字段 `is_subagent` / `subagent`（首个布尔字段优先，与 bark-core 同口径）；
+- **合并后的两种模式（Agent / IDE）都会触发同一套 hooks**（2026-11-26 实测：Agent 模式问天气、IDE 模式问电影票，`SessionStart` / `UserPromptSubmit` / `Stop` / `Notification` 齐全，工具类 hook 只对 Grep 这类本地工具触发）。事件按 `session_id` 归属，载荷里没有区分模式的字段——数据层唯一差异是 workspace（Agent 模式跑在 `solo-lite-runtime.code-workspace`，IDE 模式是普通 folder 工作区），接入侧不需要分两套。
 
 ---
 
@@ -162,7 +163,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | 注册事件 | `UserPromptSubmit`→activity、`PreToolUse`→activity、`Notification`→**见下（授权等待=等待色）**、`PostToolUseFailure`→tool_failed、`Stop`→run_completed、**`SessionEnd`→run_aborted（主动中断清场）** |
 | 需要你做 | 桌面版实测改完即生效；若未生效，完全退出并重启对应应用 |
 
-> 国际版与国内版**合并成一条 adapter**（与 TraeCode 的「国际版 / 国内版」同样式）：存在哪个配置文件就写哪个，两个都在就都写——一般人不会同时装两个版本。原来的独立条目 `qoder-cn` 已下线，老配置里的开关会在加载时并到 `qoder` 上。
+> 国际版与国内版**合并成一条 adapter**（与 TRAE 的「国际版 / 国内版」同样式）：存在哪个配置文件就写哪个，两个都在就都写——一般人不会同时装两个版本。原来的独立条目 `qoder-cn` 已下线，老配置里的开关会在加载时并到 `qoder` 上。
 
 **事件表取两个版本都支持的交集**（没注册的两个实测都无功能损失）：`SessionStart` 在本仓库是空操作（不通知、不建档，见 `state.rs` 的 `apply_session_event`）；`PermissionRequest` 国际版实测**从不触发**（授权等待走 `Notification`），CN 文档也没列它。
 
@@ -496,33 +497,44 @@ driver remains scheduled or active*，实现里只在状态跳变时 emit），�
 
 ---
 
-## 10. TraeWork（监控型 · 非官方）
+## 10. TRAE 会话库（Token 用量 · 非官方）
+
+> 2026-11 起 TraeCode 与 TraeWork 合并为同一个应用（Trae CN 1.107.x，`resources/app/modules/ai-agent` 内置），
+> 表现为一个 agent：id 仍是 `trae-code`（兼容已安装 hooks），界面展示为 **TRAE**。
+> 事件走 hooks（见 §2），**TraeWork 的监控型 adapter 已下线**；会话库现在只用于 Token 用量采集。
 
 | 项 | 值 |
 | --- | --- |
-| id | `trae-work` |
-| 数据源 | `%APPDATA%\TRAE SOLO CN\ModularData\ai-agent\database.db`（**SQLCipher 4 加密**） |
-| 轮询间隔 | 5 秒；主库 + `-wal` 的指纹（大小+修改时间）没变则跳过重新解密，空闲零开销 |
-| 安装标记 | 上述 db 文件存在 |
-| 需要你做 | 无（不用信任/重启/新建会话） |
+| id | `trae-code`（展示名 TRAE） |
+| 事件来源 | hooks：`~/.trae-cn/hooks.json` / `~/.trae/hooks.json`（两种模式都会触发） |
+| 用量数据源 | `%APPDATA%\Trae CN\ModularData\ai-agent\database.db`（**SQLCipher 4 加密**） |
+| 采集节奏 | 30 秒；主库 + `-wal` 指纹（大小+修改时间）没变则跳过解密 |
+| 需要你做 | Hooks 设置里启用全局配置，运行方式改「本地自动运行」（见 §2） |
 
-**接入路线（2026-09 实测打通，TraeWork CN 0.1.69）**：官方 hook 是 TraeCode 的（TraeWork 仅企业版提供 hook），个人版走监控路线。会话库是 SQLCipher 4（AES-256-CBC + HMAC-SHA512，page=4096，reserve=80 即 16B IV + 64B HMAC），但**密钥是固定的**——与 Trae CN 同源的常量链（`mics_sj10gy` 加密数据 → `rust`/`cpp`/`electron` 三表 XOR 得固定密码 → PBKDF2-HMAC-SHA256 十万次迭代派生密钥）。我们做**页面级解密**成明文 SQLite（**含 `-wal` 帧叠加**，见下「坑」）后照常轮询：密钥派生与页面解密见 `crates/bark-adapters/src/traework_db.rs`（已知答案单测钉死派生链）；社区资料：[Oh-My-Trae/trae-db-decrypt](https://github.com/Oh-My-Trae/trae-db-decrypt)、[DirWang 的逆向分析](https://www.cnblogs.com/DirWang/p/21513074)（注意其 `article_solo.md`「SOLO CN 密钥随机、解不开」的结论**已过时**——本机实测固定密钥 HMAC 校验通过）。
+**Token 口径**（`app/src-tauri/src/usage_trae.rs`）：读 `server_history_info` 里 `source='llm_default'` 的行——
+每次模型调用一行，`token_usage` 是服务端回传的总 token（prompt + completion，含 reasoning），
+**内置模型（积分）与外接模型都有**。`extra_info` 的 `exact_prompt_tokens_v1` / `exact_output_tokens_v1` /
+`exact_total_tokens_v1` 是 provider 原始用量（内置模型另有 `exact_reasoning_tokens_v1`），
+缺这些字段的早期记录退回 `token_usage - item_token_usage`。归一化后 `output` 只记可见输出
+（已扣 reasoning），与 Gemini 等源同口径；本地不落缓存字段，`cache_read/write` 恒 0（算不出缓存命中率）。
 
-**schema 校准**（2026-09，TraeWork CN 0.1.69 解密库实测）：
+**会话库与解密**（`crates/bark-adapters/src/trae_db.rs`）：SQLCipher 4（AES-256-CBC + HMAC-SHA512，
+page=4096，reserve=80 即 16B IV + 64B HMAC），**密钥固定**——`mics_sj10gy` 加密数据经
+`rust`/`cpp`/`electron` 三表 XOR 得密码，再 PBKDF2-HMAC-SHA256 十万次派生出密钥。页面级解密成
+明文 SQLite（含 `-wal` 帧叠加）后只读查询。社区资料：[Oh-My-Trae/trae-db-decrypt](https://github.com/Oh-My-Trae/trae-db-decrypt)、
+[DirWang 的逆向分析](https://www.cnblogs.com/DirWang/p/21513074)（其「SOLO CN 密钥随机」的结论已过时）。
 
-- 回合生命周期在 `chat_turn`（每回合一行）：`turn_status` 终态值域 `completed` / `failed` / `canceled`；
-- 状态跃迁映射：→ `completed` = `run_completed`；→ `failed` = `run_failed`；→ **`canceled` = `run_aborted`（用户主动停止，信号非常干净）**；其余非终态值一律视为运行中（值域扩展也兼容）；
-- 运行中的心跳：`chat_message` / `history_v2` / `chat_turn` 的 max(id) 增长（`history_v2` 回合内持续追加，实测约 13 行/回合）——监控型拿不到 UserPromptSubmit/PreToolUse，靠它点亮流光（机制同 WorkBuddy）；
-- 会话标题 `chat_session.session_title`；工作目录 `session_project → project.absolute_path`。
+**已下线监控的历史结论（保留备查）**：合并前的 TraeWork 走 `chat_turn.turn_status` 推断回合状态
+（`canceled` = 用户主动停止，信号很干净）；`history_v2` 回合内持续追加可做心跳。这条路线已随
+TraeWork 一并移除——合并后的两种模式都有 hooks，`SessionStart` / `UserPromptSubmit` / `Stop` /
+`Notification` 全覆盖，不需要再靠轮询推断。
 
 **坑**：
 
-- **非官方机制，TraeWork 升级可能失效**（换密钥常量 / 改 schema）：可用性探针（HMAC 校验 + 解密 + 查询，重试 3 次）失败时 UI 给出具体原因；核对工具 `tools/traework-probe.mjs`（`verify` / `strings` / `decrypt` / `dump` / `sql` 子命令，`strings` 扫 `ai_agent.dll` 判断密钥常量是否变更，用法见文件头注释），以及本机冒烟测试 `cargo test -p bark-adapters --lib -- --ignored`；
-- **`-wal` 必须一起看**（2026-09-24 事故教训）：宿主是 SQLite WAL 模式，新提交先落 `database.db-wal`、checkpoint 后才进主库，实测 `-wal` 常驻 4-5MB（上千帧）——旧实现只解主库、轮询指纹也只看主库，导致 checkpoint 之前的新回合**全程不可见**（当天两次提问均无光效，事件一个都没发）。现在 `decrypt_db` 按 SQLite WAL 恢复语义把 `-wal` 帧叠回明文库（checksum 链 + 页级 HMAC + 只到最后提交帧，RESTART checkpoint 残留的陈旧尾帧被链式校验排除），轮询指纹同样盯住 `-wal`；
-- 每轮把整库读入内存再解密（75MB 级，AES-NI 下几十毫秒），结果写临时文件后 rusqlite 只读查询；
-- 与 WorkBuddy 同款「先快照再推断」：撕裂快照单轮失败可接受、下轮自愈（连续失败每 12 轮 warn 一次）；运行中回合的行从库里消失（会话被删）时主动发 `run_aborted` 闭环，避免已经删除的会话长期残留在显示中。
+- **非官方机制，TRAE 升级可能失效**（换密钥常量 / 改 schema）：采集失败只在错误变化时记一次日志、下轮自愈；核对工具 `tools/traework-probe.mjs`（`verify` / `strings` / `decrypt` / `dump` / `sql`，用法见文件头注释）；
+- **`-wal` 必须一起看**：宿主是 WAL 模式，新提交先落 `database.db-wal`、checkpoint 后才进主库（实测常驻 4-5MB / 上千帧）。解密要叠加 WAL 帧，指纹也要盯 `-wal`，否则新会话整场不可见（2026-09-24 事故教训）；
+- 解密产物是整库明文（AI 对话内容）：写临时文件、查完立即删除，内存副本清零。
 
-**备选路线（未采用，供后续参考）**：TraeWork 个人版支持 **MCP**（设置里手动配置 stdio/HTTP server；或项目级 `.trae/mcp.json`，需在 设置 > MCP 打开「启用项目级 MCP」）与 **Skill**（`SKILL.md` 放 `%userprofile%/.trae-cn/skills/` 全局生效，或项目 `.trae/skills/`；规则可用全局规则或 `AGENTS.md`）。组合方式：做一个 notify 型 MCP 工具 + Skill/规则要求模型在关键节点调用。缺点：**模型可能忘调**（可靠性不如库轮询）、事件粒度糙、拿不到干净的中止信号。适合做补充（如回合内的细节信号），不适合做主路线。
 
 ---
 
@@ -741,16 +753,16 @@ Kimi 电脑客户端的「Work」模式（2026-06 上线 Beta，Windows/macOS）
 2. **事件到了吗**：GUI「事件流」页看有没有新事件。有事件但没通知 → 是规则问题（免打扰时段、聚合窗口、子代理事件不通知、渠道开关、静音）；
 3. **hook 被调起了吗**：设 `BARK_DEBUG=1` 后重启 agent，hook 会在 stderr 打印上报结果（含失败原因，不含 token 明文）；
 4. **端口/token 改过吗**：设置页「服务信息」会提示「需重启生效」；
-5. **应用侧要不要信任/重启**：见各 agent 的「需要你做」一列——TraeCode / CodeBuddy / Codex 需要信任、Qoder / Qoder CN 未生效时需重启、**ZCode 需要新建会话**；
+5. **应用侧要不要信任/重启**：见各 agent 的「需要你做」一列——TRAE / CodeBuddy / Codex 需要信任、Qoder / Qoder CN 未生效时需重启、**ZCode 需要新建会话**；
 6. **ZCode 专项**：① 它读的是**用户级** `~/.zcode/cli/config.json`，写在项目里的 `hooks` 会被整体忽略；② 看看 `~/.zcode/cli/log/zcode-<日期>.jsonl`——`config.file.invalid`/`Config file failed to load` 说明那份 JSON 不被接受（**最常见的原因是文件带了 UTF-8 BOM**），`hook.run.failed` 说明我们的条目被调起但失败了。
 
-**流光不亮但通知正常**：多半是心跳类事件没注册（见 TraeCode / Qoder / CN 的 activity 说明），或者该 agent 是监控型且心跳没发出去。
+**流光不亮但通知正常**：多半是心跳类事件没注册（见 TRAE / Qoder / CN 的 activity 说明），或者该 agent 是监控型且心跳没发出去。
 
 **回合结束后流光一直停在思考色、「运行中会话」列表里那条不消失**：说明这次回合结束的信号没被我们收到。已知情形：
 - Qoder / Qoder CN **用户主动中断**时只有 `SessionEnd`、没有 `Stop`（见 §4，已注册处理 → `run_aborted`）；
 - Qoder / Qoder CN **额度用尽、鉴权失效**时一个 hook 都不发（见 §4）：daemon 每秒尾读当前回合 transcript，按合成 API 错误消息合成 `run_failed`；
 - **ZCode 手动终止（停止按钮 / Esc）一个事件都不发**（实测，见 §6）：既没有 `SessionEnd` 也没有 `Stop`，连 `PostToolUseFailure` 都不带 `is_interrupt`。daemon 会读它的本地日志推断中断（非官方机制，约 1 秒）；
-- **定期核验**：每 5 分钟主动请求各来源检测。Codex 重读当前回合的有限 JSONL 尾部；Qoder 的 transcript 观察器每秒增量读取（主动核验时重读有限尾部）；CodeBuddy 按 `transcript_path` 读 CLI/IDE 会话记录，只认显式 `status=completed` 且没有失败/中断标记、其后没有非元数据记录（IDE 的正文文件每秒重读，候选稳定 5 秒才收档）；WorkBuddy、TraeWork、Kimi Work、豆包工作唤醒已有监控线程；ZCode 与 TRAE Code 日志观察器继续按秒读取。
+- **定期核验**：每 5 分钟主动请求各来源检测。Codex 重读当前回合的有限 JSONL 尾部；Qoder 的 transcript 观察器每秒增量读取（主动核验时重读有限尾部）；CodeBuddy 按 `transcript_path` 读 CLI/IDE 会话记录，只认显式 `status=completed` 且没有失败/中断标记、其后没有非元数据记录（IDE 的正文文件每秒重读，候选稳定 5 秒才收档）；WorkBuddy、Kimi Work、豆包工作唤醒已有监控线程；ZCode 与 TRAE 日志观察器继续按秒读取。
 - **证据不足时保留**：没有终态事件、数据库不可读、日志静默或暂不支持核验，都不再推断失败/中止。进程仍存在也不能证明某个具体回合仍在执行。
 - **立即核验**：托盘菜单 →「检测运行状态」，核验结果经原事件管道更新会话和光效，不再无条件熄灭。`BARK_STALE_AFTER_MS` 已移除。
 

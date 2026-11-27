@@ -159,34 +159,53 @@ impl UsageStore {
     }
 
     /// 批量幂等入库，返回**新增**条数（重读旧记录返回 0）。关闭态为 no-op。
+    ///
+    /// 整批走一个事务：首轮回补（如 TRAE 一次 4000+ 条历史调用）逐条提交要 8 秒，
+    /// 单事务下是几十毫秒——后台采集线程不必长时间占着库。
     pub fn insert(&self, records: &[UsageRecord]) -> usize {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(conn) = guard.as_ref() else { return 0 };
-        let mut added = 0usize;
-        let mut stmt = match conn.prepare_cached(
-            "INSERT OR IGNORE INTO usage_record
-             (agent, record_id, session_id, ts, day, model,
-              input_new, cache_read, cache_write, output, reasoning, credits)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        ) {
-            Ok(s) => s,
+        if records.is_empty() {
+            return 0;
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(conn) = guard.as_mut() else { return 0 };
+        let tx = match conn.transaction() {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!("用量入库准备失败: {e}");
+                tracing::warn!("用量入库开启事务失败: {e}");
                 return 0;
             }
         };
-        for r in records {
-            let day = chrono::DateTime::from_timestamp_millis(r.ts)
-                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-                .unwrap_or_default();
-            let params = rusqlite::params![
-                r.agent, r.record_id, r.session_id, r.ts, day, r.model,
-                r.input_new, r.cache_read, r.cache_write, r.output, r.reasoning, r.credits
-            ];
-            match stmt.execute(params) {
-                Ok(n) => added += n,
-                Err(e) => tracing::warn!("用量入库失败 agent={} id={}: {e}", r.agent, r.record_id),
+        let mut added = 0usize;
+        {
+            let mut stmt = match tx.prepare_cached(
+                "INSERT OR IGNORE INTO usage_record
+                 (agent, record_id, session_id, ts, day, model,
+                  input_new, cache_read, cache_write, output, reasoning, credits)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("用量入库准备失败: {e}");
+                    return 0;
+                }
+            };
+            for r in records {
+                let day = chrono::DateTime::from_timestamp_millis(r.ts)
+                    .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                let params = rusqlite::params![
+                    r.agent, r.record_id, r.session_id, r.ts, day, r.model,
+                    r.input_new, r.cache_read, r.cache_write, r.output, r.reasoning, r.credits
+                ];
+                match stmt.execute(params) {
+                    Ok(n) => added += n,
+                    Err(e) => tracing::warn!("用量入库失败 agent={} id={}: {e}", r.agent, r.record_id),
+                }
             }
+        }
+        if let Err(e) = tx.commit() {
+            tracing::warn!("用量入库提交失败（本批丢弃）: {e}");
+            return 0;
         }
         added
     }

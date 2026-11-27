@@ -24,6 +24,7 @@ import {
   eventLabel,
   agentIcon,
   agentName,
+  isSubagentEvent,
   isSubagentSession,
   phaseLabel,
   placeholderName,
@@ -250,29 +251,35 @@ export function sessionRowKey(agent: string, sessionId: string): string {
  * 「手动终止」行的展示信息快照（按 [`sessionRowKey`] 存）。
  *
  * daemon 摘掉会话之后就再也算不出这一行的名字了（`subagentLabel` 需要「是否多工作区」、
- * `rowLabel` 需要工作区名），所以在它**还在快照里**的那几帧把名字/提示/缩进存下来，
+ * `rowLabel` 需要工作区名），所以在它**还在快照里**的那几帧把名字/提示存下来，
  * 供保留期内重建这一行时使用。
  */
-const abortedMemo = new Map<string, { name: string; tip: string; depth?: number; subagent: boolean }>();
+const abortedMemo = new Map<string, { name: string; tip: string }>();
 
 /**
- * 「上一帧见到的样子」——**每一行**都记（键同 [`sessionRowKey`]），不只记手动终止的。
+ * 「上一帧见到的样子」——**每条真实行**都记（键同 [`sessionRowKey`]），不只记手动终止的。
  *
  * 用途：父行从快照里消失、而它的子代理还在跑时，`sessionRows` 会合成一行占位父行
  * （`会话 …尾号`）当落脚点。一串 id 尾号既认不出是哪个 agent、也不好看（用户点名过两次），
  * 而这个会话本 agent 名我们**上一帧刚见过**——直接拿来用，标签降级成「已结束」。
  *
  * 与 [`abortedMemo`] 分家的原因：那个只在「手动终止」时写、且语义是「这一行被谁终止了」；
- * 这份是纯展示缓存，凡渲染过的行都进（父行正常结束 / 已从本地显示移除也走这条路）。
+ * 这份是纯展示缓存，真实行渲染过就进（父行正常结束 / 已从本地显示移除也走这条路）。
+ * **占位行不进**：它的名字是合成的，写进来之后还原时读到的就是它自己，真名字与下面的
+ * 兜底永远轮不到（实测：主会话在子代理跑着的那段时间一直显示 `会话 …6ee0ea`）。
  */
 const lastSeenRow = new Map<string, { name: string; tip: string }>();
 
-/** 完成/失败事件 → 驻留行（思考/等待由会话表表达，终态靠这里短暂展示） */function onEvent(ev: NormalizedEvent) {
+/** 完成/失败事件 → 驻留行（思考/等待由会话表表达，终态靠这里短暂展示） */
+function onEvent(ev: NormalizedEvent) {
   // 推送负载兜底：null / 异常负载直接忽略，别把整个渲染循环冻在旧帧
   if (!ev || typeof ev !== "object") {
     console.warn("事件推送负载异常，已忽略：", ev);
     return;
   }
+  // 「是不是子代理行」只有这一个判据：名字选 `子代理 NN`，缩进 / 连接线 / 图标（见 `render`）
+  // 也全看它。两个口径会拼出「子代理标签 + 根行图标」这种自相矛盾的一行（实测抓到过）。
+  const sub = isSubagentEvent(ev);
   const map: Partial<Record<NormalizedEvent["type"], [StateColor, string]>> = {
     run_completed: ["completed", eventLabel("run_completed")],
     run_failed: ["failed", eventLabel("run_failed")],
@@ -296,16 +303,8 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
     // 只补空档：已经在快照里就地标过的那种，用 `currentRows` 存下来的更准
     if (!abortedMemo.has(key)) {
       abortedMemo.set(key, {
-        name: ev.is_subagent
-          ? subagentLabel(ev.agent, ev.session_id)
-          : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
+        name: sub ? subagentLabel(ev.agent, ev.session_id) : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
         tip: ev.project ?? "",
-        // 子代理恒挂在父行下面一级；主会话顶格。`undefined` = **不知道**（事件没带
-        // `is_subagent`）：这样的一行**不缩进**，也就不带根行的图标（见 render 的图标条件），
-        // 免得出现「子代理标签 + 根行图标」这种自相矛盾的一行
-        depth: ev.is_subagent === true ? 1 : ev.is_subagent === false ? 0 : undefined,
-        // 名字已经按「是不是子代理」选过了（子代理→`X 子代理`），这个标记只影响渲染方式
-        subagent: ev.is_subagent === true,
       });
     }
     scheduleExpiry();
@@ -323,16 +322,14 @@ const lastSeenRow = new Map<string, { name: string; tip: string }>();
     // 「子代理」。名字不一致就会被读成「挂在别人下面」（实测踩过：子代理收尾那一瞬间，
     // 它的「任务完成」行看着挂到了另一个工作区的会话下）。单一工作区时才用全称——
     // 那时没有歧义，缩写反而是丢信息
-    name: ev.is_subagent
-      ? subagentLabel(ev.agent, ev.session_id)
-      : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
+    name: sub ? subagentLabel(ev.agent, ev.session_id) : rowLabel(ev.agent, ev.project, lastMixedWorkspaces),
     tip: ev.project ?? "",
     label: hit[1],
     state: hit[0],
-    subagent: ev.is_subagent === true,
+    subagent: sub,
     // 子代理的终态行跟着它的父会话**同一个工作区**（同一个 agent 的终态事件本就该按事件里
     // 的 agent 名显示），缩进与子代理行一致
-    depth: ev.is_subagent ? 1 : 0,
+    depth: sub ? 1 : 0,
     parentMissing: false,
     placeholder: false,
     parentId: ev.parent_session_id ?? null,
@@ -419,9 +416,6 @@ function currentRows(): Row[] {
       abortedMemo.set(sessionRowKey(s.agent, s.session_id), {
         name: sub ? subagentLabel(s.agent, s.session_id) : rowLabel(s.agent, s.project, mixedWorkspaces),
         tip: rowTip(s.project),
-        depth,
-        // 真实行子代理与否是确定的（快照里的 `parent`），记下来供合成行复用
-        subagent: sub,
       });
     }
     // 占位父行没有 agent 级信息可取（它不是快照里的会话）：显示 `会话 …尾号`；
@@ -432,8 +426,10 @@ function currentRows(): Row[] {
         ? subagentLabel(s.agent, s.session_id)
         : rowLabel(s.agent, s.project, mixedWorkspaces);
     const tip = rowTip(s.project);
-    // 每一行都留一份「上一帧见到的样子」：父行消失后要靠它把占位父行还原成真名字
-    lastSeenRow.set(sessionRowKey(s.agent, s.session_id), { name, tip });
+    // 只记**真实行**：占位行的名字是合成的（`会话 …尾号`），记进「上一帧见到的样子」后，
+    // 还原占位行时读回来的就是它自己——真名字与下面的兜底永远轮不到（实测：主会话在
+    // 子代理跑着的那段时间一直显示 `会话 …6ee0ea`，正是被自己覆盖的结果）。
+    if (!placeholder) lastSeenRow.set(sessionRowKey(s.agent, s.session_id), { name, tip });
     return {
       key: s.session_id,
       sessionId: s.session_id,
@@ -452,9 +448,10 @@ function currentRows(): Row[] {
     };
   });
   // 占位父行一律还原成**真名字**：只要这一行还有子在跑，就没理由摆一串 id 尾号
-  // （用户点名过两次）。名字取「上一帧见到的样子」；实在没见过（widget 是刚启动的）
-  // 就退化成 agent 名 +「已结束」——那个 agent 名是确定的：合成占位行时用的是子代理的
-  // agent，而子代理与父会话必然是同一个 agent。
+  // （用户点名过两次）。名字取「上一帧见到的样子」；实在没见过（widget 刚启动、快照里
+  // 从头到尾没出现过父行——典型是 daemon 重启后父会话只剩保活心跳）就按**真实行的同一
+  // 口径**现算：单一工作区用 agent 名，跨工作区用「简称 · 工作区」。工作区来自子代理
+  // （见 api.ts 的 ghostSession），所以这条兜底同样带得出 dsh-git-panel 这样的归属。
   {
     const seen = new Set<string>();
     for (let i = 0; i < rows.length; i++) {
@@ -471,8 +468,8 @@ function currentRows(): Row[] {
       rows[i] = {
         key: row.key,
         agent: row.agent,
-        name: memo?.name ?? last?.name ?? t("floating.endedName", { name: agentName(row.agent) }),
-        tip: memo?.tip ?? last?.tip ?? "",
+        name: memo?.name ?? last?.name ?? rowLabel(row.agent, row.tip || null, lastMixedWorkspaces),
+        tip: memo?.tip ?? last?.tip ?? row.tip,
         label: aborted ? eventLabel("run_aborted") : t("events.ended"),
         state: aborted ? "aborted" : "completed",
         subagent: false,
@@ -494,15 +491,43 @@ function currentRows(): Row[] {
     if (left > 0) {
       // 插到父行**子树**的正下方，而不是列表末尾：追加到末尾会让子代理的「任务完成」
       // 行落在最后一行会话（可能是另一个工作区的）的子树里，看起来就像挂到了那个会话
-      // 下面（实测踩过）。父行不在了就退回追加——至少还是「一条短命的驻留行」。
-      const pi = terminal.parentId ? rows.findIndex((r) => r.key === terminal!.parentId) : -1;
+      // 下面（实测踩过）。
+      let pi = terminal.parentId ? rows.findIndex((r) => r.key === terminal!.parentId) : -1;
+      // 父行连列表都不在（daemon 刚重启、父会话只剩保活心跳；或父回合已结束被摘档）：
+      // 子代理的终态行会孤零零地落在末尾，卡片上只剩「子代理 01 · 任务完成」，看着像
+      // 子代理没有主会话（用户实测点名）。这里按子代理终态事件自带的 agent / 工作区
+      // 补一行「已结束」父行，让驻留行照常挂在它下面——与 sessionRows 的占位父行同一口径。
+      if (pi < 0 && terminal.subagent && terminal.parentId) {
+        // 名字与占位行还原同一条兜底链：上一帧见过就用它（父行刚被摘档时这是唯一的真名与
+        // 工作区），没见过才按真实行的同一口径现算。
+        const seenParent = lastSeenRow.get(sessionRowKey(terminal.agent, terminal.parentId));
+        rows.push({
+          key: terminal.parentId,
+          agent: terminal.agent,
+          name: seenParent?.name ?? rowLabel(terminal.agent, terminal.tip || null, lastMixedWorkspaces),
+          tip: seenParent?.tip || terminal.tip,
+          label: t("events.ended"),
+          state: "completed",
+          subagent: false,
+          depth: 0,
+          parentMissing: false,
+          // 不标 `placeholder`：既有「还有子在跑的占位父行」在悬浮窗里还原后同样按正常行
+          // 强度渲染（弱化会让人读成另一条临时会话），页脚口径也与之一致。
+          placeholder: false,
+        });
+        pi = rows.length - 1;
+      }
       if (pi < 0) {
         rows.push(terminal);
       } else {
         const pd = rows[pi].depth;
         let end = pi + 1;
         while (end < rows.length && rows[end].depth > pd) end++;
-        rows.splice(end, 0, terminal);
+        // 驻留行跟着父行再深一级：父行本身就是子代理时（孙代），写死 1 级会和父行同缩进
+        const inserted = terminal.subagent
+          ? { ...terminal, depth: Math.min(pd + 1, SESSION_INDENT_MAX) }
+          : terminal;
+        rows.splice(end, 0, inserted);
       }
     } else terminal = null;
   }

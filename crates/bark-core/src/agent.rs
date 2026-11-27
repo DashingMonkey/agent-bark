@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// - `qoder-work`：QoderWork，官方已从产品线除名
 /// - `qoder-cn-cli`：Qoder CN CLI，几乎无人使用
 /// - `qoder-cn`：Qoder CN 国内版已与国际版**合并**成一条 adapter（id 仍是 `qoder`，
-///   同时写 `~/.qoder/settings.json` 与 `~/.qoder-cn/settings.json`，与 TraeCode 同样式）。
+///   同时写 `~/.qoder/settings.json` 与 `~/.qoder-cn/settings.json`，与 TRAE 同样式）。
 ///   老配置里的 `qoder-cn` 开关会在加载时并到 `qoder` 上（见 `BarkConfig::load`）
 /// - `windsurf`：已移除检测和接入。
 pub const RETIRED_AGENT_IDS: [&str; 4] = ["qoder-work", "qoder-cn-cli", "qoder-cn", "windsurf"];
@@ -17,6 +17,11 @@ pub const RETIRED_AGENT_IDS: [&str; 4] = ["qoder-work", "qoder-cn-cli", "qoder-c
 #[serde(rename_all = "kebab-case")]
 pub enum AgentKind {
     ClaudeCode,
+    /// TRAE（2026-11 起 TraeCode 与 TraeWork 合并为同一个应用）。
+    ///
+    /// 变体名与 id 都保留 `trae-code`：已安装的 hooks（`~/.trae-cn/hooks.json`）
+    /// 里写的就是 `--agent trae-code`，改 id 会让老配置的事件静默失效；
+    /// 对外展示统一由 [`AgentKind::display_name`] 给出 "TRAE"。
     TraeCode,
     CodeBuddy,
     Qoder,
@@ -24,7 +29,6 @@ pub enum AgentKind {
     Zcode,
     OpenCode,
     Dsh,
-    TraeWork,
     WorkBuddy,
     // ---- 2026-09 广度扩展（官方 hooks 文档 + AgentPet/lazyagent 等开源实现
     // 双源交叉验证后接入；均未实机测试，依赖各家启动自愈 + 判死兜底）----
@@ -68,7 +72,7 @@ impl AgentKind {
     /// 前两者没人用或被官方除名，后者并入了 Qoder。都不再注册 adapter，用户配置里
     /// 残留的旧 id 字符串无害——agents 段存的是 String，bark-cli 遇到未知 id 也只
     /// 打印一行并 exit 0）
-    pub const ALL: [AgentKind; 20] = [
+    pub const ALL: [AgentKind; 19] = [
         AgentKind::ClaudeCode,
         AgentKind::TraeCode,
         AgentKind::CodeBuddy,
@@ -77,7 +81,6 @@ impl AgentKind {
         AgentKind::Zcode,
         AgentKind::OpenCode,
         AgentKind::Dsh,
-        AgentKind::TraeWork,
         AgentKind::WorkBuddy,
         AgentKind::GeminiCli,
         AgentKind::QwenCode,
@@ -101,7 +104,6 @@ impl AgentKind {
             AgentKind::Zcode => "zcode",
             AgentKind::OpenCode => "opencode",
             AgentKind::Dsh => "dsh",
-            AgentKind::TraeWork => "trae-work",
             AgentKind::WorkBuddy => "workbuddy",
             AgentKind::GeminiCli => "gemini-cli",
             AgentKind::QwenCode => "qwen-code",
@@ -119,17 +121,16 @@ impl AgentKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             AgentKind::ClaudeCode => "Claude Code",
-            AgentKind::TraeCode => "TraeCode",
+            AgentKind::TraeCode => "TRAE",
             AgentKind::CodeBuddy => "CodeBuddy",
             // 国际版与国内版（Qoder CN）共用这一条：一般人不会同时装两个版本，
-            // 装了也会一起写（与 TraeCode 的「国际版 / 国内版」同样式）
+            // 装了也会一起写（与 TRAE 的「国际版 / 国内版」同样式）
             AgentKind::Qoder => "Qoder",
             AgentKind::Codex => "Codex",
             // Z.ai（智谱 GLM）的编程 Agent，国内 bigmodel / 国际 z.ai 同一份配置
             AgentKind::Zcode => "ZCode",
             AgentKind::OpenCode => "OpenCode",
             AgentKind::Dsh => "DeepSeek Harness",
-            AgentKind::TraeWork => "TraeWork",
             AgentKind::WorkBuddy => "WorkBuddy",
             AgentKind::GeminiCli => "Gemini CLI",
             AgentKind::QwenCode => "Qwen Code",
@@ -155,9 +156,7 @@ impl AgentKind {
 
     pub fn mode(&self) -> AdapterMode {
         match self {
-            AgentKind::TraeWork | AgentKind::WorkBuddy | AgentKind::KimiWork | AgentKind::DoubaoWork => {
-                AdapterMode::Watch
-            }
+            AgentKind::WorkBuddy | AgentKind::KimiWork | AgentKind::DoubaoWork => AdapterMode::Watch,
             // DSH：生成原生 Cordis 插件并挂载（见 bark-adapters/src/dsh.rs）
             _ => AdapterMode::Hook,
         }

@@ -1,8 +1,9 @@
 //! 其余「业界已验证」源的采集（定义移植自 ccusage 20.0.51 各 adapter 的字段口径）。
 //!
 //! 本机未安装的源也实现 parser：用户装好即自动出数（首轮回补历史）。
-//! 拿不到可靠定义的（Antigravity 的 SQLite 快照 schema、Trae 系加密库、
-//! 豆包、Cursor 官方 API）**不猜口径**——不采集即不列出。
+//! 拿不到可靠定义的（Antigravity 的 SQLite 快照 schema、豆包、Cursor 官方 API）
+//! **不猜口径**——不采集即不列出。TRAE 的加密会话库在 [`crate::usage_trae`] 单独处理
+//! （解密后读 `server_history_info` 的服务端用量）。
 //!
 //! CodeBuddy 有两种落盘形态（定义移植自 tokscale `sessions/tencent_buddy.rs`）：
 //! - CLI：`~/.codebuddy/projects/**/*.jsonl`（含 subagents）。用量多数写在

@@ -639,6 +639,16 @@ impl HookAdapter for ClaudeStyleAdapter {
             kind
         };
         let mut event = NormalizedEvent::from_raw(self.spec.kind.id(), kind, raw);
+        // TRAE（TraeCode）的 hook 载荷**每条**都带 agent_id/agent_type——2026-11-23 实测
+        // （Trae CN 的 Agent Hooks 日志）：SessionStart / UserPromptSubmit / Stop / Notification
+        // 全是 `solo_agent`，而它的事件面只有官方 6 个事件、没有子代理事件。通用的
+        // 「agent_id/agent_type 非空即子代理」启发式（bark_core::event::detect_subagent）会把
+        // 主会话的**每一条**事件都判成子代理：通知被静默丢掉，悬浮窗还把完成行标成
+        // 「子代理 01」——实测被点名「没走子代理却显示子代理」。与 ZCode 同款处理
+        // （见 zcode.rs 的 is_subagent）：只认显式布尔字段，其余一律按主会话。
+        if self.spec.kind == AgentKind::TraeCode {
+            event.is_subagent = explicit_subagent_flag(raw);
+        }
         if input_tool && event_name == "PostToolUse"
             && raw.get("tool_name").and_then(Value::as_str)
                 .is_some_and(|name| name.rsplit('.').next() == Some("request_user_input_async"))
@@ -684,6 +694,21 @@ impl HookAdapter for ClaudeStyleAdapter {
             bark_core::Lang::En => spec_trust_hint_en(self.spec.kind),
         }
     }
+}
+
+/// 子代理标记只认**显式布尔字段**（`is_subagent` / `subagent`）。
+///
+/// 给「载荷里恒带 agent_id / agent_type、但事件面没有子代理事件」的 agent 用（TraeCode；
+/// ZCode 另有会话命名判定，见 zcode.rs 的 `is_subagent`）。通用启发式的依据是 Claude Code
+/// 只在子代理内部才给这些字段——对 TRAE 不成立，见 `normalize` 里的实测记录。
+///
+/// 取值口径与 `bark_core::event::detect_subagent` / `zcode::is_subagent` 一致：**首个**布尔
+/// 字段说了算（`is_subagent` 优先于 `subagent`），不是「任一为 true」。
+fn explicit_subagent_flag(raw: &Value) -> bool {
+    ["is_subagent", "subagent"]
+        .iter()
+        .find_map(|key| raw.get(*key).and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// 英文界面的信任引导（与各 spec 的 `trust_hint` 中文原文一一对应；仅这几个
@@ -2383,6 +2408,42 @@ mod tests {
         ] {
             assert_eq!(adapter.normalize("Notification", &json!({"notification_type":notification_type})).unwrap().kind, expected);
         }
+    }
+
+    #[test]
+    fn trae_agent_scope_fields_do_not_mark_the_session_as_subagent() {
+        // 2026-11-23 实测（Trae CN 的 Modular/agent-hooks.log）：TRAE 每一条 hook 载荷都带
+        // agent_id/agent_type，值恒为 `solo_agent`（SessionStart / UserPromptSubmit / Stop /
+        // Notification 完全一致）。通用的「agent_id/agent_type 非空即子代理」启发式会把主会话
+        // 整条判成子代理——通知被静默丢掉，悬浮窗还会把主会话的完成行标成「子代理 01」。
+        let adapter = trae_code();
+        let payload = json!({
+            "session_id": "6b039ee1e0b35903403524b7",
+            "cwd": "C:/Users/x/Documents/Trae-CN/temp_20261013_01",
+            "hook_event_name": "Stop",
+            "agent_id": "solo_agent",
+            "agent_type": "solo_agent",
+            "notification_type": "permission_prompt",
+            "last_assistant_message": "done",
+        });
+        // 四个实测事件全过一遍：Notification 那条最要紧——被误判成子代理时通知会被直接丢掉
+        for name in ["SessionStart", "UserPromptSubmit", "Stop", "Notification"] {
+            let ev = adapter.normalize(name, &payload).expect("事件名都在官方 6 事件里");
+            assert!(!ev.is_subagent, "{name} 带 agent_id/agent_type 也不能判子代理");
+        }
+        // 显式布尔字段仍然有效（将来 TRAE 若恢复子代理 hook，按它走）
+        let explicit = adapter
+            .normalize("Stop", &json!({"session_id": "s", "agent_id": "solo_agent", "is_subagent": true}))
+            .unwrap();
+        assert!(explicit.is_subagent);
+        // 与 bark-core / zcode 同口径：首个布尔字段优先，不是「任一为 true」
+        let first_wins = adapter
+            .normalize("Stop", &json!({"session_id": "s", "is_subagent": false, "subagent": true}))
+            .unwrap();
+        assert!(!first_wins.is_subagent, "is_subagent 在前且为 false，subagent:true 不该翻案");
+        // 其它 Claude 系 agent 的通用启发式不受影响（agent_id 只在子代理内部出现）
+        let claude = claude_code().normalize("Stop", &json!({"session_id": "s", "agent_id": "abc"})).unwrap();
+        assert!(claude.is_subagent);
     }
 
     // ---- 2026-09 广度扩展：事件表 ⊆ 官方事件表（未知事件名有让整份 hooks

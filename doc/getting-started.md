@@ -4,7 +4,7 @@
 
 ## 安装
 
-从 [发布页](https://gitee.com/dashingmonkey/agent-bark/releases) 下载 Windows 安装包，安装并启动 Agent Bark。需要从源码构建时，请看 [开发构建](development.md)。
+从 [发布页](https://github.com/DashingMonkey/agent-bark/releases) 下载 Windows 安装包，安装并启动 Agent Bark。需要从源码构建时，请看 [开发构建](development.md)。
 
 ## 接入第一个 Agent
 

@@ -7,7 +7,7 @@ use crate::dsh::DshAdapter;
 use crate::kimi_code;
 use crate::kimiwork::KimiWorkWatch;
 use crate::opencode::OpenCodeAdapter;
-use crate::watch::{TraeWorkWatch, WatchAdapter, WorkBuddyWatch};
+use crate::watch::{WatchAdapter, WorkBuddyWatch};
 use crate::zcode::ZcodeAdapter;
 use crate::{AgentStatus, HookAdapter, RegisterCtx, VerifyReport};
 use bark_core::{AgentKind, BarkConfig};
@@ -37,7 +37,6 @@ pub fn hook_adapters() -> Vec<Box<dyn HookAdapter>> {
 pub fn watch_adapters() -> Vec<Box<dyn WatchAdapter>> {
     vec![
         Box::new(WorkBuddyWatch),
-        Box::new(TraeWorkWatch),
         Box::new(KimiWorkWatch),
         Box::new(DoubaoWorkWatch),
     ]

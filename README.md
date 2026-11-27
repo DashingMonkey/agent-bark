@@ -43,9 +43,9 @@
 
 | 接入方式 | Agent |
 | --- | --- |
-| Hook | Claude Code、TRAE（原 TraeCode）、CodeBuddy、Qoder / Qoder CN、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Antigravity、Kimi Code |
+| Hook | Claude Code、TRAE、CodeBuddy、Qoder / Qoder CN、Codex、ZCode、Gemini CLI、Qwen Code、Factory Droid、Grok CLI、Cursor、Copilot CLI、Antigravity、Kimi Code |
 | 插件 | OpenCode、DeepSeek Harness |
-| 本地监控 | WorkBuddy、TraeWork、Kimi Work、豆包工作 |
+| 本地监控 | WorkBuddy、Kimi Work、豆包工作 |
 
 配置方法与注意事项见 [Agent 接入文档](doc/agent-integration.md)。本地监控属于非官方适配。
 

@@ -46,7 +46,7 @@ fn snapshot_removal_failure_warns_instead_of_silent_let() {
 
 #[test]
 fn decrypt_page_body_has_no_heap_allocation() {
-    let src = read_src("traework_db.rs");
+    let src = read_src("trae_db.rs");
     let body = fn_body(&src, "fn decrypt_page(enc_key: &[u8], page: &[u8], pgno: u64, out: &mut Vec<u8>)");
     assert!(
         !body.contains("vec![") && !body.contains("Vec::with_capacity") && !body.contains(".to_vec()"),

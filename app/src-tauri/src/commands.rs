@@ -236,7 +236,7 @@ fn set_agent_enabled_blocking(
             hint = adapter.unregister_hint(lang).map(String::from);
         }
     } else if agent.mode() == bark_core::AdapterMode::Watch {
-        // 监控型（WorkBuddy / TraeWork）：没有 hook 配置文件可写，开关落盘后
+        // 监控型（WorkBuddy / Kimi Work / 豆包工作）：没有 hook 配置文件可写，开关落盘后
         // 由 sync_watchers 启停。启用前先做可用性预检，把失败挡在开关翻转之前——
         // 否则开关写成功了 watcher 却起不来，UI 只会显示「已开启未生效」，
         // 用户不知道为什么（真实原因：库不存在 / schema 失效 / 已加密）。
