@@ -28,6 +28,13 @@ struct Source {
 
 static SOURCES: &[Source] = &[
     Source {
+        agent: "antigravity",
+        prefix: crate::antigravity_watch::EVENT_PREFIX,
+        accept: Some(crate::antigravity_watch::accept),
+        current: crate::antigravity_watch::still_current,
+        preserve_wait: Some(crate::antigravity_watch::preserve_wait),
+    },
+    Source {
         agent: "codex",
         prefix: crate::codex_watch::EVENT_PREFIX,
         accept: Some(crate::codex_watch::accept),
@@ -121,6 +128,12 @@ mod tests {
         );
         assert!(is_local_evidence(&codebuddy));
 
+        let antigravity = event(
+            "antigravity",
+            &format!("{}s1:1", crate::antigravity_watch::EVENT_PREFIX),
+        );
+        assert!(is_local_evidence(&antigravity));
+
         // 前缀对但 agent 不对：不认，避免别的 agent 的事件混进豁免/回合校验。
         let forged = event("claude-code", &format!("{}s1:1", crate::qoder_watch::EVENT_PREFIX));
         assert!(!is_local_evidence(&forged));
@@ -128,6 +141,10 @@ mod tests {
 
     #[test]
     fn registered_sources_keep_their_own_judgements() {
+        let antigravity = source_for_agent("antigravity").expect("antigravity 必须登记");
+        assert_eq!(antigravity.prefix, crate::antigravity_watch::EVENT_PREFIX);
+        assert!(antigravity.accept.is_some(), "Antigravity 的等待与中止校验不能丢");
+        assert!(antigravity.preserve_wait.is_some(), "Antigravity 的并行等待保留不能丢");
         let qoder = source_for_agent("qoder").expect("qoder 必须登记");
         assert_eq!(qoder.prefix, crate::qoder_watch::EVENT_PREFIX);
         assert!(qoder.accept.is_none(), "Qoder 的普通 hook 事件不需要入口过滤");

@@ -63,7 +63,7 @@ Codex 的 `PreToolUse` 中，`request_user_input` / `request_user_input_async`�
 | Cursor | `stop.status=aborted`；`sessionEnd.reason` 按完成/取消/失败分类 | 收到信号后释放；已做载荷测试，未现场实测 |
 | Copilot CLI | `sessionEnd.reason=abort/user_exit` 释放；complete 为完成，error/timeout 为失败 | 会话级信号；未现场验证每次取消是否触发 |
 | Gemini CLI / Qwen Code / Factory Droid | `SessionEnd`（官方文档，未实测） | 退出会话时释放；中断后继续对话则刷新 |
-| Antigravity | **无**（官方就没有会话级/中断事件） | 保留最后已知状态；继续对话则刷新，可本地移除 |
+| Antigravity | `Stop.terminationReason=USER_CANCELED` + 本地 `language_server.log` / CLI 日志取消记录（2026-11-27 本机实测，~1s） | 秒级清除运行态（run_aborted）；日志缺失或格式变化时保留最后已知状态，可本地移除 |
 
 **三条硬约束**（见 `crates/bark-cli/src/lib.rs` 模块注释，改 hook 逻辑必须守住）：
 1. 永远退出码 0——绝不能阻塞 agent；
@@ -637,10 +637,16 @@ Windsurf 已按用户要求移除检测、接入入口和适配器；旧 agent i
 | id | `antigravity` |
 | 配置文件 | `~/.gemini/config/hooks.json`（**命名组**结构：顶层每个键是一个组，agent-bark 独占 `agent-bark` 组，用户自己的组与 Gemini CLI 的配置互不影响） |
 | 安装标记 | `~/.gemini/config` 目录存在 |
-| 注册事件 | `PreInvocation`/`PreToolUse`→activity、`PostToolUse`→tool_finished、`Stop`→run_completed |
+| 注册事件 | `PreInvocation`→activity（带 `lastUserInput`）、`PreToolUse`→activity（`ask_question`/`ask_user_question`/带 `BlockedOnUser` 的 `notify_user`→**input_required**，`ask_permission`→**permission_required**）、`PostToolUse`→tool_finished（带非空 `error`→tool_failed，均解除等待）、`Stop`→按 `terminationReason` / `error` 细分 run_completed / **run_aborted** / **run_failed** |
 | 需要你做 | 在 Antigravity **设置中开启 Hooks** |
 
-官方 5 个事件里取 4 个（`PostInvocation` 与 `Stop` 重合，不重复注册）（**未实测**）。两个形态细节：`PreToolUse`/`PostToolUse` 是 matcher 事件，需要 `{"matcher": "*", "hooks": [...]}` 包装；`PreInvocation`/`Stop` 是裸 handler 列表。payload 为 camelCase（`conversationId`/`workspacePaths`/`toolCall.name`）且**没有事件名字段**——事件名由 hook 命令的 `--event` 参数提供，不受影响。没有会话级/中断事件，缺少中止信号时保留最后已知状态，可本地移除。
+官方 6 个事件里取 4 个（`PostInvocation` 与 `Stop` 重合，不重复注册；**2026-11-27 本机实测 Antigravity 2.35.2 / macOS**）。两个形态细节：`PreToolUse`/`PostToolUse` 是 matcher 事件，需要 `{"matcher": "*", "hooks": [...]}` 包装；`PreInvocation`/`Stop` 是裸 handler 列表。payload 为 camelCase（`conversationId`/`workspacePaths`/`toolCall{name,args}`/`lastUserInput`/`terminationReason`/`error`），事件名由 hook 命令的 `--event` 参数提供。
+
+**2026-11-27 本机实测要点**：
+- **选项/提问等待**：Antigravity 没有独立的 `Notification` / `PermissionRequest` hook，向用户弹出选项走 `PreToolUse` 的 `ask_question`（实测 `toolCall.name="ask_question"`，参数 `questions` 兼容数组与 JSON 字符串），提交答案后由 `PostToolUse` 解除等待；`ask_permission` 归为 `permission_required`、`notify_user`（仅 `BlockedOnUser=true`）归为 `input_required`。同一回合内若有其它并行工具先结束，`antigravity_watch` 会保留等待相位，直到对应等待工具的 `PostToolUse`、下一次 `PreInvocation` 或终态到达；
+- **手动中止不触发 `Stop` hook**：思考中点击停止时，宿主在 `language_server.log`（macOS `~/Library/Logs/Antigravity/language_server.log`，亦兼容 Windows/Linux 及 `~/.gemini/antigravity*/log/*.log`）立即写下 `CancelCascadeInvocation requested: cascade_id="<id>"` 与 `Cancel requested for cascade <id>`，但**不会调起 `Stop` hook**。daemon 侧 `antigravity_watch` 独立线程每秒增量尾读日志并合成 `run_aborted`（经 `evidence` 注册表按 `last_activity` 校验，旧中止不会误清下一回合）；若某入口触发了带 `terminationReason="USER_CANCELED"` 的 `Stop` hook，适配器同样按 `run_aborted` 归一。
+- **Token 用量采集**：增量尾读 `~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`（忽略同目录的 `transcript_full.jsonl` 防止双计），采集 `status=DONE` 的 `PLANNER_RESPONSE` 与 `CHECKPOINT`（上下文压缩调用）。本机连续步实证 `input_tokens` 不含 `cache_read_tokens`，直接记为 `input_new`，以 `<session_id>:<step_index>` 幂等去重；
+- **能力边界**：通用工具（如 `run_command`）自身的权限审批弹窗发生在 `PreToolUse` 之后、宿主不提供审批前通知 hook，这类弹窗无法由 hook 单独区分；日志缺失或格式变化时保留最后已知状态，可本地移除。
 
 ---
 

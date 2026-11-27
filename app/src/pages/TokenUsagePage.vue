@@ -6,7 +6,29 @@ import { agentIcon, api, type AgentUsage, type DailyUsage, type HourlyUsage, typ
 const { t, locale } = useI18n();
 
 type Range = "today" | "d7" | "d30" | "d365";
-const range = ref<Range>("d30");
+const RANGE_KEY = "usage.range";
+function isRange(v: string | null): v is Range {
+  return v === "today" || v === "d7" || v === "d30" || v === "d365";
+}
+// 默认查「今天」，切换后记入 localStorage，重启应用也保持上次选择
+const range = ref<Range>((() => {
+  try {
+    const saved = localStorage.getItem(RANGE_KEY);
+    return isRange(saved) ? saved : "today";
+  } catch {
+    return "today";
+  }
+})());
+
+function onRangeChange(next: Range) {
+  range.value = next;
+  try {
+    localStorage.setItem(RANGE_KEY, next);
+  } catch {
+    // 存不进去就算了，本次会话内仍生效
+  }
+  void refresh();
+}
 const agents = ref<AgentUsage[]>([]);
 const daily = ref<DailyUsage[]>([]);
 const hourly = ref<HourlyUsage[]>([]);
@@ -406,7 +428,7 @@ watchEffect(
         <span class="hint">{{ $t("usage.asOf", { time: asOf }) }}</span>
       </div>
       <div class="page-actions">
-        <select :value="range" @change="range = ($event.target as HTMLSelectElement).value as Range; void refresh()">
+        <select :value="range" @change="onRangeChange(($event.target as HTMLSelectElement).value as Range)">
           <option value="today">{{ $t("usage.rangeToday") }}</option>
           <option value="d7">{{ $t("usage.range7") }}</option>
           <option value="d30">{{ $t("usage.range30") }}</option>

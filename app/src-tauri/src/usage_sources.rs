@@ -1,9 +1,16 @@
-//! 其余「业界已验证」源的采集（定义移植自 ccusage 20.0.51 各 adapter 的字段口径）。
+//! 其余「业界已验证」源的采集（定义移植自 ccusage 20.0.51 各 adapter 的字段口径，
+//! 及本机实测验证的 Antigravity transcript 口径）。
 //!
 //! 本机未安装的源也实现 parser：用户装好即自动出数（首轮回补历史）。
-//! 拿不到可靠定义的（Antigravity 的 SQLite 快照 schema、豆包、Cursor 官方 API）
-//! **不猜口径**——不采集即不列出。TRAE 的加密会话库在 [`crate::usage_trae`] 单独处理
-//! （解密后读 `server_history_info` 的服务端用量）。
+//! 拿不到可靠定义的（豆包、Cursor 官方 API）**不猜口径**——不采集即不列出。
+//! TRAE 的加密会话库在 [`crate::usage_trae`] 单独处理（解密后读 `server_history_info` 的服务端用量）。
+//!
+//! Antigravity（2026-11-27 本机实测 2.35.2 / macOS）：
+//! - 路径：`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+//!   （含子代理独立会话目录；只读 `transcript.jsonl`，忽略 `transcript_full.jsonl` 防双计）；
+//! - 记账记录：`type = PLANNER_RESPONSE | CHECKPOINT` 且 `status = DONE`；
+//! - 口径实证：连续步中 `step[n].cache_read_tokens == step[n-1].cache_read_tokens + step[n-1].input_tokens + 1`，
+//!   证明 `input_tokens` 本身**不含**缓存读取，直接作为 `input_new`。
 //!
 //! CodeBuddy 有两种落盘形态（定义移植自 tokscale `sessions/tencent_buddy.rs`）：
 //! - CLI：`~/.codebuddy/projects/**/*.jsonl`（含 subagents）。用量多数写在
@@ -13,7 +20,7 @@
 //!   同一行会镜像写多个日志 sink，按 agent + 秒 + 用量四元组去重。
 //!
 //! 口径假设（与各源官方语义一致，单测钉死）：
-//! - Claude / Droid：input_tokens 不含缓存读取；
+//! - Claude / Droid / Antigravity：input_tokens 不含缓存读取；
 //! - Gemini / Qwen：promptTokenCount 含 cachedContentTokenCount，需拆；
 //! - OpenCode：tokens_input 不含 cache.read；
 //! - Copilot OTEL：gen_ai.usage.input_tokens 视为含缓存，拆出 cache_read；
@@ -77,6 +84,7 @@ pub fn poll(store: &UsageStore, c: &mut Cursors, home: &Path) {
             .collect();
         store.insert(&recs);
     }
+    collect_antigravity(store, c, home);
     collect_codebuddy(store, c, home);
     collect_codebuddy_logs(store, c, home);
     collect_opencode(store, c, home);
@@ -345,6 +353,136 @@ impl FilterEmpty for String {
         } else {
             Some(self)
         }
+    }
+}
+
+// ---- Antigravity transcript.jsonl ----
+
+/// 枚举 Antigravity（App / CLI / IDE）三个入口的会话 transcript.jsonl。
+/// 直接按固定目录布局 `<app_data>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+/// 定位，避免递归扫描 `scratch/` / `media/`，也不读 `transcript_full.jsonl`（防双计）。
+fn antigravity_files(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in ["antigravity", "antigravity-cli", "antigravity-ide"] {
+        let brain = home.join(".gemini").join(dir).join("brain");
+        let Ok(rd) = std::fs::read_dir(&brain) else { continue };
+        for e in rd.flatten() {
+            let p = e
+                .path()
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// 从 `.../<conversation_id>/.system_generated/logs/transcript.jsonl` 提取会话 id。
+fn antigravity_session_id(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn ts_of_any(rec: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    for k in keys {
+        let Some(v) = rec.get(*k) else { continue };
+        match v {
+            serde_json::Value::String(s) => {
+                if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+                    return Some(d.timestamp_millis());
+                }
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(ms) = n.as_i64() {
+                    return Some(ms);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 解析 Antigravity `transcript.jsonl` 的单行用量记录。
+/// 仅认 `type = PLANNER_RESPONSE | CHECKPOINT` 且 `status = DONE`（或无 status 字段）；
+/// `input_tokens` 本身不含 `cache_read_tokens`，直接作为 `input_new`。
+pub fn parse_antigravity_line(line: &str, session: &str) -> Option<UsageRecord> {
+    let rec: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ty = rec.get("type")?.as_str()?;
+    if !matches!(ty, "PLANNER_RESPONSE" | "CHECKPOINT") {
+        return None;
+    }
+    if rec
+        .get("status")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.eq_ignore_ascii_case("DONE"))
+    {
+        return None;
+    }
+    let input_new = num(&rec, &["input_tokens", "inputTokens"]).max(0);
+    let cache_read = num(&rec, &["cache_read_tokens", "cacheReadTokens"]).max(0);
+    let cache_write = num(
+        &rec,
+        &[
+            "cache_write_tokens",
+            "cacheWriteTokens",
+            "cache_creation_tokens",
+            "cacheCreationTokens",
+        ],
+    )
+    .max(0);
+    let output = num(&rec, &["output_tokens", "outputTokens"]).max(0);
+    let reasoning = num(
+        &rec,
+        &[
+            "reasoning_tokens",
+            "reasoningTokens",
+            "thinking_tokens",
+            "thinkingTokens",
+        ],
+    )
+    .max(0);
+    if input_new == 0 && cache_read == 0 && cache_write == 0 && output == 0 && reasoning == 0 {
+        return None;
+    }
+    let ts = ts_of_any(&rec, &["created_at", "createdAt", "timestamp"])?;
+    let record_id = first_i64(&rec, &["step_index", "stepIndex"])
+        .map(|step| format!("{session}:{step}"))
+        .unwrap_or_else(|| format!("{session}:{ts}:{input_new}:{cache_read}:{output}"));
+    Some(UsageRecord {
+        agent: "antigravity".into(),
+        record_id,
+        session_id: session.to_string(),
+        ts,
+        model: str_of(&rec, &["model", "modelName"]),
+        input_new,
+        cache_read,
+        cache_write,
+        output,
+        reasoning,
+        credits: None,
+    })
+}
+
+fn collect_antigravity(store: &UsageStore, c: &mut Cursors, home: &Path) {
+    for path in antigravity_files(home) {
+        let session = antigravity_session_id(&path);
+        let lines = tail_lines(&path, c.files.entry(path.clone()).or_insert(0));
+        if lines.is_empty() {
+            continue;
+        }
+        let recs: Vec<UsageRecord> = lines
+            .iter()
+            .filter_map(|l| parse_antigravity_line(l, &session))
+            .collect();
+        store.insert(&recs);
     }
 }
 
@@ -963,6 +1101,119 @@ mod tests {
         collect_codebuddy_logs(&store, &mut c2, &home);
         let again = store.by_agent("2000-01-01", "2100-01-01");
         assert_eq!(again.iter().find(|r| r.agent == "codebuddy").unwrap().requests, 4);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_planner_and_checkpoint_usage() {
+        // 实测样本：step 1 in=15802 cache=0；step 4 cache=15803 in=2197（input_tokens 不含缓存）
+        let planner = r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T13:08:07Z","model":"gemini-4-neon-xhigh","input_tokens":2197,"cache_read_tokens":15803,"output_tokens":435}"#;
+        let r = parse_antigravity_line(planner, "conv-1").unwrap();
+        assert_eq!(r.agent, "antigravity");
+        assert_eq!(r.record_id, "conv-1:4");
+        assert_eq!(r.session_id, "conv-1");
+        assert_eq!(r.model, "gemini-4-neon-xhigh");
+        assert_eq!(r.input_new, 2197);
+        assert_eq!(r.cache_read, 15803);
+        assert_eq!(r.cache_write, 0);
+        assert_eq!(r.output, 435);
+        assert_eq!(r.reasoning, 0);
+
+        // CHECKPOINT（上下文压缩模型调用，无 model 字段）也计入用量
+        let checkpoint = r#"{"step_index":455,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-11-27T12:41:12Z","input_tokens":3321,"cache_read_tokens":56571,"output_tokens":3111}"#;
+        let cp = parse_antigravity_line(checkpoint, "conv-1").unwrap();
+        assert_eq!(cp.record_id, "conv-1:455");
+        assert_eq!(cp.input_new, 3321);
+        assert_eq!(cp.cache_read, 56571);
+        assert_eq!(cp.output, 3111);
+        assert!(cp.model.is_empty());
+
+        // RUNNING、非模型步骤、零用量记录均跳过
+        let running = planner.replace("\"DONE\"", "\"RUNNING\"");
+        assert!(parse_antigravity_line(&running, "conv-1").is_none());
+        let generic = r#"{"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-27T13:08:05Z","content":"ok"}"#;
+        assert!(parse_antigravity_line(generic, "conv-1").is_none());
+        let zero = r#"{"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T13:08:09Z","input_tokens":0,"cache_read_tokens":0,"output_tokens":0}"#;
+        assert!(parse_antigravity_line(zero, "conv-1").is_none());
+    }
+
+    #[test]
+    fn antigravity_collect_end_to_end_ignores_full_transcript_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "bark-ag-usage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let home = dir.join("home");
+        let app_logs = home
+            .join(".gemini")
+            .join("antigravity")
+            .join("brain")
+            .join("conv-app")
+            .join(".system_generated")
+            .join("logs");
+        let cli_logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("conv-cli")
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&app_logs).unwrap();
+        std::fs::create_dir_all(&cli_logs).unwrap();
+
+        let l1 = r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T13:07:53Z","model":"gemini-4-neon-xhigh","input_tokens":15802,"cache_read_tokens":0,"output_tokens":815}"#;
+        let l2 = r#"{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-27T13:08:07Z","model":"gemini-4-neon-xhigh","input_tokens":2197,"cache_read_tokens":15803,"output_tokens":435}"#;
+        let l3 = r#"{"step_index":1,"type":"CHECKPOINT","status":"DONE","created_at":"2026-11-27T13:10:00Z","input_tokens":100,"cache_read_tokens":500,"output_tokens":50}"#;
+
+        std::fs::write(app_logs.join("transcript.jsonl"), format!("{l1}\n")).unwrap();
+        // transcript_full.jsonl 与 transcript.jsonl 内容同源，必须忽略防止双计
+        std::fs::write(app_logs.join("transcript_full.jsonl"), format!("{l1}\n{l2}\n")).unwrap();
+        std::fs::write(cli_logs.join("transcript.jsonl"), format!("{l3}\n")).unwrap();
+
+        let store = UsageStore::new(dir.join("usage.sqlite3"));
+        store.set_enabled(true);
+        let mut c = Cursors::default();
+        collect_antigravity(&store, &mut c, &home);
+
+        let rows = store.by_agent("2000-01-01", "2100-01-01");
+        let ag = rows.iter().find(|r| r.agent == "antigravity").expect("Antigravity 未入库");
+        assert_eq!(ag.requests, 2);
+        assert_eq!(ag.input_new, 15802 + 100);
+        assert_eq!(ag.cache_read, 500);
+        assert_eq!(ag.output, 815 + 50);
+
+        // 追加新步：增量尾读只补新步
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(app_logs.join("transcript.jsonl"))
+                .unwrap();
+            writeln!(f, "{l2}").unwrap();
+        }
+        collect_antigravity(&store, &mut c, &home);
+        let ag = store
+            .by_agent("2000-01-01", "2100-01-01")
+            .into_iter()
+            .find(|r| r.agent == "antigravity")
+            .unwrap();
+        assert_eq!(ag.requests, 3);
+        assert_eq!(ag.input_new, 15802 + 2197 + 100);
+        assert_eq!(ag.cache_read, 15803 + 500);
+        assert_eq!(ag.output, 815 + 435 + 50);
+
+        // 全新游标重扫：主键去重幂等
+        let mut c2 = Cursors::default();
+        collect_antigravity(&store, &mut c2, &home);
+        let ag = store
+            .by_agent("2000-01-01", "2100-01-01")
+            .into_iter()
+            .find(|r| r.agent == "antigravity")
+            .unwrap();
+        assert_eq!(ag.requests, 3);
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

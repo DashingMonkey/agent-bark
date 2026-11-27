@@ -16,7 +16,7 @@
 //! 通过 AtomicBool 停止标志协调退出。
 
 use bark_core::{now_millis, project_name_from_cwd, AgentKind, EventKind, NormalizedEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -237,6 +237,19 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "terminated" | "error" | "archived")
 }
 
+/// 已知状态全集，含本 adapter 不产事件的中性态（active/pending）。
+///
+/// 集合外的值意味着 WorkBuddy 又改了 `sessions.status` 的语义——2026-10 改过取消
+/// 的写法、2026-11（5.12.1）把回合结束从 completed 改成 active。这类变化不会让
+/// schema 探测失败，界面照样显示「监控中」，只能靠一条日志留下证据。
+fn is_known_status(status: &str) -> bool {
+    matches!(
+        status,
+        "active" | "pending" | "working" | "planning"
+            | "completed" | "terminated" | "error" | "archived"
+    )
+}
+
 /// 状态跃迁 → 事件判定（纯函数，便于测试）。
 /// - `first`：首轮只播种，不产终态事件（否则启动时重放全部历史终态会话）；
 ///   运行中心跳由 needs_heartbeat 单独负责，首轮就会点亮
@@ -256,6 +269,11 @@ fn run_event(prev: &str, status: &str, suppress: bool, first: bool) -> Option<Ev
         "pending" if was_running => Some(EventKind::InputRequired),
         // 非终态 → 终态：通知（已终态的行再变终态是重复通知，不发）
         "completed" if !is_terminal(prev) => Some(EventKind::RunCompleted),
+        // WorkBuddy 5.12.1（ACP）起：回合正常结束不再把会话写成 completed，而是留在
+        // `active`，终态只落在回合记录的 acp-terminal-state 行（stopReason=end_turn）。
+        // 运行态回到 active 即本回合结束——不认这条，悬浮窗会永远停在「思考中」。
+        // 仅从运行态跃迁才认：新建会话本来就是 active，不能误报完成。
+        "active" if was_running => Some(EventKind::RunCompleted),
         "terminated" | "error" if !is_terminal(prev) => Some(EventKind::RunFailed),
         // 运行中被归档：turn 实际已结束，闭环掉状态表条目，避免它长期残留在显示中。
         // 归一成 RunAborted 而不是 RunCompleted：归档不是「跑完了」，
@@ -453,6 +471,8 @@ impl WatchAdapter for WorkBuddyWatch {
         cleanup_stale_snapshot_dirs(&std::env::temp_dir(), STALE_SNAPSHOT_MIN_AGE);
         Ok(std::thread::spawn(move || {
             let mut last: HashMap<String, SeenSession> = HashMap::new();
+            // 未识别状态每个取值只告警一次，避免每轮刷屏
+            let mut unknown_status: HashSet<String> = HashSet::new();
             // 被淘汰的终态会话 → 淘汰时的轮次；有效期内压制「回表」重复通知
             let mut tombstone: HashMap<String, u64> = HashMap::new();
             // 首轮轮询只播种终态、不产事件：否则启动时会把库中所有历史
@@ -467,6 +487,14 @@ impl WatchAdapter for WorkBuddyWatch {
                         fail_count = 0;
                         round += 1;
                         for (session, title, status, cwd, updated_at) in snap {
+                            // 语义变更不会让 schema 探测失败，只会让状态走 `_ => None`
+                            // 静默吞掉——留一条一次性证据，下次升级不用从头查。
+                            if !is_known_status(&status) && unknown_status.insert(status.clone()) {
+                                tracing::warn!(
+                                    "WorkBuddy 出现未识别的会话状态「{status}」（示例 session={session}）：\
+                                     状态判定可能已随版本失效，请核对 watch.rs 的 is_running / is_terminal"
+                                );
+                            }
                             let prev = last.get(&session).map(|s| s.status.as_str()).unwrap_or("");
                             let suppress = prev.is_empty() && tombstone.contains_key(&session);
                             let hb = needs_heartbeat(&status, last.get(&session), round, Self::HEARTBEAT_EVERY_ROUNDS);
@@ -651,6 +679,39 @@ mod tests {
         assert_eq!(run_event("", "completed", true, false), None);
         // 但重新进入运行态后的新一轮跃迁仍通知
         assert_eq!(run_event("working", "completed", true, false), Some(EventKind::RunCompleted));
+    }
+
+    /// WorkBuddy 5.12.1（ACP）：回合正常结束把会话写回 `active` 而不是 `completed`。
+    /// 只认「运行态 → active」——新建会话、从终态恢复本来就停在 active，不能误报完成。
+    #[test]
+    fn workbuddy_active_after_running_closes_turn() {
+        assert_eq!(run_event("working", "active", false, false), Some(EventKind::RunCompleted));
+        assert_eq!(run_event("planning", "active", false, false), Some(EventKind::RunCompleted));
+        // 新建会话首轮 / 持续空闲：不通知
+        assert_eq!(run_event("", "active", false, false), None);
+        assert_eq!(run_event("active", "active", false, false), None);
+        // 从终态恢复成 active：不是新的完成
+        assert_eq!(run_event("completed", "active", false, false), None);
+        assert_eq!(run_event("error", "active", false, false), None);
+        // 还没跑起来就回到 active：不发完成
+        assert_eq!(run_event("pending", "active", false, false), None);
+        // 播种轮依旧不产终态事件
+        assert_eq!(run_event("working", "active", false, true), None);
+    }
+
+    /// 5.12.1 的 `active` 原本是个未识别值，被 `_ => None` 静默吞掉、没有任何痕迹。
+    /// 这条测试锁住「未知值必须能报出来」，下次再改语义至少留得下证据。
+    #[test]
+    fn unknown_status_is_detected() {
+        for s in [
+            "active", "pending", "working", "planning",
+            "completed", "terminated", "error", "archived",
+        ] {
+            assert!(is_known_status(s), "{s} 是已校准的状态");
+        }
+        for s in ["idle", "waiting", "queued", "running", ""] {
+            assert!(!is_known_status(s), "{s} 应触发未识别告警");
+        }
     }
 
     #[test]

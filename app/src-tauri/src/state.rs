@@ -152,6 +152,7 @@ pub struct AppState {
     /// 的空闲回声」与「无心跳 agent 的真等待」区分开（见 apply_session_event）
     pub recent_finished: Mutex<HashMap<String, i64>>,
     pub codex_turns: Mutex<crate::codex_watch::Turns>,
+    pub antigravity_waits: Mutex<crate::antigravity_watch::Waits>,
     /// 监控型 adapter 的运行线程（kind_id → 停止标志 + 线程句柄）
     pub watchers: Mutex<HashMap<String, WatcherHandle>>,
     /// 全局静音（托盘开关，仅暂停推送，事件仍入历史；重启后恢复）
@@ -362,6 +363,7 @@ impl AppState {
             dismissed_sessions: Mutex::new(HashMap::new()),
             recent_finished: Mutex::new(HashMap::new()),
             codex_turns: Mutex::new(crate::codex_watch::Turns::default()),
+            antigravity_waits: Mutex::new(crate::antigravity_watch::Waits::default()),
             watchers: Mutex::new(HashMap::new()),
             muted: std::sync::atomic::AtomicBool::new(false),
             audio_hold_until: Mutex::new(None),
@@ -1383,7 +1385,10 @@ fn apply_session_event_with_wait(sessions: &mut HashMap<String, SessionStatus>, 
     let mut delta = apply_session_event_inner(sessions, finished, event, stale);
     if preserve_wait && !stale {
         if let Some(s) = sessions.get_mut(&key) {
-            s.phase = SessionPhase::WaitingPermission;
+            s.phase = match previous {
+                Some(SessionPhase::WaitingInput) => SessionPhase::WaitingInput,
+                _ => SessionPhase::WaitingPermission,
+            };
             delta.phase_changed = previous != Some(s.phase.clone());
         }
     }
@@ -3535,5 +3540,106 @@ mod tests {
         assert!(apply_session_event(&mut sessions, &mut finished, &extra).suppressed_echo);
         assert_eq!(sessions.len(), ACTIVE_SESSIONS_CAP);
         assert_eq!(sessions["trae-code|s0"].last_activity, original);
+    }
+
+    #[test]
+    fn antigravity_ask_question_preserves_waiting_input_across_parallel_tools_and_aborts_cleanly() {
+        let adapter = bark_adapters::registry::find_hook_adapter(AgentKind::Antigravity).unwrap();
+        let mut waits = crate::antigravity_watch::Waits::default();
+        let (mut sessions, mut finished) = table();
+
+        let step = |event_name: &str, payload: serde_json::Value, at: i64| {
+            let mut e = adapter.normalize(event_name, &payload).unwrap();
+            e.timestamp = at;
+            e
+        };
+
+        // 1) PreInvocation 开启思考
+        let e1 = step(
+            "PreInvocation",
+            serde_json::json!({ "conversationId": "c1", "lastUserInput": "帮我看看" }),
+            1000,
+        );
+        waits.observe(&e1);
+        apply_session_event_with_wait(&mut sessions, &mut finished, &e1, false, waits.preserve_wait(&e1));
+        assert_eq!(sessions["antigravity|c1"].phase, SessionPhase::Thinking);
+
+        // 2) PreToolUse(ask_question) 进入 WaitingInput
+        let e2 = step(
+            "PreToolUse",
+            serde_json::json!({
+                "conversationId": "c1",
+                "toolCall": {
+                    "name": "ask_question",
+                    "args": { "questions": [{ "question": "选哪项？", "options": ["A", "B"] }] }
+                }
+            }),
+            2000,
+        );
+        waits.observe(&e2);
+        apply_session_event_with_wait(&mut sessions, &mut finished, &e2, false, waits.preserve_wait(&e2));
+        assert_eq!(sessions["antigravity|c1"].phase, SessionPhase::WaitingInput);
+
+        // 3) 并行工具 update_focus 的开始与结束不得把 WaitingInput 冲回 Thinking / ToolRunning
+        let e3 = step(
+            "PreToolUse",
+            serde_json::json!({ "conversationId": "c1", "toolCall": { "name": "update_focus" } }),
+            2010,
+        );
+        waits.observe(&e3);
+        let d3 = apply_session_event_with_wait(&mut sessions, &mut finished, &e3, false, waits.preserve_wait(&e3));
+        assert_eq!(sessions["antigravity|c1"].phase, SessionPhase::WaitingInput);
+        assert!(!d3.phase_changed, "等待相位未变，不应重播提示音");
+
+        let e4 = step(
+            "PostToolUse",
+            serde_json::json!({ "conversationId": "c1", "toolCall": { "name": "update_focus" } }),
+            2020,
+        );
+        waits.observe(&e4);
+        let d4 = apply_session_event_with_wait(&mut sessions, &mut finished, &e4, false, waits.preserve_wait(&e4));
+        assert_eq!(sessions["antigravity|c1"].phase, SessionPhase::WaitingInput);
+        assert!(!d4.phase_changed);
+
+        // 4) ask_question 自己的 PostToolUse 到达后，相位恢复 Thinking
+        let e5 = step(
+            "PostToolUse",
+            serde_json::json!({ "conversationId": "c1", "toolCall": { "name": "ask_question" } }),
+            5000,
+        );
+        waits.observe(&e5);
+        let d5 = apply_session_event_with_wait(&mut sessions, &mut finished, &e5, false, waits.preserve_wait(&e5));
+        assert_eq!(sessions["antigravity|c1"].phase, SessionPhase::Thinking);
+        assert!(d5.phase_changed);
+
+        // 5) 过时的日志中止不得误清会话；当前时刻的日志中止立即移除会话
+        let mut stale_abort = NormalizedEvent::from_raw(
+            "antigravity",
+            EventKind::RunAborted,
+            &serde_json::json!({ "conversationId": "c1" }),
+        );
+        stale_abort.id = format!("{}c1:4000", crate::antigravity_watch::EVENT_PREFIX);
+        stale_abort.timestamp = 4000;
+        assert!(!crate::antigravity_watch::still_current(
+            sessions.get("antigravity|c1"),
+            &stale_abort
+        ));
+
+        let mut fresh_abort = stale_abort;
+        fresh_abort.id = format!("{}c1:6000", crate::antigravity_watch::EVENT_PREFIX);
+        fresh_abort.timestamp = 6000;
+        assert!(crate::antigravity_watch::still_current(
+            sessions.get("antigravity|c1"),
+            &fresh_abort
+        ));
+        waits.observe(&fresh_abort);
+        apply_session_event_with_wait(
+            &mut sessions,
+            &mut finished,
+            &fresh_abort,
+            false,
+            waits.preserve_wait(&fresh_abort),
+        );
+        assert!(sessions.is_empty(), "手动中止后会话必须立即释放");
     }
 }

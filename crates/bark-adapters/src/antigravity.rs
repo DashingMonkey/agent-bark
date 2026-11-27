@@ -6,40 +6,222 @@
 //! 组外的所有键与组内非事件键一律不碰——隔离边界与 opencode 的「独占插件文件」
 //! 同思路，只是粒度从整个文件缩到一个键。
 //!
-//! 条目形态因事件而异（官方文档 antigravity.google/docs/hooks + AgentPet 实现
-//! 双源一致）：`PreToolUse` / `PostToolUse` 是 matcher 事件，需要
+//! 条目形态因事件而异（官方文档 antigravity.google/docs/hooks + 2026-11-27 本机实测
+//! Antigravity 2.35.2）：`PreToolUse` / `PostToolUse` 是 matcher 事件，需要
 //! `{ "matcher": "*", "hooks": [ { "type": "command", ... } ] }` 包装；
 //! `PreInvocation` / `Stop` 是裸 handler 列表 `[{ "type": "command", ... }]`。
 //!
-//! payload 是 camelCase（`conversationId` / `workspacePaths` / `toolCall{name}`）
-//! 且**没有事件名字段**——事件名由 hook 命令的 `--event` 参数提供，不受影响；
-//! 字段提取靠 `NormalizedEvent::from_raw` 的别名兜底。
+//! payload 是 camelCase（`conversationId` / `workspacePaths` / `toolCall{name,args}` /
+//! `lastUserInput` / `terminationReason` / `error`），事件名由 hook 命令的 `--event`
+//! 参数提供，字段提取靠 `NormalizedEvent::from_raw` 与本模块的 `normalize` 补齐。
 //!
-//! **未实测**：映射按官方事件表 + AgentPet 验证过的形态写入，配合启动自愈与
-//! 判死兜底。
+//! 实测要点（2026-11-27，Antigravity 2.35.2 / macOS）：
+//! - Antigravity 没有独立的 `Notification` / `PermissionRequest` hook：向用户展示选项
+//!   或请求额外权限走 `PreToolUse`（`ask_question` / `ask_permission` / 带 `BlockedOnUser`
+//!   的 `notify_user`），用户回答/确认后触发 `PostToolUse`（`ToolFinished` 解除等待）；
+//! - `Stop` 载荷带 `terminationReason`（`NO_TOOL_CALL` / `USER_CANCELED` / `ERROR` 等）与
+//!   `error`，需区分正常完成、用户取消与失败；
+//! - 思考中手动点击停止时，宿主记录 `CancelCascadeInvocation` / `Cancel requested for cascade`
+//!   但**不会执行 `Stop` hook**，由 daemon 侧的 `antigravity_watch` 增量尾读日志补出
+//!   `RunAborted`。
 
 use crate::jsonio;
 use crate::{HookAdapter, InstallCtx, InstallEnv, RegisterCtx, VerifyReport};
-use bark_core::{AgentKind, EventKind};
+use bark_core::event::{truncate_chars, MAX_MESSAGE_CHARS};
+use bark_core::{AgentKind, EventKind, NormalizedEvent};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// 我们独占的组名（顶层键）。其余组是用户的，一个字节都不动。
 const GROUP: &str = "agent-bark";
 
-/// agent 事件名 → 统一事件类型（官方 5 个事件里取子集）：
-/// - `PreInvocation` → Activity（回合计时开始，等价 UserPromptSubmit；
-///   Antigravity 没有 session-start/notification 钩子，这是最早的信号）
-/// - `PreToolUse` → Activity（工具开始）；`PostToolUse` → ToolFinished
-///   （等待状态解除的唯一信号，§1.11 同口径）
-/// - `Stop` → RunCompleted（官方无会话级结束事件，Stop 就是释放运行态的信号）
-/// - 没注册 `PostInvocation`：与 Stop 高度重合的回合收尾信号，多注册只多空转
+/// agent 事件名 → 默认统一事件类型（官方 6 个事件里取子集，`normalize` 再按载荷细化）：
+/// - `PreInvocation` → Activity（回合/推理开始，带 `lastUserInput` 作为任务提示）
+/// - `PreToolUse` → Activity（交互提问/权限工具升级为 InputRequired / PermissionRequired）
+/// - `PostToolUse` → ToolFinished（带非空 `error` 时为 ToolFailed；两者均解除等待状态）
+/// - `Stop` → RunCompleted（按 `terminationReason` / `error` 细分为 RunAborted / RunFailed）
+/// - 没注册 `PostInvocation`：与 Stop 高度重合，多注册只多空转
 pub(crate) const EVENT_MAP: &[(&str, EventKind)] = &[
     ("PreInvocation", EventKind::Activity),
     ("PreToolUse", EventKind::Activity),
     ("PostToolUse", EventKind::ToolFinished),
     ("Stop", EventKind::RunCompleted),
 ];
+
+/// 提取工具的末段名（兼容 `default_api:ask_question` / `functions.ask_question` 等命名空间前缀）。
+pub fn base_tool_name(name: &str) -> &str {
+    name.rsplit(['.', ':']).next().unwrap_or(name).trim()
+}
+
+/// 载荷里的工具名（Antigravity 在 `toolCall.name`，同时兜底常见别名）。
+fn raw_tool_name(raw: &Value) -> Option<&str> {
+    raw.pointer("/toolCall/name")
+        .or_else(|| raw.get("tool_name"))
+        .or_else(|| raw.get("toolName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// 载荷里的工具参数对象（Antigravity 在 `toolCall.args`，同时兜底 `tool_input`）。
+fn raw_tool_args(raw: &Value) -> Option<&Value> {
+    raw.pointer("/toolCall/args")
+        .or_else(|| raw.get("tool_input"))
+        .or_else(|| raw.get("toolInput"))
+}
+
+/// 布尔字段宽松读取（兼容真实 bool 与 proto/JSON 序列化出的 `"true"`）。
+fn bool_flag(v: &Value) -> bool {
+    v.as_bool() == Some(true)
+        || v.as_str()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Antigravity 交互式等待工具判定：`PreToolUse` 命中时立即切入对应等待相位。
+fn waiting_kind_for_tool(name: &str, args: Option<&Value>) -> Option<EventKind> {
+    match base_tool_name(name).to_ascii_lowercase().as_str() {
+        "ask_question" | "ask_user_question" => Some(EventKind::InputRequired),
+        "ask_permission" => Some(EventKind::PermissionRequired),
+        "notify_user" => {
+            let blocked = args.is_some_and(|a| {
+                a.get("BlockedOnUser")
+                    .or_else(|| a.get("blockedOnUser"))
+                    .or_else(|| a.get("blocked_on_user"))
+                    .is_some_and(bool_flag)
+            });
+            blocked.then_some(EventKind::InputRequired)
+        }
+        _ => None,
+    }
+}
+
+/// 从 `ask_question` 参数提取问题文案：同时兼容 `questions` 为 JSON 数组或 JSON 字符串
+/// （Antigravity transcript 实测存在 JSON 字符串化形态）。
+fn extract_ask_question_message(args: Option<&Value>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    let parsed_str;
+    let questions = match args.get("questions") {
+        Some(Value::Array(items)) => Some(items.as_slice()),
+        Some(Value::String(text)) => {
+            parsed_str = serde_json::from_str::<Value>(text).ok();
+            parsed_str.as_ref().and_then(Value::as_array).map(Vec::as_slice)
+        }
+        _ => None,
+    };
+    if let Some(items) = questions {
+        let joined = items
+            .iter()
+            .filter_map(|q| {
+                q.get("question")
+                    .or_else(|| q.get("title"))
+                    .or_else(|| q.get("header"))
+                    .or_else(|| q.get("prompt"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            return truncate_chars(&joined, MAX_MESSAGE_CHARS);
+        }
+    }
+    for key in ["question", "prompt", "message", "Message"] {
+        if let Some(s) = args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            return truncate_chars(s, MAX_MESSAGE_CHARS);
+        }
+    }
+    String::new()
+}
+
+/// 从 `ask_permission` 参数提取权限说明（优先 `Reason`，否则拼 `Action` + `Target`）。
+fn extract_ask_permission_message(args: Option<&Value>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    if let Some(reason) = args
+        .get("Reason")
+        .or_else(|| args.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return truncate_chars(reason, MAX_MESSAGE_CHARS);
+    }
+    let action = args
+        .get("Action")
+        .or_else(|| args.get("action"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let target = args
+        .get("Target")
+        .or_else(|| args.get("target"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let summary = match (action, target) {
+        (Some(a), Some(t)) => format!("{a}: {t}"),
+        (Some(a), None) => a.to_string(),
+        (None, Some(t)) => t.to_string(),
+        (None, None) => String::new(),
+    };
+    truncate_chars(&summary, MAX_MESSAGE_CHARS)
+}
+
+/// 从 `notify_user` 参数提取展示消息。
+fn extract_notify_user_message(args: Option<&Value>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    args.get("Message")
+        .or_else(|| args.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, MAX_MESSAGE_CHARS))
+        .unwrap_or_default()
+}
+
+/// 非空错误文本（`Stop` / `PostToolUse` 的 `error` 字段）。
+fn non_empty_error(raw: &Value) -> Option<&str> {
+    raw.get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// 根据 `Stop` 载荷里的 `terminationReason` 与 `error` 细分终态类型。
+/// 官方枚举（hooks.md）：`NO_TOOL_CALL` / `MAX_INVOCATIONS` / `MAX_FORCED_INVOCATIONS` /
+/// `MAX_TOKEN_BUDGET_EXCEEDED` / `ERROR` / `USER_CANCELED` / `TERMINAL_STEP_TYPE` /
+/// `TERMINAL_CUSTOM_HOOK` / `INJECTED_RESPONSE`（以及在线文档示例里的 `model_stop` / `error`）。
+fn stop_event_kind(raw: &Value) -> EventKind {
+    let reason = raw
+        .get("terminationReason")
+        .or_else(|| raw.get("termination_reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(reason) = reason {
+        let norm = reason.to_ascii_uppercase();
+        let norm = norm.strip_prefix("EXECUTOR_TERMINATION_REASON_").unwrap_or(&norm);
+        return match norm {
+            "USER_CANCELED" | "USER_CANCELLED" | "CANCELED" | "CANCELLED" | "ABORTED" => {
+                EventKind::RunAborted
+            }
+            "ERROR" => EventKind::RunFailed,
+            _ if non_empty_error(raw).is_some() => EventKind::RunFailed,
+            _ => EventKind::RunCompleted,
+        };
+    }
+    if non_empty_error(raw).is_some() {
+        EventKind::RunFailed
+    } else {
+        EventKind::RunCompleted
+    }
+}
 
 /// 需要 matcher 包装的事件（官方 schema：工具事件按工具匹配，`*` = 全部工具）
 const MATCHER_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
@@ -137,6 +319,53 @@ impl HookAdapter for AntigravityAdapter {
             .iter()
             .find(|(name, _)| *name == event_name)
             .map(|(_, kind)| *kind)
+    }
+
+    fn normalize(&self, event_name: &str, raw: &Value) -> Option<NormalizedEvent> {
+        let base_kind = self.event_kind(event_name)?;
+        let tool = raw_tool_name(raw);
+        let args = raw_tool_args(raw);
+        let kind = match event_name {
+            "PreToolUse" => tool
+                .and_then(|name| waiting_kind_for_tool(name, args))
+                .unwrap_or(base_kind),
+            "PostToolUse" => {
+                if non_empty_error(raw).is_some() {
+                    EventKind::ToolFailed
+                } else {
+                    EventKind::ToolFinished
+                }
+            }
+            "Stop" => stop_event_kind(raw),
+            _ => base_kind,
+        };
+        let mut event = NormalizedEvent::from_raw(self.kind().id(), kind, raw);
+        if event_name == "PreToolUse" && event.message.is_empty() {
+            if let Some(name) = tool {
+                let extracted = match base_tool_name(name).to_ascii_lowercase().as_str() {
+                    "ask_question" | "ask_user_question" => extract_ask_question_message(args),
+                    "ask_permission" => extract_ask_permission_message(args),
+                    "notify_user" if kind == EventKind::InputRequired => {
+                        extract_notify_user_message(args)
+                    }
+                    _ => String::new(),
+                };
+                if !extracted.is_empty() {
+                    event.message = extracted;
+                }
+            }
+        } else if event_name == "PreInvocation" && event.message.is_empty() {
+            if let Some(prompt) = raw
+                .get("lastUserInput")
+                .or_else(|| raw.get("last_user_input"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                event.message = truncate_chars(prompt, MAX_MESSAGE_CHARS);
+            }
+        }
+        Some(event)
     }
 
     fn register(&self, ctx: &RegisterCtx) -> anyhow::Result<()> {
@@ -421,6 +650,170 @@ mod tests {
         assert_eq!(adapter.event_kind("Stop"), Some(EventKind::RunCompleted));
         assert_eq!(adapter.event_kind("PostInvocation"), None);
         assert_eq!(adapter.event_kind("SessionStart"), None);
+
+        // PreInvocation 提取 lastUserInput 作为回合 prompt
+        let pre_inv = adapter
+            .normalize(
+                "PreInvocation",
+                &json!({
+                    "conversationId": "conv-1",
+                    "workspacePaths": [r"D:\Workspace\proj"],
+                    "lastUserInput": "帮我排查 hook 问题"
+                }),
+            )
+            .unwrap();
+        assert_eq!(pre_inv.kind, EventKind::Activity);
+        assert_eq!(pre_inv.tool_name, None);
+        assert_eq!(pre_inv.message, "帮我排查 hook 问题");
+    }
+
+    /// 交互式选项 / 权限工具：PreToolUse 切等待态，PostToolUse 解除等待
+    #[test]
+    fn normalize_maps_interactive_tools_to_waiting_and_post_tool_releases() {
+        let adapter = antigravity();
+
+        // 1) ask_question（questions 为 JSON 数组）
+        let ev = adapter
+            .normalize(
+                "PreToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "ask_question",
+                        "args": {
+                            "questions": [
+                                { "question": "选择方案 A 还是 B？", "options": ["A", "B"] },
+                                { "question": "是否同步更新文档？", "options": ["是", "否"] }
+                            ]
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(ev.kind, EventKind::InputRequired);
+        assert_eq!(ev.tool_name.as_deref(), Some("ask_question"));
+        assert_eq!(ev.message, "选择方案 A 还是 B？\n是否同步更新文档？");
+
+        // 2) ask_question（questions 为 JSON 字符串 + 带命名空间前缀）
+        let ev_str = adapter
+            .normalize(
+                "PreToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "default_api:ask_question",
+                        "args": {
+                            "questions": "[{\"question\":\"模型结构选哪种？\",\"options\":[\"A\",\"B\"]}]"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(ev_str.kind, EventKind::InputRequired);
+        assert_eq!(ev_str.message, "模型结构选哪种？");
+
+        // 3) ask_permission → PermissionRequired
+        let perm = adapter
+            .normalize(
+                "PreToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "ask_permission",
+                        "args": { "Action": "run_command", "Target": "npm test", "Reason": "需要运行测试" }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(perm.kind, EventKind::PermissionRequired);
+        assert_eq!(perm.message, "需要运行测试");
+
+        // 4) notify_user：仅 BlockedOnUser=true 才进等待态
+        let blocked = adapter
+            .normalize(
+                "PreToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "notify_user",
+                        "args": { "BlockedOnUser": true, "Message": "请确认实现计划" }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(blocked.kind, EventKind::InputRequired);
+        assert_eq!(blocked.message, "请确认实现计划");
+
+        let non_blocking = adapter
+            .normalize(
+                "PreToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "notify_user",
+                        "args": { "BlockedOnUser": false, "Message": "进度同步" }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(non_blocking.kind, EventKind::Activity);
+
+        // 5) PostToolUse：正常收尾 → ToolFinished；带 error → ToolFailed
+        let post_ok = adapter
+            .normalize(
+                "PostToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": { "name": "ask_question" }
+                }),
+            )
+            .unwrap();
+        assert_eq!(post_ok.kind, EventKind::ToolFinished);
+        assert_eq!(post_ok.tool_name.as_deref(), Some("ask_question"));
+
+        let post_err = adapter
+            .normalize(
+                "PostToolUse",
+                &json!({
+                    "conversationId": "conv-1",
+                    "toolCall": { "name": "edit_file" },
+                    "error": "target not found"
+                }),
+            )
+            .unwrap();
+        assert_eq!(post_err.kind, EventKind::ToolFailed);
+        assert_eq!(post_err.message, "target not found");
+    }
+
+    /// Stop 载荷按 terminationReason / error 区分完成、用户取消与失败
+    #[test]
+    fn normalize_classifies_stop_termination_reasons() {
+        let adapter = antigravity();
+
+        for reason in ["USER_CANCELED", "EXECUTOR_TERMINATION_REASON_USER_CANCELED", "user_canceled", "aborted"] {
+            let ev = adapter
+                .normalize("Stop", &json!({ "conversationId": "c1", "terminationReason": reason }))
+                .unwrap();
+            assert_eq!(ev.kind, EventKind::RunAborted, "reason={reason}");
+        }
+
+        let err_reason = adapter
+            .normalize("Stop", &json!({ "conversationId": "c1", "terminationReason": "ERROR", "error": "quota exceeded" }))
+            .unwrap();
+        assert_eq!(err_reason.kind, EventKind::RunFailed);
+        assert_eq!(err_reason.message, "quota exceeded");
+
+        let err_only = adapter
+            .normalize("Stop", &json!({ "conversationId": "c1", "error": "upstream 500" }))
+            .unwrap();
+        assert_eq!(err_only.kind, EventKind::RunFailed);
+
+        for reason in ["NO_TOOL_CALL", "model_stop", "MAX_INVOCATIONS", "TERMINAL_STEP_TYPE"] {
+            let ev = adapter
+                .normalize("Stop", &json!({ "conversationId": "c1", "terminationReason": reason, "error": "" }))
+                .unwrap();
+            assert_eq!(ev.kind, EventKind::RunCompleted, "reason={reason}");
+        }
     }
 
     /// Path 传递路径检查：config_path 在生产模式下指向 ~/.gemini/config/hooks.json

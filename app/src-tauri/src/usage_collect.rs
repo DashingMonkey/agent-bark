@@ -35,6 +35,7 @@ const ZCODE_LOOKBACK_MS: i64 = 60_000;
 /// 它与 AgentKind::ALL 对齐。仅测试引用，生产构建不编译。
 #[cfg(test)]
 pub const USAGE_SOURCE_AGENTS: &[&str] = &[
+    "antigravity",
     "claude-code",
     "codebuddy",
     "codex",
@@ -56,7 +57,6 @@ pub const USAGE_SOURCE_AGENTS: &[&str] = &[
 /// 新增采集器时同步移除这里；与 usage_sources.rs 头注的「不猜口径」清单一致。
 pub const NO_USAGE_SOURCE_AGENTS: &[&str] = &[
     "cursor",
-    "antigravity",
     "doubao-work",
 ];
 
@@ -935,7 +935,7 @@ mod tests {
             );
         }
         // 逐源打印；本机没装 / 会话为空的源只提示不硬断言（冒烟测跨机器可用）
-        for want in ["zcode", "workbuddy", "dsh", "codex", "qoder"] {
+        for want in ["antigravity", "zcode", "workbuddy", "dsh", "codex", "qoder"] {
             if !agents.iter().any(|a| a.agent == want && a.requests > 0) {
                 println!("SMOKE {want} 本机无数据（未安装或会话为空）");
             }

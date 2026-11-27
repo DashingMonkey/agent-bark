@@ -1,4 +1,5 @@
 mod abort_watch;
+mod antigravity_watch;
 mod codebuddy_watch;
 mod codex_watch;
 mod evidence;
@@ -216,6 +217,7 @@ pub fn run() {
             // 从本地日志/transcript 补。必须在 sync_watchers 之前：那一步会拿走 tx 的
             // 所有权。
             abort_watch::spawn(state.clone(), tx.clone());
+            antigravity_watch::spawn(state.clone(), tx.clone());
             codebuddy_watch::spawn(state.clone(), tx.clone());
             codex_watch::spawn(state.clone(), tx.clone());
             qoder_watch::spawn(state.clone(), tx.clone());

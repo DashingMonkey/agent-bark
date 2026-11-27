@@ -22,7 +22,7 @@
 | Cursor | stop.status 的 completed/aborted/error → 完成/终止/失败；sessionEnd.reason 同样分类，关闭窗口释放 | **本轮修复**原来一律把 stop 当完成的错误；当前官方文档及载荷回归测试，未现场操作宿主 |
 | Copilot CLI | agentStop 完成；sessionEnd.reason 的 complete/abort/user_exit/error/timeout 分类 | **本轮修复**原来一律把 sessionEnd 当终止的错误；当前官方文档及载荷回归测试。会话结束不等于每次按停止都会收到 |
 | Windsurf（已移除） | 按用户要求移除检测与接入 | 不再属于当前支持范围 |
-| Antigravity | Stop → 完成 | 当前适配器没有取消分支，宿主载荷未现场核对；不能承诺手动停止已正确识别 |
+| Antigravity | Stop 按 `terminationReason` / `error` 分流完成/终止/失败；`language_server.log` / CLI 日志的 `CancelCascadeInvocation` / `Cancel requested for cascade` → 终止；`PreToolUse` 交互提问/权限工具（`ask_question` / `ask_permission` / `notify_user(BlockedOnUser)`）→ 等待，匹配 `PostToolUse` 解除 | 2026-11-27 本机实测（Antigravity 2.35.2 / macOS）：思考中手动点击停止不会触发 `Stop` hook，但日志立即记录 `CancelCascadeInvocation` 与 `Cancel requested for cascade`；增量尾读秒级释放，按 `last_activity` 防旧中止误清下一回合。日志缺失或格式变化时保留最后已知状态，可本地移除 |
 | Kimi Code | Interrupt/SessionEnd → 终止；Stop 完成、StopFailure 失败 | 显式取消映射及测试已有；本轮未现场操作宿主 |
 | Kimi Work | wire.jsonl turn.cancel → 终止；end_turn → 完成 | 已有本机协议样本与行为测试；日志可读时有明确取消信号 |
 | 豆包工作 | SDK 日志确认 `click_break_button` + `success`，按会话/消息 ID 匹配 → 终止；数据库清空等待 6s 后 → 完成 | **已补用户停止信号**：2026-10-14 本机真实取消样本验证。重复/旧消息取消不会影响新一轮；日志缺失、未观测到对应消息 ID、失败原因仍属缺口 |
@@ -33,4 +33,4 @@
 - Copilot CLI：[Hook configuration](https://docs.github.com/en/copilot/reference/hooks-configuration)。`sessionEnd.reason = complete | error | abort | timeout | user_exit`。
 - Gemini CLI：[Hooks reference — AfterAgent](https://geminicli.com/docs/hooks/reference/)。回合最终响应后触发；此信息本身不构成取消识别保证。
 
-后续重点是 Antigravity 的真实取消样本，以及豆包工作缺失日志时的结束原因，而不是继续扩大通用字符串匹配。当前结论是「全部接入已审查，发现的明确映射错误已修正」，不能写成「全部 Agent 的手动停止均已实测通过」。
+后续重点是豆包工作缺失日志时的结束原因，以及各未实测宿主在实机环境下的停止样本，而不是继续扩大通用字符串匹配。当前结论是「全部接入已审查，发现的明确映射错误已修正（含 2026-11-27 本机实测补齐的 Antigravity 选项等待与日志取消释放）」，不能写成「全部 Agent 的手动停止均已实测通过」。

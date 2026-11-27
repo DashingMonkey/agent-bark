@@ -1,6 +1,9 @@
 //! WorkBuddy 的会话状态 completed 同时覆盖正常完成与取消。
 //! 2026-10-14 本机样本：取消回合写 assistant/incomplete + skipRun +
 //! error.message="Interrupted by user"；正常回合写 assistant/completed。
+//! 2026-11-27（5.12.1 / ACP）：回合终态改为写 `acp-terminal-state` 行
+//! （stopReason=end_turn / error / cancelled），会话行本身只回到 `active`，
+//! 不再写 completed——状态机侧由 watch.rs 的 `active` 跃迁兜住，这里补终态细分。
 //! 只在会话终态跃迁时读有限 JSONL 尾部，补充明确的取消原因。
 
 use bark_core::EventKind;
@@ -59,6 +62,13 @@ fn classify_tail(tail: &str, session: &str, updated_at: i64) -> Option<EventKind
         // 尾部半行/损坏不能跳过去命中旧回合。
         let row: Value = serde_json::from_str(line).ok()?;
         match row.get("type")?.as_str()? {
+            // 5.12.1（ACP）的回合终态：优先于 message 判定，stopReason 区分完成/取消/失败。
+            "acp-terminal-state" => return classify_acp_terminal(&row, updated_at),
+            // 与 acp-terminal-state 同批写入的旁路记录（asar 内 Sc 集合），
+            // 出现在终态行之后但只是统计信息，不能当成「更新的活动」。
+            "turn-metrics" | "request-recovery" | "model-usage" | "credit-usage" | "context-usage" => {
+                continue
+            }
             "session-meta" | "file-history-snapshot" => continue,
             "message" => {}
             _ => return None, // 更新的推理/工具活动意味着旧终态已经过时。
@@ -79,10 +89,86 @@ fn classify_tail(tail: &str, session: &str, updated_at: i64) -> Option<EventKind
     None
 }
 
+/// 5.12.1（ACP）的回合终态行，样本：
+/// `{"type":"acp-terminal-state","stopReason":"end_turn",
+///   "providerData":{"skipRun":true,"acpTerminalState":true,"finishReason":"stop"}}`
+///
+/// 该行没有 sessionId（文件本身按 `{session}.jsonl` 定位，无需再校验）；
+/// 与 message 一样受提交滞后窗口保护，避免旧回合的终态覆盖下一次跃迁。
+fn classify_acp_terminal(row: &Value, updated_at: i64) -> Option<EventKind> {
+    let timestamp = row.get("timestamp")?.as_i64()?;
+    let lag = updated_at.checked_sub(timestamp)?;
+    if timestamp <= 0 || !(0..=MAX_COMMIT_LAG_MS).contains(&lag) {
+        return None;
+    }
+    let stop_reason = row.get("stopReason").and_then(Value::as_str).unwrap_or_default();
+    let finish_reason = row
+        .pointer("/providerData/finishReason")
+        .and_then(Value::as_str);
+    // eslint 风格的空值检查在这里不适用：error 可能是字符串、对象或 null
+    let has_error = row.get("error").is_some_and(|v| !v.is_null());
+    let cancelled = row
+        .pointer("/providerData/cancelReason")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if has_error || stop_reason == "error" {
+        return Some(EventKind::RunFailed);
+    }
+    if cancelled
+        || matches!(
+            stop_reason,
+            "cancelled" | "canceled" | "interrupted" | "killed" | "stopped"
+        )
+    {
+        return Some(EventKind::RunAborted);
+    }
+    (stop_reason == "end_turn" || finish_reason == Some("stop")).then_some(EventKind::RunCompleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn acp_terminal(stop_reason: &str, finish: &str) -> Value {
+        json!({"type":"acp-terminal-state", "timestamp":10_000, "stopReason":stop_reason,
+            "providerData":{"skipRun":true,"acpTerminalState":true,"finishReason":finish}})
+    }
+
+    /// 5.12.1 起正常结束只写 acp-terminal-state，会话行停在 active；
+    /// 这条判定不成立就会把每次正常完成显示成「思考中」永不结束。
+    #[test]
+    fn acp_terminal_state_classifies_end_turn_cancel_and_error() {
+        let done = acp_terminal("end_turn", "stop");
+        assert_eq!(
+            classify_tail(&format!("{done}\n"), "s1", 10_100),
+            Some(EventKind::RunCompleted)
+        );
+        // 真实样本里 context-usage 比终态行晚 56ms 落盘，不能挡住反向遍历
+        let tail = format!("{done}\n{}", json!({"type":"context-usage","timestamp":10_056}));
+        assert_eq!(classify_tail(&tail, "s1", 10_100), Some(EventKind::RunCompleted));
+        // 用户中断
+        let cancelled = acp_terminal("cancelled", "stop");
+        assert_eq!(
+            classify_tail(&format!("{cancelled}\n"), "s1", 10_100),
+            Some(EventKind::RunAborted)
+        );
+        // providerData.cancelReason 同样表示中断
+        let mut with_reason = cancelled.clone();
+        with_reason["providerData"]["cancelReason"] = json!("user");
+        assert_eq!(
+            classify_tail(&format!("{with_reason}\n"), "s1", 10_100),
+            Some(EventKind::RunAborted)
+        );
+        // 失败
+        let failed = acp_terminal("error", "error");
+        assert_eq!(
+            classify_tail(&format!("{failed}\n"), "s1", 10_100),
+            Some(EventKind::RunFailed)
+        );
+        // 提交滞后超出窗口：不认，免得旧回合终态覆盖下一次跃迁
+        assert_eq!(classify_tail(&format!("{done}\n"), "s1", 20_000), None);
+    }
 
     fn interrupted() -> Value {
         json!({"type":"message", "role":"assistant", "status":"incomplete",
